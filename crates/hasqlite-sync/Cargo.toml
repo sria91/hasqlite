@@ -1,0 +1,15 @@
+[package]
+name = "hasqlite-sync"
+description = "Sync scheduling wrapping rsqlite-rsync"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+hasqlite-core = { path = "../hasqlite-core" }
+thiserror.workspace = true
+tokio.workspace = true
+
+# Uncomment in Phase 2 when wiring replication:
+# rsqlite-rsync = { path = "../../../rsqlite-rsync" }

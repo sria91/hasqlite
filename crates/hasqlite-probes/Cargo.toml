@@ -1,0 +1,12 @@
+[package]
+name = "hasqlite-probes"
+description = "HTTP health/readiness endpoints for hasqlite nodes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+hasqlite-core = { path = "../hasqlite-core" }
+tokio.workspace = true
+tracing.workspace = true
