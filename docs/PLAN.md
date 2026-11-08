@@ -133,7 +133,7 @@ Events per tick (from rsync `ReconcileDecision` model):
    - When a replica is eligible to promote, it must NOT immediately assume the writer role.
    - The candidate replica MUST execute an atomic lease acquisition or compare-and-swap (CAS) operation on the authoritative lease store (e.g. Kubernetes Lease API `resourceVersion` CAS or file lock CAS).
    - CAS condition: the acquisition CAS cannot replace a lease renewed after the candidate's observation: compare a version that changes on renewal (e.g. Kubernetes Lease `resourceVersion` or monotonic renewal counter), or atomically recheck the holder and expiry under the file lock while asserting `expected_generation == observed_generation` and confirming the observed lease remains unheld/expired before atomically setting `holder = self`, `new_generation = observed_generation + 1`, and updated TTL.
-   - If CAS succeeds: node advances to `Promote` with authoritative writer rights for `new_generation`.
+   - If CAS succeeds: before entering `Promote`, re-validate freshness against the current time and confirm that this node still holds a valid lease for `new_generation`. If both checks pass, node advances to `Promote` with authoritative writer rights for `new_generation`. If either check fails, keep the node read-only as a replica (`StayReplica`) and release the lease only if it is still held by this node for that generation; otherwise let it expire.
    - If CAS fails (e.g. concurrent race won by another replica or renewal by writer): promotion is aborted immediately; node transitions to `StayReplica` (fail closed).
 5. Decide: `KeepWriter`, `Promote`, `Demote`, `StayReplica`, `NoOp`.
 6. Execute actions:

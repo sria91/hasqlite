@@ -20,7 +20,7 @@ mcp_codebase-memo_get_architecture({ "project": "<display_name>" })
 2. Call `get_architecture(project)` to understand the codebase structure.
 3. Use `search_graph` to find relevant symbols, `trace_call_path` for call chains.
 4. Use `get_code_snippet` to read specific function implementations.
-5. Use `read_file` when you need exact raw content to edit a specific line, or when the index does not cover requested content (including for diagnosis without editing); retain the restriction to exact raw content needed for the task.
+5. Use `read_file` when you need exact raw content to edit a specific line, when the index does not cover requested content (including for diagnosis without editing), or to verify indexed content when the index may be stale (refresh a stale index before relying on its relationships or snippet ranges); retain the restriction to exact raw content needed for the task.
 
 ### Available Tools (14 MCP tools)
 

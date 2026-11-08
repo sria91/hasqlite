@@ -61,7 +61,10 @@ already implicit in `rsqlite-rsync` HA mode.
 ## Kubernetes
 
 14. **Rollout probes**: use `/healthz` for pod readiness during rolling updates;
-    use `/ready` only when routing write traffic to the current writer.
+    write traffic must be routed only to the current writer, using a writer-aware
+    mechanism such as a controller-managed EndpointSlice or a proxy that checks
+    `/ready`. Clarify that `/healthz` readiness alone does not provide writer-only
+    routing.
 15. **preStop**: mandatory sync attempt before SIGTERM to tighten RPO.
 
 Violations of this contract are **severity-0** bugs.
