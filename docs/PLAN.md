@@ -162,7 +162,8 @@ is supported as an explicit first-class operational mode:
 
 - **Direct genesis writer bootstrap**: In standalone mode (`mode = "standalone"` in `[node]` or CLI `--mode standalone`),
   the node skips peer freshness checks, acquires writer status via the authoritative file lease (`LeaseRecord`), and transitions
-  directly from `Starting → Writer(g)`, bypassing the intermediate `Replica` state.
+  directly from `Starting → Writer(g)`, bypassing the intermediate `Replica` state. Standalone configurations strictly require
+  `lease.source = "file"`; Kubernetes lease backends are rejected because they do not provide single-node host filesystem mutual exclusion.
 - **Generation continuity & authoritative source of truth**: The lease record (`LeaseRecord.generation` stored in the lease file)
   is the authoritative source of truth for writer identity and generation (per `docs/safety-contract.md` §2).
   - **First boot**: On a fresh volume with no prior lease file or database state, initial generation is explicitly `1`.
@@ -171,9 +172,11 @@ is supported as an explicit first-class operational mode:
   - **Monotonic lease acquisition**: Standalone bootstrap writes an updated `LeaseRecord` with `generation = g_prior + 1`
     (or `1` if `g_prior == 0`) under advisory POSIX file locking (`flock`), guaranteeing generation monotonicity
     if the volume is subsequently migrated into an HA cluster.
-- **Mutual exclusion via POSIX file locking (`flock`)**: The file lease source enforces advisory POSIX file locking
-  (`flock`/`fcntl`) on the lease file. If multiple containers mistakenly bind-mount the same host volume,
-  the second container fails fast with `EWOULDBLOCK` rather than causing split-brain write corruption.
+- **Mutual exclusion via POSIX file locking (`flock`) on shared volume**: The file lease path MUST reside on the shared
+  database volume (e.g. `/var/lib/hasqlite/lease.txt`). The file lease source enforces advisory POSIX file locking (`flock`/`fcntl`)
+  on that path. Because the lock targets the shared volume filesystem rather than a container-local path (such as `/var/run/`),
+  any concurrent container sharing the database volume contends for the exact same file inode and fails fast with `EWOULDBLOCK`,
+  preventing split-brain write corruption.
 - **Zero-sync overhead**: Peer replication loops are dormant; write fence is active locally for writer generation `g`.
 - **Graceful shutdown on `SIGTERM`**: Handles container stop signals within Docker's default 10s grace window by
   executing a synchronous passive WAL checkpoint (`sqlite3_wal_checkpoint_v2(TRUNCATE)`), draining in-flight gRPC
@@ -497,23 +500,30 @@ mode = "standalone" # Auto-promotes to genesis writer at generation g_prior + 1 
 dir = "/var/lib/hasqlite"
 
 [lease]
-source = "file"
+source = "file" # Standalone mode strictly requires file-backed lease
 
 [lease.file]
-path = "/var/run/hasqlite/lease.txt"
+# MUST reside on the shared database volume (/var/lib/hasqlite) so flock protects all containers
+path = "/var/lib/hasqlite/lease.txt"
 
 # Note: [freshness], [promotion], and [sync] sections are omitted in standalone mode
 
 [gateway]
 bind = "0.0.0.0:50051"
-auth_token_file = "/run/secrets/hasqlite_token" # or auth_token_env = "HASQLITE_GRPC_AUTH_TOKEN"
+auth_token_file = "/run/secrets/hasqlite_token" # Mutually exclusive with auth_token_env
+# auth_token_env = "HASQLITE_GRPC_AUTH_TOKEN"
 allow_replica_reads = false
 
 [probes]
 http_bind = "0.0.0.0:8088"
 ```
 
-Standalone Docker invocation:
+### Standalone Docker invocation
+
+> [!NOTE]
+> **Phase 1b Target**: The Docker invocation below illustrates the planned deployment workflow once the Phase 1b runtime and packaging land. (In the current Phase 0 repository, the binary outputs a bootstrap log and exits).
+>
+> All required configuration fields (`node.id`, `data.dir`, `lease.source`, `gateway.bind`, `probes.http_bind`) are supplied by mounting the standalone TOML configuration. In Phase 1b, the image entrypoint will also support synthesizing minimal standalone defaults if config mounts are omitted.
 
 ```bash
 docker run -d \
@@ -521,10 +531,11 @@ docker run -d \
   -p 50051:50051 \
   -p 8088:8088 \
   -u 1000:1000 \
+  -v /path/to/standalone.toml:/etc/hasqlite/cluster.toml:ro \
   -v hasqlite-data:/var/lib/hasqlite \
   -v /path/to/token.txt:/run/secrets/hasqlite_token:ro \
-  -e HASQLITE_MODE=standalone \
-  hasqlite:${HASQLITE_VERSION:-0.1.0}
+  hasqlite:${HASQLITE_VERSION:-0.1.0} \
+  run --config /etc/hasqlite/cluster.toml
 ```
 
 ---

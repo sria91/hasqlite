@@ -126,6 +126,11 @@ impl ClusterConfig {
                 Self::validate_promotion(promotion)?;
             }
             NodeMode::Standalone => {
+                if self.lease.source != LeaseSourceType::File {
+                    return Err(HasqliteError::Validation(
+                        "node.mode is 'standalone' but lease.source is not 'file' (standalone mode requires file-backed lease for flock mutual exclusion)".to_string(),
+                    ));
+                }
                 if let Some(ref freshness) = self.freshness {
                     Self::validate_freshness(freshness)?;
                 }
@@ -138,6 +143,11 @@ impl ClusterConfig {
             }
         }
 
+        if self.gateway.auth_token_env.is_some() && self.gateway.auth_token_file.is_some() {
+            return Err(HasqliteError::Validation(
+                "cannot specify both gateway.auth_token_env and gateway.auth_token_file (choose one credential source)".to_string(),
+            ));
+        }
         if let Some(ref env) = self.gateway.auth_token_env
             && env.trim().is_empty()
         {
@@ -308,8 +318,10 @@ pub struct SyncSection {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GatewaySection {
     pub bind: String,
+    /// Environment variable containing the bearer auth token (mutually exclusive with `auth_token_file`).
     #[serde(default)]
     pub auth_token_env: Option<String>,
+    /// File path containing the bearer auth token (mutually exclusive with `auth_token_env`).
     #[serde(default)]
     pub auth_token_file: Option<PathBuf>,
     #[serde(default)]
@@ -454,7 +466,7 @@ dir = "/var/lib/hasqlite"
 source = "file"
 
 [lease.file]
-path = "/var/run/hasqlite/lease.txt"
+path = "/var/lib/hasqlite/lease.txt"
 
 [gateway]
 bind = "0.0.0.0:50051"
@@ -502,6 +514,34 @@ http_bind = "0.0.0.0:8088"
             config3.validate().unwrap_err(),
             HasqliteError::Validation(
                 "promotion section is required in clustered mode".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn standalone_mode_rejects_kubernetes_lease() {
+        let mut config = valid_test_config();
+        config.node.mode = NodeMode::Standalone;
+        config.lease.source = LeaseSourceType::Kubernetes;
+        let err = config.validate().unwrap_err();
+        assert_eq!(
+            err,
+            HasqliteError::Validation(
+                "node.mode is 'standalone' but lease.source is not 'file' (standalone mode requires file-backed lease for flock mutual exclusion)".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn gateway_rejects_both_auth_token_env_and_file() {
+        let mut config = valid_test_config();
+        config.gateway.auth_token_env = Some("HASQLITE_AUTH_TOKEN".to_string());
+        config.gateway.auth_token_file = Some(PathBuf::from("/etc/hasqlite/token.txt"));
+        let err = config.validate().unwrap_err();
+        assert_eq!(
+            err,
+            HasqliteError::Validation(
+                "cannot specify both gateway.auth_token_env and gateway.auth_token_file (choose one credential source)".to_string()
             )
         );
     }
@@ -645,6 +685,7 @@ http_bind = "0.0.0.0:8088"
         );
 
         let mut config4 = valid_test_config();
+        config4.gateway.auth_token_env = None;
         config4.gateway.auth_token_file = Some(PathBuf::from("   "));
         let err4 = config4.validate().unwrap_err();
         assert_eq!(
