@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 /// Stable identity for a cluster member (hostname, pod name, etc.).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct NodeId(pub String);
+pub struct NodeId(String);
 
 impl NodeId {
     pub fn new(id: impl Into<String>) -> Self {
@@ -14,6 +14,10 @@ impl NodeId {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    pub fn into_inner(self) -> String {
+        self.0
     }
 }
 
@@ -71,11 +75,21 @@ pub struct ClusterConfig {
 }
 
 impl ClusterConfig {
-    /// Validates semantic correctness, required backend sections, positive intervals, and socket address formats.
+    /// Validates semantic correctness, required backend sections, positive intervals, path presence, and socket address formats.
     pub fn validate(&self) -> Result<(), HasqliteError> {
         if self.node.id.as_str().trim().is_empty() {
             return Err(HasqliteError::Validation(
                 "node.id must not be empty".to_string(),
+            ));
+        }
+        if self.data.dir.as_os_str().is_empty() {
+            return Err(HasqliteError::Validation(
+                "data.dir must not be empty".to_string(),
+            ));
+        }
+        if self.freshness.path.as_os_str().is_empty() {
+            return Err(HasqliteError::Validation(
+                "freshness.path must not be empty".to_string(),
             ));
         }
         if self.sync.interval_secs == 0 {
@@ -86,6 +100,32 @@ impl ClusterConfig {
         if self.freshness.max_age_secs == 0 {
             return Err(HasqliteError::Validation(
                 "freshness.max_age_secs must be greater than 0".to_string(),
+            ));
+        }
+        if self.promotion.max_future_skew_secs > 300 {
+            return Err(HasqliteError::Validation(
+                "promotion.max_future_skew_secs must not exceed 300 seconds".to_string(),
+            ));
+        }
+        if let Some(ref ep) = self.sync.origin_endpoint
+            && ep.trim().is_empty()
+        {
+            return Err(HasqliteError::Validation(
+                "sync.origin_endpoint must not be empty when specified".to_string(),
+            ));
+        }
+        if let Some(ref env) = self.sync.transport_auth_token_env
+            && env.trim().is_empty()
+        {
+            return Err(HasqliteError::Validation(
+                "sync.transport_auth_token_env must not be empty when specified".to_string(),
+            ));
+        }
+        if let Some(ref env) = self.gateway.auth_token_env
+            && env.trim().is_empty()
+        {
+            return Err(HasqliteError::Validation(
+                "gateway.auth_token_env must not be empty when specified".to_string(),
             ));
         }
         match self.lease.source {
@@ -392,5 +432,79 @@ http_bind = "127.0.0.1:8088"
         config2.probes.http_bind = "999.999.999.999:80".to_string();
         let err2 = config2.validate().unwrap_err();
         assert!(matches!(err2, HasqliteError::Validation(msg) if msg.contains("probes.http_bind")));
+    }
+
+    #[test]
+    fn validation_rejects_empty_paths() {
+        let mut config = valid_test_config();
+        config.data.dir = PathBuf::from("");
+        let err = config.validate().unwrap_err();
+        assert_eq!(
+            err,
+            HasqliteError::Validation("data.dir must not be empty".to_string())
+        );
+
+        let mut config2 = valid_test_config();
+        config2.freshness.path = PathBuf::from("");
+        let err2 = config2.validate().unwrap_err();
+        assert_eq!(
+            err2,
+            HasqliteError::Validation("freshness.path must not be empty".to_string())
+        );
+    }
+
+    #[test]
+    fn validation_rejects_excessive_clock_skew() {
+        let mut config = valid_test_config();
+        config.promotion.max_future_skew_secs = 301;
+        let err = config.validate().unwrap_err();
+        assert_eq!(
+            err,
+            HasqliteError::Validation(
+                "promotion.max_future_skew_secs must not exceed 300 seconds".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn validation_rejects_empty_strings_in_optional_fields() {
+        let mut config = valid_test_config();
+        config.sync.origin_endpoint = Some("   ".to_string());
+        let err = config.validate().unwrap_err();
+        assert_eq!(
+            err,
+            HasqliteError::Validation(
+                "sync.origin_endpoint must not be empty when specified".to_string()
+            )
+        );
+
+        let mut config2 = valid_test_config();
+        config2.sync.transport_auth_token_env = Some("".to_string());
+        let err2 = config2.validate().unwrap_err();
+        assert_eq!(
+            err2,
+            HasqliteError::Validation(
+                "sync.transport_auth_token_env must not be empty when specified".to_string()
+            )
+        );
+
+        let mut config3 = valid_test_config();
+        config3.gateway.auth_token_env = Some("   ".to_string());
+        let err3 = config3.validate().unwrap_err();
+        assert_eq!(
+            err3,
+            HasqliteError::Validation(
+                "gateway.auth_token_env must not be empty when specified".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn node_id_conversions_and_deref() {
+        let id = NodeId::new("node-alpha");
+        assert_eq!(id.as_str(), "node-alpha");
+        assert_eq!(&*id, "node-alpha");
+        assert_eq!(format!("{id}"), "node-alpha");
+        assert_eq!(id.into_inner(), "node-alpha");
     }
 }

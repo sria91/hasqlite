@@ -1,5 +1,6 @@
 //! Controller reconcile and promotion gates — implementation lands in Phase 1.
 
+use hasqlite_core::NodeId;
 use hasqlite_lease::{FreshnessLedger, LeaseRecord};
 
 /// Placeholder for the tick outcome type (will match rsqlite-rsync `HaController`).
@@ -7,6 +8,79 @@ use hasqlite_lease::{FreshnessLedger, LeaseRecord};
 pub struct ControllerTick {
     pub lease: LeaseRecord,
     pub freshness: Option<FreshnessLedger>,
+}
+
+/// Promotion validation errors reflecting §7 of the Safety Contract.
+#[derive(thiserror::Error, Debug, PartialEq, Eq)]
+pub enum PromotionError {
+    #[error("no freshness ledger recorded for replica")]
+    NoFreshnessRecord,
+    #[error("freshness age {age_secs}s exceeds max allowed age {max_age_secs}s")]
+    StaleReplica { age_secs: u64, max_age_secs: u64 },
+    #[error("source generation {source_gen} is below minimum allowed generation {min_gen}")]
+    GenerationTooLow { source_gen: u64, min_gen: u64 },
+    #[error(
+        "snapshot timestamp {synced_at_secs}s is in the future by {skew_secs}s (max allowed {max_skew_secs}s)"
+    )]
+    ClockSkewExceeded {
+        synced_at_secs: u64,
+        skew_secs: u64,
+        max_skew_secs: u64,
+    },
+    #[error("freshness ledger bound to node {bound_to}, but promoting node is {promoting_node}")]
+    ReplicaMismatch {
+        bound_to: NodeId,
+        promoting_node: NodeId,
+    },
+}
+
+/// Validates whether a replica meets all freshness and fencing criteria to promote to writer (§7).
+pub fn validate_promotion(
+    freshness: Option<&FreshnessLedger>,
+    promoting_node: &NodeId,
+    now_secs: u64,
+    max_freshness_age_secs: u64,
+    min_source_generation: u64,
+    max_future_skew_secs: u64,
+) -> Result<(), PromotionError> {
+    let ledger = freshness.ok_or(PromotionError::NoFreshnessRecord)?;
+
+    if let Some(ref bound_node) = ledger.destination_node_id
+        && bound_node != promoting_node
+    {
+        return Err(PromotionError::ReplicaMismatch {
+            bound_to: bound_node.clone(),
+            promoting_node: promoting_node.clone(),
+        });
+    }
+
+    if ledger.source_generation < min_source_generation {
+        return Err(PromotionError::GenerationTooLow {
+            source_gen: ledger.source_generation,
+            min_gen: min_source_generation,
+        });
+    }
+
+    if ledger.synced_at_secs > now_secs {
+        let skew = ledger.synced_at_secs - now_secs;
+        if skew > max_future_skew_secs {
+            return Err(PromotionError::ClockSkewExceeded {
+                synced_at_secs: ledger.synced_at_secs,
+                skew_secs: skew,
+                max_skew_secs: max_future_skew_secs,
+            });
+        }
+    } else {
+        let age = now_secs - ledger.synced_at_secs;
+        if age > max_freshness_age_secs {
+            return Err(PromotionError::StaleReplica {
+                age_secs: age,
+                max_age_secs: max_freshness_age_secs,
+            });
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -25,5 +99,135 @@ mod tests {
             freshness: None,
         };
         assert_eq!(tick.lease.generation, 1);
+    }
+
+    #[test]
+    fn validate_promotion_accepts_fresh_replica() {
+        let promoting_node = NodeId::from("node-2");
+        let ledger = FreshnessLedger {
+            source_node_id: NodeId::from("node-1"),
+            source_generation: 5,
+            synced_at_secs: 1_000,
+            destination_node_id: Some(promoting_node.clone()),
+        };
+
+        let result = validate_promotion(Some(&ledger), &promoting_node, 1_005, 10, 1, 2);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_promotion_rejects_missing_ledger() {
+        let promoting_node = NodeId::from("node-2");
+        let result = validate_promotion(None, &promoting_node, 1_000, 10, 1, 2);
+        assert_eq!(result.unwrap_err(), PromotionError::NoFreshnessRecord);
+    }
+
+    #[test]
+    fn validate_promotion_rejects_stale_ledger() {
+        let promoting_node = NodeId::from("node-2");
+        let ledger = FreshnessLedger {
+            source_node_id: NodeId::from("node-1"),
+            source_generation: 5,
+            synced_at_secs: 1_000,
+            destination_node_id: Some(promoting_node.clone()),
+        };
+
+        let result = validate_promotion(Some(&ledger), &promoting_node, 1_015, 10, 1, 2);
+        assert_eq!(
+            result.unwrap_err(),
+            PromotionError::StaleReplica {
+                age_secs: 15,
+                max_age_secs: 10
+            }
+        );
+    }
+
+    #[test]
+    fn validate_promotion_rejects_generation_below_minimum() {
+        let promoting_node = NodeId::from("node-2");
+        let ledger = FreshnessLedger {
+            source_node_id: NodeId::from("node-1"),
+            source_generation: 2,
+            synced_at_secs: 1_000,
+            destination_node_id: None,
+        };
+
+        let result = validate_promotion(Some(&ledger), &promoting_node, 1_002, 10, 5, 2);
+        assert_eq!(
+            result.unwrap_err(),
+            PromotionError::GenerationTooLow {
+                source_gen: 2,
+                min_gen: 5
+            }
+        );
+    }
+
+    #[test]
+    fn validate_promotion_rejects_excessive_future_skew() {
+        let promoting_node = NodeId::from("node-2");
+        let ledger = FreshnessLedger {
+            source_node_id: NodeId::from("node-1"),
+            source_generation: 5,
+            synced_at_secs: 1_010,
+            destination_node_id: None,
+        };
+
+        let result = validate_promotion(Some(&ledger), &promoting_node, 1_000, 10, 1, 2);
+        assert_eq!(
+            result.unwrap_err(),
+            PromotionError::ClockSkewExceeded {
+                synced_at_secs: 1_010,
+                skew_secs: 10,
+                max_skew_secs: 2
+            }
+        );
+    }
+
+    #[test]
+    fn validate_promotion_rejects_replica_mismatch() {
+        let promoting_node = NodeId::from("node-2");
+        let ledger = FreshnessLedger {
+            source_node_id: NodeId::from("node-1"),
+            source_generation: 5,
+            synced_at_secs: 1_000,
+            destination_node_id: Some(NodeId::from("node-3")),
+        };
+
+        let result = validate_promotion(Some(&ledger), &promoting_node, 1_002, 10, 1, 2);
+        assert_eq!(
+            result.unwrap_err(),
+            PromotionError::ReplicaMismatch {
+                bound_to: NodeId::from("node-3"),
+                promoting_node: NodeId::from("node-2")
+            }
+        );
+    }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn prop_promotion_freshness_age_invariant(
+            now_secs in 1_000u64..1_000_000,
+            delta in 0u64..100,
+            max_age in 1u64..50,
+        ) {
+            let promoting = NodeId::from("node-self");
+            let synced = now_secs.saturating_sub(delta);
+            let ledger = FreshnessLedger {
+                source_node_id: NodeId::from("node-src"),
+                source_generation: 10,
+                synced_at_secs: synced,
+                destination_node_id: Some(promoting.clone()),
+            };
+
+            let res = validate_promotion(Some(&ledger), &promoting, now_secs, max_age, 1, 5);
+            let age = now_secs - synced;
+            if age <= max_age {
+                prop_assert!(res.is_ok());
+            } else {
+                prop_assert_eq!(res.unwrap_err(), PromotionError::StaleReplica { age_secs: age, max_age_secs: max_age });
+            }
+        }
     }
 }
