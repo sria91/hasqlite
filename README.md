@@ -23,6 +23,7 @@ described there.
 | HA control loop, promotion, fencing | Module in monolith | First-class crates + `hasqlite` binary |
 | SQL Gateway & client | Embedded in `--ha` | Node runtime concern; shared proto with rsync |
 | CLI sync tool | `rsqlite-rsync` binary | Optional thin wrapper or direct library calls |
+| Standalone single-node in Docker | Supported via `ClientBackend::Local` / compose | Fast-tracked deliverable (Phase 1b) with dedicated container image & config profile |
 | K8s manifests & runbooks | Examples in rsync repo | Opinionated, versioned under `deploy/` |
 
 Long term, durable HA types and orchestration logic should **live here**; sync
