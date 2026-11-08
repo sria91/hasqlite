@@ -161,11 +161,16 @@ While `hasqlite` is primarily an HA clustering engine, single-node standalone op
 is supported as an explicit first-class operational mode:
 
 - **Direct genesis writer bootstrap**: In standalone mode (`mode = "standalone"` in `[node]` or CLI `--mode standalone`),
-  the node skips peer freshness checks, acquires writer status via local file lease or in-process self-grant,
-  and transitions directly from `Starting → Writer(g)`, bypassing the intermediate `Replica` state.
-- **Generation continuity on volume reuse**: If a persistent volume has existing SQLite user metadata from a
-  prior cluster generation `g`, standalone bootstrap initializes at `g + 1` (preserving monotonic generation)
-  rather than resetting to 1, ensuring safe forward migration if the volume is later returned to an HA cluster.
+  the node skips peer freshness checks, acquires writer status via the authoritative file lease (`LeaseRecord`), and transitions
+  directly from `Starting → Writer(g)`, bypassing the intermediate `Replica` state.
+- **Generation continuity & authoritative source of truth**: The lease record (`LeaseRecord.generation` stored in the lease file)
+  is the authoritative source of truth for writer identity and generation (per `docs/safety-contract.md` §2).
+  - **First boot**: On a fresh volume with no prior lease file or database state, initial generation is explicitly `1`.
+  - **Volume reuse**: When bootstrapping on an existing volume, the node reads the prior lease generation `g_lease`
+    and database user metadata `g_db`, setting `g_prior = max(g_lease, g_db)`.
+  - **Monotonic lease acquisition**: Standalone bootstrap writes an updated `LeaseRecord` with `generation = g_prior + 1`
+    (or `1` if `g_prior == 0`) under advisory POSIX file locking (`flock`), guaranteeing generation monotonicity
+    if the volume is subsequently migrated into an HA cluster.
 - **Mutual exclusion via POSIX file locking (`flock`)**: The file lease source enforces advisory POSIX file locking
   (`flock`/`fcntl`) on the lease file. If multiple containers mistakenly bind-mount the same host volume,
   the second container fails fast with `EWOULDBLOCK` rather than causing split-brain write corruption.
@@ -272,7 +277,7 @@ Scope:
 - `deploy/docker/docker-compose.standalone.yml` and container quickstart scripts with host volume permission guidance.
 - Standalone mode profile in `hasqlite-core` and `hasqlite-node`:
   - `mode = "standalone"` in `ClusterConfig` (or `--mode standalone` CLI / `HASQLITE_MODE=standalone`).
-  - Auto-acquire genesis writer lease (POSIX `flock` on file lease or in-memory self-fenced lease) at monotonic generation `g` without requiring peer sync history or freshness section.
+  - Auto-acquire genesis writer lease (POSIX `flock` on file lease) writing an authoritative `LeaseRecord` at `new_gen = g_prior + 1` (defaulting to `1` on first boot, or incrementing `max(g_lease, g_db)` observed from prior volume state) without requiring peer sync history or freshness section.
   - Secret file credential support: `auth_token_file` (or `HASQLITE_GRPC_AUTH_TOKEN_FILE`) for secure credential mounting via Docker secrets or volume files.
   - Minimal node supervisor: bind gRPC SQL gateway engine and HTTP probe server (`/ready`, `/live`, `/healthz`).
   - Graceful shutdown handling: synchronous `sqlite3_wal_checkpoint_v2(TRUNCATE)`, in-flight connection draining, and lease release within Docker's 10s grace window on `SIGTERM`/`SIGINT`.
@@ -486,7 +491,7 @@ For running a single standalone node in Docker without replication peers:
 ```toml
 [node]
 id = "standalone-0"
-mode = "standalone" # Auto-promotes to genesis writer at generation g
+mode = "standalone" # Auto-promotes to genesis writer at generation g_prior + 1 (1 on first boot)
 
 [data]
 dir = "/var/lib/hasqlite"
