@@ -1,0 +1,6 @@
+/target/
+**/*.proptest-regressions
+/.vscode
+/.cursor
+/.codebase-memory
+/.zed/settings.json
