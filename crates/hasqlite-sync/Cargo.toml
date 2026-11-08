@@ -1,0 +1,15 @@
+[package]
+name = "hasqlite-sync"
+description = "Sync scheduling wrapping rsqlite-rsync"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+hasqlite-core = { path = "../hasqlite-core" }
+thiserror.workspace = true
+tokio.workspace = true
+
+# In Phase 2, wire replication via git dependency or workspace patch override:
+# rsqlite-rsync = { git = "https://github.com/sria91/rsqlite-rsync", branch = "master" }
