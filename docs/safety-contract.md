@@ -22,9 +22,14 @@ already implicit in `rsqlite-rsync` HA mode.
 ## Promotion
 
 7. A node may **promote to writer** only if:
-   - It holds the current lease (or acquires it per lease rules), **and**
+   - It successfully executes an atomic lease acquisition / compare-and-swap (CAS)
+     operation incrementing the generation counter (`new_gen = expected_gen + 1`)
+     with generation fencing, **and**
    - `validate_promotion` passes: freshness age ≤ `max_freshness_age_secs`,
-     generation ≥ `min_source_generation`, clock skew within bounds.
+     generation ≥ `min_source_generation`, verified `source_node_id`, and clock
+     skew within bounds.
+   - If the atomic lease acquisition fails (e.g. concurrent claim lost to a peer),
+     promotion is denied and the node remains a replica (fail closed).
 8. **Failed promotion** must not open writable SQL paths (fail closed).
 
 ## Demotion

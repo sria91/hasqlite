@@ -3,7 +3,7 @@
 High Availability SQLite in Rust. This document is the implementation handoff:
 architecture, phased delivery, crate layout, and a test matrix derived from
 production patterns already proven in
-[`rsqlite-rsync`](../../rsqlite-rsync).
+[`rsqlite-rsync`](https://github.com/sria91/rsqlite-rsync).
 
 ---
 
@@ -124,17 +124,29 @@ States: `Starting` → `Replica` | `Writer(g)` → `Demoting` → `Replica`.
 
 Events per tick (from rsync `ReconcileDecision` model):
 
-1. Observe lease (holder, generation, TTL).
-2. Observe freshness (source generation, age).
-3. Decide: `KeepWriter`, `Promote`, `Demote`, `StayReplica`, `NoOp`.
-4. Execute actions: sync pull, open/close writable handles, update role files,
-   append audit, update probes.
+1. Observe lease (holder, generation, TTL, renewal timestamp).
+2. Observe freshness (source node ID, source generation, sync timestamp, age).
+3. Evaluate promotion eligibility:
+   - If writer: check lease validity and renewal deadline.
+   - If replica and lease expired/unheld: verify `validate_promotion` (freshness age ≤ `max_freshness_age_secs`, source generation ≥ `min_source_generation`, verified source node, clock skew within bounds).
+4. Atomic lease acquisition with generation fencing:
+   - When a replica is eligible to promote, it must NOT immediately assume the writer role.
+   - The candidate replica MUST execute an atomic lease acquisition or compare-and-swap (CAS) operation on the authoritative lease store (e.g. Kubernetes Lease API `resourceVersion` CAS or file lock CAS).
+   - CAS condition: assert `expected_generation == observed_generation` and atomically set `holder = self`, `new_generation = observed_generation + 1`, and updated TTL.
+   - If CAS succeeds: node advances to `Promote` with authoritative writer rights for `new_generation`.
+   - If CAS fails (e.g. concurrent race won by another replica or renewal by writer): promotion is aborted immediately; node transitions to `StayReplica` (fail closed).
+5. Decide: `KeepWriter`, `Promote`, `Demote`, `StayReplica`, `NoOp`.
+6. Execute actions:
+   - On `Promote` (strictly gated by CAS success): open writable handle, activate generation write fence, update role file to `writer:<gen>`, append audit, update probes (`/ready`).
+   - On `Demote`: close/fence writable handles, abort in-flight writes, update role file to `replica`, update probes.
+   - On `StayReplica`: trigger scheduled sync pull from current writer if due.
 
 **Invariants** (tested continuously):
 
 - At most one node reports `Writer` for a given lease epoch.
-- No SQL write accepted unless `enforce_write_fence` passes.
-- Promotion rejected when `validate_promotion` fails (stale freshness, generation).
+- Single-writer promotion guarantee: promotion strictly requires prior success of an atomic lease compare-and-swap (CAS) incrementing the generation counter; lost CAS races fail closed (`StayReplica`).
+- No SQL write accepted unless `enforce_write_fence` passes for the current generation.
+- Promotion rejected when `validate_promotion` fails (stale freshness, generation mismatch, unattributed freshness ledger).
 - Replica DB not written except by sync engine (exclusive replica).
 
 ---
@@ -167,10 +179,10 @@ hasqlite/
 
 ### Dependency on rsqlite-rsync
 
-Use a **path dependency** during development:
+Use a **path dependency** during development in `crates/hasqlite-sync/Cargo.toml`:
 
 ```toml
-rsqlite-rsync = { path = "../../rsqlite-rsync", default-features = false }
+rsqlite-rsync = { path = "../../../rsqlite-rsync", default-features = false }
 ```
 
 Published versions should pin to crates.io releases once HA APIs are stabilized
@@ -205,15 +217,17 @@ Target for v1.0: **E2** (wrapper + comprehensive tests); v1.2: **E3**.
 
 Port **pure logic** from `rsqlite-rsync/src/ha.rs` into `hasqlite-controller`:
 
-- `parse_lease_record`, `parse_freshness_ledger`
+- `parse_lease_record`, `parse_freshness_ledger` (with non-empty source node attribution)
 - `validate_promotion`, `enforce_write_fence`
-- `HaController::tick` equivalent with injectable `LeaseSource` / `FreshnessSource`
-- `ControllerPlan` + `execute_controller_plan` with test doubles
+- Atomic lease acquisition / CAS trait: `LeaseSource::compare_and_swap_lease(expected_generation, new_holder, new_generation) -> Result<LeaseRecord, LeaseCasError>` with generation fencing
+- `HaController::tick` equivalent with injectable `LeaseSource` / `FreshnessSource`, strictly gating any promotion decision/action on atomic lease acquisition success
+- `ControllerPlan` + `execute_controller_plan` with test doubles modeling concurrent promotion races where multiple replicas observe an expired lease simultaneously
 
 Deliverables:
 
 - 100% line coverage on promotion/fencing pure functions (see §6.1)
-- Property tests for generation monotonicity and TTL expiry
+- Property tests for generation monotonicity, atomic CAS success/loss races, and TTL expiry
+- Single-winner verification: dual replica failover simulation asserting exactly one node promotes
 - No SQLite I/O in this crate (fast CI)
 
 ### Phase 2 — Sync orchestration (weeks 4–6)
@@ -448,8 +462,8 @@ Alerts (recommended):
 
 ## 11. References
 
-- [rsqlite-rsync README](../../rsqlite-rsync/README.md)
-- [rsqlite-rsync HA guide](../../rsqlite-rsync/docs/ha-guide.md)
-- [k3s HA runbook](../../rsqlite-rsync/docs/k3s-ha-runbook.md)
-- [Protocol](../../rsqlite-rsync/docs/protocol.md)
-- [plan-k3sHaSqliteSync.prompt.md](../../rsqlite-rsync/.github/prompts/plan-k3sHaSqliteSync.prompt.md)
+- [rsqlite-rsync README](https://github.com/sria91/rsqlite-rsync/blob/master/README.md)
+- [rsqlite-rsync HA guide](https://github.com/sria91/rsqlite-rsync/blob/master/docs/ha-guide.md)
+- [k3s HA runbook](https://github.com/sria91/rsqlite-rsync/blob/master/docs/k3s-ha-runbook.md)
+- [Protocol](https://github.com/sria91/rsqlite-rsync/blob/master/docs/protocol.md)
+- [plan-k3sHaSqliteSync.prompt.md](https://github.com/sria91/rsqlite-rsync/blob/master/.github/prompts/plan-k3sHaSqliteSync.prompt.md)

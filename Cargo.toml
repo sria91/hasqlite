@@ -9,7 +9,6 @@ members = [
     "crates/hasqlite-node",
     "hasqlite",
 ]
-default-members = ["hasqlite"]
 
 [workspace.package]
 edition = "2024"

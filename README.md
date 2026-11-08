@@ -5,7 +5,7 @@ active–passive SQLite clusters: lease-based single-writer fencing, incremental
 page-level replication, and an optional SQL gateway for application traffic.
 
 This repository is a **focused HA product** built on learnings from
-[`rsqlite-rsync`](../rsqlite-rsync): bandwidth-efficient rsync-style page sync,
+[`rsqlite-rsync`](https://github.com/sria91/rsqlite-rsync): bandwidth-efficient rsync-style page sync,
 file/Kubernetes lease coordination, freshness-gated promotion, and gRPC SQL
 access with leader discovery.
 
@@ -33,7 +33,7 @@ duplication.
 
 - [Comprehensive plan](docs/PLAN.md)
 - [Safety contract (draft)](docs/safety-contract.md)
-- [rsqlite-rsync HA guide](../rsqlite-rsync/docs/ha-guide.md)
+- [rsqlite-rsync HA guide](https://github.com/sria91/rsqlite-rsync/blob/master/docs/ha-guide.md)
 
 ## License
 
