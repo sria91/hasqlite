@@ -4,8 +4,58 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Stable identity for a cluster member (hostname, pod name, etc.).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct NodeId(pub String);
+
+impl NodeId {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for NodeId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl From<String> for NodeId {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+impl From<&str> for NodeId {
+    fn from(s: &str) -> Self {
+        Self(s.to_string())
+    }
+}
+
+impl AsRef<str> for NodeId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for NodeId {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+/// Supported coordination backend types for writer leases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LeaseSourceType {
+    Kubernetes,
+    File,
+}
 
 /// Top-level cluster configuration (see `docs/PLAN.md` §7).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -20,9 +70,80 @@ pub struct ClusterConfig {
     pub probes: ProbesSection,
 }
 
+impl ClusterConfig {
+    /// Validates semantic correctness, required backend sections, positive intervals, and socket address formats.
+    pub fn validate(&self) -> Result<(), HasqliteError> {
+        if self.node.id.as_str().trim().is_empty() {
+            return Err(HasqliteError::Validation(
+                "node.id must not be empty".to_string(),
+            ));
+        }
+        if self.sync.interval_secs == 0 {
+            return Err(HasqliteError::Validation(
+                "sync.interval_secs must be greater than 0".to_string(),
+            ));
+        }
+        if self.freshness.max_age_secs == 0 {
+            return Err(HasqliteError::Validation(
+                "freshness.max_age_secs must be greater than 0".to_string(),
+            ));
+        }
+        match self.lease.source {
+            LeaseSourceType::Kubernetes => {
+                let k8s = self.lease.kubernetes.as_ref().ok_or_else(|| {
+                    HasqliteError::Validation(
+                        "lease.source is 'kubernetes' but lease.kubernetes section is missing"
+                            .to_string(),
+                    )
+                })?;
+                if k8s.lease_name.trim().is_empty() {
+                    return Err(HasqliteError::Validation(
+                        "lease.kubernetes.lease_name must not be empty".to_string(),
+                    ));
+                }
+                if k8s.namespace.trim().is_empty() {
+                    return Err(HasqliteError::Validation(
+                        "lease.kubernetes.namespace must not be empty".to_string(),
+                    ));
+                }
+            }
+            LeaseSourceType::File => {
+                let file = self.lease.file.as_ref().ok_or_else(|| {
+                    HasqliteError::Validation(
+                        "lease.source is 'file' but lease.file section is missing".to_string(),
+                    )
+                })?;
+                if file.path.as_os_str().is_empty() {
+                    return Err(HasqliteError::Validation(
+                        "lease.file.path must not be empty".to_string(),
+                    ));
+                }
+            }
+        }
+        if self.gateway.bind.parse::<std::net::SocketAddr>().is_err() {
+            return Err(HasqliteError::Validation(format!(
+                "gateway.bind '{}' is not a valid socket address (expected IP:PORT)",
+                self.gateway.bind
+            )));
+        }
+        if self
+            .probes
+            .http_bind
+            .parse::<std::net::SocketAddr>()
+            .is_err()
+        {
+            return Err(HasqliteError::Validation(format!(
+                "probes.http_bind '{}' is not a valid socket address (expected IP:PORT)",
+                self.probes.http_bind
+            )));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeSection {
-    pub id: String,
+    pub id: NodeId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -32,7 +153,7 @@ pub struct DataSection {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LeaseSection {
-    pub source: String,
+    pub source: LeaseSourceType,
     #[serde(default)]
     pub file: Option<FileLeaseSection>,
     #[serde(default)]
@@ -85,27 +206,28 @@ pub struct ProbesSection {
     pub http_bind: String,
 }
 
-#[derive(thiserror::Error, Debug)]
+#[derive(thiserror::Error, Debug, PartialEq, Eq)]
 pub enum HasqliteError {
     #[error("configuration error: {0}")]
     Config(String),
+    #[error("validation error: {0}")]
+    Validation(String),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn cluster_config_models_all_documented_sections() {
-        let config = ClusterConfig {
+    fn valid_test_config() -> ClusterConfig {
+        ClusterConfig {
             node: NodeSection {
-                id: "pod-0".to_string(),
+                id: NodeId::from("pod-0"),
             },
             data: DataSection {
                 dir: PathBuf::from("/var/lib/hasqlite"),
             },
             lease: LeaseSection {
-                source: "kubernetes".to_string(),
+                source: LeaseSourceType::Kubernetes,
                 file: None,
                 kubernetes: Some(KubernetesLeaseSection {
                     lease_name: "hasqlite-writer".to_string(),
@@ -133,15 +255,142 @@ mod tests {
             probes: ProbesSection {
                 http_bind: "0.0.0.0:8088".to_string(),
             },
-        };
+        }
+    }
 
-        assert_eq!(config.node.id, "pod-0");
+    #[test]
+    fn cluster_config_models_all_documented_sections() {
+        let config = valid_test_config();
+        assert_eq!(config.node.id, NodeId::from("pod-0"));
+        assert_eq!(config.node.id.as_str(), "pod-0");
         assert_eq!(config.data.dir, PathBuf::from("/var/lib/hasqlite"));
-        assert_eq!(config.lease.source, "kubernetes");
+        assert_eq!(config.lease.source, LeaseSourceType::Kubernetes);
         assert_eq!(config.freshness.max_age_secs, 10);
         assert_eq!(config.promotion.max_future_skew_secs, 2);
         assert_eq!(config.sync.interval_secs, 2);
         assert_eq!(config.gateway.bind, "0.0.0.0:50051");
         assert_eq!(config.probes.http_bind, "0.0.0.0:8088");
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn toml_roundtrip_and_defaults() {
+        let toml_str = r#"
+[node]
+id = "node-alpha"
+
+[data]
+dir = "/tmp/data"
+
+[lease]
+source = "file"
+
+[lease.file]
+path = "/tmp/hasqlite.lease"
+
+[freshness]
+path = "/tmp/freshness.txt"
+max_age_secs = 5
+
+[promotion]
+min_source_generation = 1
+max_future_skew_secs = 3
+
+[sync]
+interval_secs = 1
+
+[gateway]
+bind = "127.0.0.1:50051"
+
+[probes]
+http_bind = "127.0.0.1:8088"
+"#;
+
+        let parsed: ClusterConfig = toml::from_str(toml_str).expect("should parse valid toml");
+        assert_eq!(parsed.node.id, NodeId::from("node-alpha"));
+        assert_eq!(parsed.lease.source, LeaseSourceType::File);
+        assert!(!parsed.gateway.allow_replica_reads);
+        assert_eq!(parsed.gateway.auth_token_env, None);
+        assert_eq!(parsed.sync.origin_endpoint, None);
+        assert!(parsed.validate().is_ok());
+
+        let serialized = toml::to_string(&parsed).expect("should serialize to toml");
+        let reloaded: ClusterConfig =
+            toml::from_str(&serialized).expect("should reload serialized toml");
+        assert_eq!(parsed, reloaded);
+    }
+
+    #[test]
+    fn validation_rejects_empty_node_id() {
+        let mut config = valid_test_config();
+        config.node.id = NodeId::from("   ");
+        let err = config.validate().unwrap_err();
+        assert_eq!(
+            err,
+            HasqliteError::Validation("node.id must not be empty".to_string())
+        );
+    }
+
+    #[test]
+    fn validation_rejects_zero_sync_interval() {
+        let mut config = valid_test_config();
+        config.sync.interval_secs = 0;
+        let err = config.validate().unwrap_err();
+        assert_eq!(
+            err,
+            HasqliteError::Validation("sync.interval_secs must be greater than 0".to_string())
+        );
+    }
+
+    #[test]
+    fn validation_rejects_zero_freshness_max_age() {
+        let mut config = valid_test_config();
+        config.freshness.max_age_secs = 0;
+        let err = config.validate().unwrap_err();
+        assert_eq!(
+            err,
+            HasqliteError::Validation("freshness.max_age_secs must be greater than 0".to_string())
+        );
+    }
+
+    #[test]
+    fn validation_rejects_missing_kubernetes_section() {
+        let mut config = valid_test_config();
+        config.lease.source = LeaseSourceType::Kubernetes;
+        config.lease.kubernetes = None;
+        let err = config.validate().unwrap_err();
+        assert_eq!(
+            err,
+            HasqliteError::Validation(
+                "lease.source is 'kubernetes' but lease.kubernetes section is missing".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn validation_rejects_missing_file_section() {
+        let mut config = valid_test_config();
+        config.lease.source = LeaseSourceType::File;
+        config.lease.file = None;
+        let err = config.validate().unwrap_err();
+        assert_eq!(
+            err,
+            HasqliteError::Validation(
+                "lease.source is 'file' but lease.file section is missing".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn validation_rejects_invalid_socket_address() {
+        let mut config = valid_test_config();
+        config.gateway.bind = "invalid-address".to_string();
+        let err = config.validate().unwrap_err();
+        assert!(matches!(err, HasqliteError::Validation(msg) if msg.contains("gateway.bind")));
+
+        let mut config2 = valid_test_config();
+        config2.probes.http_bind = "999.999.999.999:80".to_string();
+        let err2 = config2.validate().unwrap_err();
+        assert!(matches!(err2, HasqliteError::Validation(msg) if msg.contains("probes.http_bind")));
     }
 }

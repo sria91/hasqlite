@@ -1,3 +1,5 @@
+<!-- Canonical reference: AGENTS.md (keep synchronized across editor rules) -->
+
 ## Codebase Memory MCP
 
 **Use Codebase Memory MCP graph tools FIRST when available — before reading files or making code changes. Ordinary file search and reads remain permitted when the server is unavailable or unconfigured.**

@@ -11,5 +11,5 @@ hasqlite-core = { path = "../hasqlite-core" }
 thiserror.workspace = true
 tokio.workspace = true
 
-# Uncomment in Phase 2 when wiring replication:
-# rsqlite-rsync = { path = "../../../rsqlite-rsync" }
+# In Phase 2, wire replication via git dependency or workspace patch override:
+# rsqlite-rsync = { git = "https://github.com/sria91/rsqlite-rsync", branch = "master" }

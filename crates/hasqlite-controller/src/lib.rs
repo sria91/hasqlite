@@ -1,10 +1,9 @@
 //! Controller reconcile and promotion gates — implementation lands in Phase 1.
 
-#![allow(dead_code)]
-
 use hasqlite_lease::{FreshnessLedger, LeaseRecord};
 
 /// Placeholder for the tick outcome type (will match rsqlite-rsync `HaController`).
+#[derive(Debug, Clone)]
 pub struct ControllerTick {
     pub lease: LeaseRecord,
     pub freshness: Option<FreshnessLedger>,
