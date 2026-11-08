@@ -18,6 +18,14 @@ already implicit in `rsqlite-rsync` HA mode.
    of sync start (rsync snapshot semantics).
 6. **Freshness ledger** records last successful sync: `source_node_id`,
    `source_generation`, `synced_at_secs`.
+   - **Replica binding**: Freshness must be bound to the replica that received
+     the snapshot by requiring replica-specific ledger storage (e.g. replica-private
+     state path) or recording the destination identity and validating it before
+     allowing promotion.
+   - **Snapshot start timestamp**: `synced_at_secs` defines freshness by the
+     snapshot start time (when origin snapshot began), not sync completion time.
+   - **Publication**: The timestamp and ledger record are published only after
+     the sync succeeds.
 
 ## Promotion
 
@@ -25,30 +33,35 @@ already implicit in `rsqlite-rsync` HA mode.
    - It successfully executes an atomic lease acquisition / compare-and-swap (CAS)
      operation incrementing the generation counter (`new_gen = expected_gen + 1`)
      with generation fencing, **and**
-   - `validate_promotion` passes: freshness age ≤ `max_freshness_age_secs`,
-     generation ≥ `min_source_generation`, verified `source_node_id`, and clock
-     skew within bounds.
+   - `validate_promotion` passes: freshness bound to the replica, freshness age ≤
+     `max_freshness_age_secs`, generation ≥ `min_source_generation`, verified
+     `source_node_id`, and clock skew within bounds.
    - If the atomic lease acquisition fails (e.g. concurrent claim lost to a peer),
      promotion is denied and the node remains a replica (fail closed).
-8. **Failed promotion** must not open writable SQL paths (fail closed).
+8. **First-writer bootstrap**: for clusters with no writer and no successful sync
+   ledger, an explicit genesis procedure or verified seed-snapshot procedure
+   establishes the initial generation and writer. Normal failover strictly keeps
+   `validate_promotion` and its freshness, source identity, replica binding, and
+   fencing requirements intact.
+9. **Failed promotion** must not open writable SQL paths (fail closed).
 
 ## Demotion
 
-9. On lease loss or TTL expiry while writer: **immediate demotion**; stop
-   accepting writes; gateway returns `NOT_LEADER` with redirect hint.
-10. Former writer **rejoins as replica** and must resync before eligible to
+10. On lease loss or TTL expiry while writer: **immediate demotion**; stop
+    accepting writes; gateway returns `NOT_LEADER` with redirect hint.
+11. Former writer **rejoins as replica** and must resync before eligible to
     promote again.
 
 ## Fencing
 
-11. `enforce_write_fence` gates all mutating SQL on the writer path.
-12. **Authentication** (bearer token) is independent of fencing; both are required
+12. `enforce_write_fence` gates all mutating SQL on the writer path.
+13. **Authentication** (bearer token) is independent of fencing; both are required
     in production configurations.
 
 ## Kubernetes
 
-13. **Rollout probes**: use `/healthz` for pod readiness during rolling updates;
+14. **Rollout probes**: use `/healthz` for pod readiness during rolling updates;
     use `/ready` only when routing write traffic to the current writer.
-14. **preStop**: mandatory sync attempt before SIGTERM to tighten RPO.
+15. **preStop**: mandatory sync attempt before SIGTERM to tighten RPO.
 
 Violations of this contract are **severity-0** bugs.

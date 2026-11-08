@@ -123,15 +123,15 @@ mod tests {
             sync: SyncSection {
                 interval_secs: 2,
                 origin_endpoint: Some("grpc://writer:50051".to_string()),
-                transport_auth_token_env: Some("RSQLITE_GRPC_AUTH_TOKEN".to_string()),
+                transport_auth_token_env: Some("HASQLITE_GRPC_AUTH_TOKEN".to_string()),
             },
             gateway: GatewaySection {
                 bind: "0.0.0.0:50051".to_string(),
-                auth_token_env: Some("RSQLITE_GRPC_AUTH_TOKEN".to_string()),
+                auth_token_env: Some("HASQLITE_GRPC_AUTH_TOKEN".to_string()),
                 allow_replica_reads: false,
             },
             probes: ProbesSection {
-                http_bind: "0.0.0.8:8088".to_string(),
+                http_bind: "0.0.0.0:8088".to_string(),
             },
         };
 
@@ -142,6 +142,6 @@ mod tests {
         assert_eq!(config.promotion.max_future_skew_secs, 2);
         assert_eq!(config.sync.interval_secs, 2);
         assert_eq!(config.gateway.bind, "0.0.0.0:50051");
-        assert_eq!(config.probes.http_bind, "0.0.0.8:8088");
+        assert_eq!(config.probes.http_bind, "0.0.0.0:8088");
     }
 }

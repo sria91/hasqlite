@@ -1,10 +1,10 @@
 ## Codebase Memory MCP
 
-**MANDATORY: use Codebase Memory MCP graph tools FIRST — before reading files or making code changes.**
+**Use Codebase Memory MCP graph tools FIRST when available — before reading files or making code changes. Ordinary file search and reads remain permitted when the server is unavailable or unconfigured.**
 
 This rule applies to every request involving this codebase.
 
-Always call `list_projects` first when you do not already know the project name, then use the `display_name` or exact `name` returned by that tool.
+Always call `list_projects` first when you do not already know the project name, then use the `display_name` or exact `name` returned by that tool. If the checkout is not indexed, use `index_repository` first.
 
 ```json
 // Step 0 — discover project names
@@ -16,11 +16,11 @@ mcp_codebase-memo_get_architecture({ "project": "<display_name>" })
 
 ### Workflow
 
-1. Call `list_projects` to discover the correct project name.
+1. Call `list_projects` to discover the correct project name (index with `index_repository` if not indexed).
 2. Call `get_architecture(project)` to understand the codebase structure.
 3. Use `search_graph` to find relevant symbols, `trace_call_path` for call chains.
 4. Use `get_code_snippet` to read specific function implementations.
-5. Only use `read_file` when you need exact raw content to edit a specific line.
+5. Use `read_file` when you need exact raw content to edit a specific line, or when the index does not cover requested content (including for diagnosis without editing); retain the restriction to exact raw content needed for the task.
 
 ### Available Tools (14 MCP tools)
 

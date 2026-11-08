@@ -7,7 +7,7 @@ production patterns already proven in
 
 ---
 
-## 1. Goals and non-goals
+## 1. Goals and future goals
 
 ### Goals
 
@@ -23,7 +23,7 @@ production patterns already proven in
 5. **Library-first**: embed the HA controller in custom agents; ship a
    batteries-included `hasqlite` node binary.
 
-### Non-goals (v1)
+### Future goals (non-goals for v1)
 
 - Multi-writer / distributed SQL consensus (Raft, Paxos, SQLite session
   extension).
@@ -132,7 +132,7 @@ Events per tick (from rsync `ReconcileDecision` model):
 4. Atomic lease acquisition with generation fencing:
    - When a replica is eligible to promote, it must NOT immediately assume the writer role.
    - The candidate replica MUST execute an atomic lease acquisition or compare-and-swap (CAS) operation on the authoritative lease store (e.g. Kubernetes Lease API `resourceVersion` CAS or file lock CAS).
-   - CAS condition: assert `expected_generation == observed_generation` and atomically set `holder = self`, `new_generation = observed_generation + 1`, and updated TTL.
+   - CAS condition: the acquisition CAS cannot replace a lease renewed after the candidate's observation: compare a version that changes on renewal (e.g. Kubernetes Lease `resourceVersion` or monotonic renewal counter), or atomically recheck the holder and expiry under the file lock while asserting `expected_generation == observed_generation` and confirming the observed lease remains unheld/expired before atomically setting `holder = self`, `new_generation = observed_generation + 1`, and updated TTL.
    - If CAS succeeds: node advances to `Promote` with authoritative writer rights for `new_generation`.
    - If CAS fails (e.g. concurrent race won by another replica or renewal by writer): promotion is aborted immediately; node transitions to `StayReplica` (fail closed).
 5. Decide: `KeepWriter`, `Promote`, `Demote`, `StayReplica`, `NoOp`.
@@ -145,6 +145,7 @@ Events per tick (from rsync `ReconcileDecision` model):
 
 - At most one node reports `Writer` for a given lease epoch.
 - Single-writer promotion guarantee: promotion strictly requires prior success of an atomic lease compare-and-swap (CAS) incrementing the generation counter; lost CAS races fail closed (`StayReplica`).
+- Live-holder preservation: a renewal occurring between candidate observation and acquisition CAS prevents replacement of the live holder.
 - No SQL write accepted unless `enforce_write_fence` passes for the current generation.
 - Promotion rejected when `validate_promotion` fails (stale freshness, generation mismatch, unattributed freshness ledger).
 - Replica DB not written except by sync engine (exclusive replica).
@@ -219,7 +220,7 @@ Port **pure logic** from `rsqlite-rsync/src/ha.rs` into `hasqlite-controller`:
 
 - `parse_lease_record`, `parse_freshness_ledger` (with non-empty source node attribution)
 - `validate_promotion`, `enforce_write_fence`
-- Atomic lease acquisition / CAS trait: `LeaseSource::compare_and_swap_lease(expected_generation, new_holder, new_generation) -> Result<LeaseRecord, LeaseCasError>` with generation fencing
+- Atomic lease acquisition / CAS trait: `LeaseSource::compare_and_swap_lease(expected_generation, expected_version, new_holder, new_generation) -> Result<LeaseRecord, LeaseCasError>` with generation and renewal fencing (compares version or rechecks expiry to prevent replacing a renewed lease)
 - `HaController::tick` equivalent with injectable `LeaseSource` / `FreshnessSource`, strictly gating any promotion decision/action on atomic lease acquisition success
 - `ControllerPlan` + `execute_controller_plan` with test doubles modeling concurrent promotion races where multiple replicas observe an expired lease simultaneously
 
@@ -227,6 +228,7 @@ Deliverables:
 
 - 100% line coverage on promotion/fencing pure functions (see §6.1)
 - Property tests for generation monotonicity, atomic CAS success/loss races, and TTL expiry
+- Race test showing that a renewal between observation and acquisition prevents replacement of the live holder
 - Single-winner verification: dual replica failover simulation asserting exactly one node promotes
 - No SQLite I/O in this crate (fast CI)
 
@@ -289,6 +291,7 @@ Deliverables:
 | Promotion | stale freshness, wrong generation, clock skew | pure function asserts |
 | Write fence | non-writer, expired lease, generation mismatch | enum `PromotionViolation` |
 | Reconcile | steal lease, renew, partition (stale holder) | state machine scenarios |
+| CAS acquisition race | renewal between observation and acquisition | mock lease store (assert CAS fails, holder preserved) |
 | Action execution | partial failure, continue-on-error | mock executor |
 
 **Property-based** (proptest, mirror `property_tests.rs`):
@@ -403,11 +406,11 @@ max_future_skew_secs = 2
 [sync]
 interval_secs = 2
 origin_endpoint = "grpc://writer:50051" # role-dependent
-transport_auth_token_env = "RSQLITE_GRPC_AUTH_TOKEN"
+transport_auth_token_env = "HASQLITE_GRPC_AUTH_TOKEN"
 
 [gateway]
 bind = "0.0.0.0:50051"
-auth_token_env = "RSQLITE_GRPC_AUTH_TOKEN"
+auth_token_env = "HASQLITE_GRPC_AUTH_TOKEN"
 allow_replica_reads = false
 
 [probes]
