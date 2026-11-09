@@ -129,6 +129,8 @@ fn is_valid_sync_origin_endpoint(endpoint: &str) -> bool {
         || host.to_ascii_lowercase().ends_with(".localhost");
 
     valid_host
+        && !port.is_empty()
+        && port.bytes().all(|byte| byte.is_ascii_digit())
         && port.parse::<u16>().is_ok_and(|port| port != 0)
         && (scheme == "https" || (scheme == "grpc" && loopback))
 }
@@ -941,6 +943,7 @@ http_bind = "0.0.0.0:8088"
             "grpc://",
             "grpc://writer",
             "grpc://writer:abc",
+            "https://writer:+443",
             "grpc://writer:0",
             "grpc://writer:65536",
             "grpc://bad_host:50051",

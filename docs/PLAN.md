@@ -193,7 +193,6 @@ flowchart TB
   subgraph k8s ["Kubernetes StatefulSet Deployment Architecture"]
     subgraph services ["Routing & Services Layer"]
       SVC_WRITE["Service: hasqlite-writer\n(Routes writes to writer EndpointSlice)"]
-      SVC_SYNC["Headless Service: hasqlite-headless\n(Stable pod DNS for replication pull)"]
       SVC_READ["Service: hasqlite-replicas\n(Optional load balancing for read-only traffic)"]
       WRITER_EPS_CTRL["Writer EndpointSlice controller\n(Checks each pod's /ready)"]
       WRITER_EPS["hasqlite-writer EndpointSlice\n(Only active /ready=200 endpoint)"]
@@ -208,7 +207,7 @@ flowchart TB
       subgraph p0_vols ["Volumes & Storage"]
         P0_PVC[("PVC: data-hasqlite-0\n(/var/lib/hasqlite: DB & WAL)")]
         P0_CFG["ConfigMap: /etc/hasqlite/cluster.toml (ro)"]
-        P0_SEC["Secret: /run/secrets/hasqlite_token (mode 0400)"]
+        P0_SEC["Secret: /run/secrets/hasqlite_token (mode 0440; restricted fsGroup)"]
       end
 
       P0_HOOKS["Lifecycle & Probes\n- preStop: checkpoint WAL(TRUNCATE) & drain\n- readinessProbe: :8088/healthz\n- livenessProbe: :8088/live"]
@@ -223,7 +222,7 @@ flowchart TB
       subgraph p1_vols ["Volumes & Storage"]
         P1_PVC[("PVC: data-hasqlite-1\n(/var/lib/hasqlite: Exclusive Replica DB)")]
         P1_LEDGER[("Freshness Ledger: /var/run/freshness.txt\n(Replica-bound sync timestamp & gen)")]
-        P1_SEC["Secret: /run/secrets/hasqlite_token (mode 0400)"]
+        P1_SEC["Secret: /run/secrets/hasqlite_token (mode 0440; restricted fsGroup)"]
       end
 
       P1_HOOKS["Lifecycle & Probes\n- preStop: catchup sync before termination\n- readinessProbe: :8088/healthz\n- livenessProbe: :8088/live"]
@@ -237,7 +236,7 @@ flowchart TB
 
       subgraph p2_vols ["Volumes & Storage"]
         P2_PVC[("PVC: data-hasqlite-2\n(/var/lib/hasqlite: Replica DB)")]
-        P2_SEC["Secret: /run/secrets/hasqlite_token (mode 0400)"]
+        P2_SEC["Secret: /run/secrets/hasqlite_token (mode 0440; restricted fsGroup)"]
       end
     end
 
@@ -256,19 +255,18 @@ flowchart TB
   SVC_READ -.->|"Read-only queries (:50443 TLS via sidecar)"| P2_TLS
   P2_TLS -.->|"Plaintext gRPC (127.0.0.1:50051)"| P2_MAIN
 
-  P1_MAIN -->|"Pull pages via HTTPS with bearer token"| SVC_SYNC
-  P2_MAIN -->|"Pull pages via HTTPS with bearer token"| SVC_SYNC
-  SVC_SYNC -->|"Forward sync RPC (:50443 TLS via sidecar)"| P0_TLS
+  P1_MAIN -->|"Pull pages via HTTPS with bearer token"| SVC_WRITE
+  P2_MAIN -->|"Pull pages via HTTPS with bearer token"| SVC_WRITE
 
   P0_MAIN -->|"Read/Write"| P0_PVC
   P0_MAIN -->|"Read configuration"| P0_CFG
-  P0_MAIN -->|"Read auth token"| P0_SEC
+  P0_MAIN -->|"Read auth token (UID 1000 via restricted fsGroup)"| P0_SEC
 
   P1_MAIN -->|"Apply replicated pages"| P1_PVC
   P1_MAIN -->|"Write last sync record"| P1_LEDGER
-  P1_MAIN -->|"Read replica sync auth token"| P1_SEC
+  P1_MAIN -->|"Read sync token (UID 1000 via restricted fsGroup)"| P1_SEC
   P2_MAIN -->|"Apply replicated pages"| P2_PVC
-  P2_MAIN -->|"Read replica sync auth token"| P2_SEC
+  P2_MAIN -->|"Read sync token (UID 1000 via restricted fsGroup)"| P2_SEC
 
   P0_MAIN -->|"Periodic lease renewal (generation g)"| K8S_LEASE
   P1_MAIN -->|"Observe lease & atomic CAS acquire (gen g+1)"| K8S_LEASE
@@ -710,6 +708,7 @@ max_future_skew_secs = 2
 interval_secs = 2
 origin_endpoint = "https://writer:50443" # remote origins require TLS; grpc:// is loopback-only
 transport_auth_token_env = "HASQLITE_GRPC_AUTH_TOKEN"
+# To use a file instead, comment out transport_auth_token_env above and uncomment this:
 # transport_auth_token_file = "/run/secrets/hasqlite_token"
 
 [gateway]
@@ -766,7 +765,7 @@ http_bind = "0.0.0.0:8088"
 >
 > **Configurable Non-Root User & Volume Permissions**: The image defaults to non-root user and group `hasqlite:hasqlite` with UID:GID `1000:1000`. Custom user/group names and UID/GID values can be configured at build time using `--build-arg USER=<user> --build-arg GROUP=<group> --build-arg UID=<uid> --build-arg GID=<gid>`. Note that build arguments configure the image's internal user identity and default directory permissions, but do not change ownership or permissions on host bind mounts. When mounting a host directory to `/var/lib/hasqlite`, users must ensure the host directory and any existing database/lease files grant write access to the runtime identity (e.g., `chown -R <uid>:<gid> /path/to/host/data`, or assigning group ownership `chgrp -R <gid> /path/to/host/data` paired with `chmod -R 0770 /path/to/host/data`). When running under rootless Docker or user namespace remapping (`userns-remap`), container UIDs/GIDs are translated to subordinate host ID ranges defined in `/etc/subuid` and `/etc/subgid` (or mapped to the rootless daemon user); operators must determine the translated host UID/GID and apply ownership or permissions using those mapped host IDs rather than container-internal values. The image configures numeric `USER ${UID}:${GID}` so runtime `-u` flags are unnecessary unless explicitly overriding the container user at runtime.
 >
-> **Secret File Permissions**: When using `auth_token_file` or `transport_auth_token_file` with mounted secrets (e.g. `/run/secrets/hasqlite_token`), ensure each node that reads the secret can access it as the configured runtime UID/GID (or mapped host ID under rootless/userns-remap) without exposing credentials to other local users. Recommend file mode `0400` (read-only by runtime UID) or `0440` (read-only by runtime UID and restricted group); do not use world-readable permissions (`0444`).
+> **Secret File Permissions**: When using `auth_token_file` or `transport_auth_token_file` with mounted secrets (e.g. `/run/secrets/hasqlite_token`), ensure each node that reads the secret can access it as the configured runtime UID/GID (or mapped host ID under rootless/userns-remap) without exposing credentials to other local users. For Kubernetes pods running as UID 1000, configure a restricted `fsGroup` and use mode `0440` so only the node UID and that group can read the token; do not use world-readable permissions (`0444`).
 >
 > **Plaintext Gateway & Network Security**: The gRPC SQL Gateway communicates in plaintext in v1 and does not provide built-in TLS termination. The host port mapping binds strictly to host loopback (`127.0.0.1:50051:50051`) to avoid publishing the unencrypted gateway on public interfaces. Any remote or multi-host access MUST traverse an external TLS termination reverse proxy or ingress sidecar (such as Envoy, Traefik, or Nginx).
 
