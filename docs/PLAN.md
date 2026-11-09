@@ -81,36 +81,201 @@ production patterns already proven in
 
 ## 3. Architecture
 
+### Simplified architecture block diagram
+
 ```mermaid
 flowchart TB
-  subgraph apps [Applications]
-    APP[Rust / other clients]
+  subgraph apps ["Applications & Traffic Routing"]
+    APP["Client Application (Rust SDK / gRPC)"]
+    ROUTER["Orchestrator / Ingress (Routes via /ready)"]
   end
 
-  subgraph cluster [hasqlite cluster]
-    W[Writer node]
-    R1[Replica node]
-    R2[Replica node]
+  subgraph cluster ["hasqlite Cluster"]
+    WRITER["Writer Node (Active Leader)\n- gRPC SQL Gateway (:50051)\n- Write Fence (Generation g)\n- SQLite DB & WAL (Live Origin)\n- HTTP Probes (/ready=200, /live, /healthz)"]
+
+    REPLICAS["Replica Nodes (Standby Replicas)\n- gRPC Gateway (:50051 NOT_LEADER Redirect)\n- Sync Worker (Scheduled Page Pull)\n- SQLite DB & Local Freshness Ledger\n- HTTP Probes (/ready=503, /live, /healthz)"]
   end
 
-  subgraph coord [Coordination]
-    LS[(Lease: file or K8s Lease API)]
-    FL[(Freshness ledger)]
+  subgraph coord ["Authoritative Coordination"]
+    LEASE[("Authoritative Lease Store\n(Kubernetes Lease API / Shared File Lock)")]
   end
 
-  APP -->|gRPC SQL| W
-  APP -.->|optional stale read| R1
+  APP -->|"Read / Write SQL (gRPC)"| WRITER
+  APP -.->|"NOT_LEADER redirect hint"| REPLICAS
+  ROUTER -->|"Route write traffic (/ready=200)"| WRITER
+  ROUTER -.->|"Health & liveness probes (/healthz, /live)"| REPLICAS
 
-  W -->|renew| LS
-  R1 -->|observe| LS
-  R2 -->|observe| LS
+  WRITER -->|"Periodic lease renewal (generation g)"| LEASE
+  REPLICAS -->|"Observe & Atomic CAS (generation g+1)"| LEASE
 
-  W -->|page sync origin| R1
-  W -->|page sync origin| R2
-
-  R1 -->|read freshness| FL
-  W -->|write freshness after sync| FL
+  REPLICAS -->|"Pull page sync batches (BLAKE3 hash)"| WRITER
 ```
+
+### Detailed cluster interaction topology
+
+```mermaid
+flowchart TB
+  subgraph apps ["Applications & Traffic Routing"]
+    APP["Client Application (Rust SDK / gRPC)"]
+    ROUTER["Orchestrator / Ingress / Proxy (K8s Service / Envoy)"]
+  end
+
+  subgraph cluster ["hasqlite HA Cluster"]
+    subgraph writer ["Writer Node (Active Leader)"]
+      W_GW["gRPC SQL Gateway (:50051)"]
+      W_FENCE["Write Fence (Generation g)"]
+      W_DB[("SQLite DB & WAL (Live Origin)")]
+      W_CTRL["HA Controller (Role: writer:g)"]
+      W_PROBE["HTTP Probes (:8088 /ready=200, /live, /healthz)"]
+    end
+
+    subgraph r1 ["Replica Node 1 (Candidate / Standby)"]
+      R1_GW["gRPC SQL Gateway (:50051)"]
+      R1_SYNC["Sync Worker (Scheduled Pull)"]
+      R1_DB[("SQLite DB (Exclusive Replica Target)")]
+      R1_LEDGER[("Freshness Ledger (Replica-Bound Storage)")]
+      R1_CTRL["HA Controller (Promotion Gate & CAS)"]
+      R1_PROBE["HTTP Probes (:8088 /ready=503, /live, /healthz)"]
+    end
+
+    subgraph r2 ["Replica Node 2 (Peer Standby)"]
+      R2_GW["gRPC SQL Gateway (:50051)"]
+      R2_SYNC["Sync Worker (Scheduled Pull)"]
+      R2_DB[("SQLite DB (Exclusive Replica Target)")]
+      R2_LEDGER[("Freshness Ledger (Replica-Bound Storage)")]
+      R2_CTRL["HA Controller (Standby Reconcile)"]
+      R2_PROBE["HTTP Probes (:8088 /ready=503, /live, /healthz)"]
+    end
+  end
+
+  subgraph coord ["Authoritative Coordination"]
+    LS[("Authoritative Lease Store (K8s Lease API / Shared File Lock)")]
+  end
+
+  APP -->|"Read/Write SQL (gRPC)"| W_GW
+  APP -.->|"Mutating SQL rejected (NOT_LEADER + redirect hint)"| R1_GW
+  APP -.->|"Optional stale read (if allow_replica_reads=true)"| R1_GW
+  R1_GW -.->|"Automatic client failover to new writer"| APP
+
+  ROUTER -->|"Route write traffic (/ready=200)"| W_PROBE
+  ROUTER -.->|"Write traffic blocked (/ready=503)"| R1_PROBE
+  ROUTER -.->|"Pod lifecycle & rolling update (/healthz, /live)"| R1_PROBE
+  ROUTER -.->|"Pod lifecycle & rolling update (/healthz, /live)"| R2_PROBE
+
+  W_GW -->|"Mutating SQL gated by generation g"| W_FENCE
+  W_FENCE -->|"Committed writes"| W_DB
+  W_CTRL -->|"Supervises active role"| W_GW
+  W_CTRL -->|"Sets probe readiness (/ready=200)"| W_PROBE
+  W_CTRL -->|"Periodic lease renewal (generation g)"| LS
+
+  R1_SYNC -->|"Pull page sync batches (gRPC / BLAKE3 hash)"| W_DB
+  R1_SYNC -->|"Apply consistent snapshot"| R1_DB
+  R1_SYNC -->|"Record synced_at_secs & source_gen"| R1_LEDGER
+
+  R2_SYNC -->|"Pull page sync batches (gRPC / BLAKE3 hash)"| W_DB
+  R2_SYNC -->|"Apply consistent snapshot"| R2_DB
+  R2_SYNC -->|"Record synced_at_secs & source_gen"| R2_LEDGER
+
+  R1_CTRL -->|"Observe lease (holder, gen, TTL)"| LS
+  R1_CTRL -->|"validate_promotion() (freshness age, skew, gen)"| R1_LEDGER
+  R1_CTRL ==>|"On lease expiry: Atomic CAS acquire (g to g+1)"| LS
+  R1_CTRL -.->|"On CAS win: Promote to writer, open DB, set /ready=200"| R1_DB
+
+  R2_CTRL -->|"Observe lease (holder, gen, TTL)"| LS
+  R2_CTRL -->|"validate_promotion() (freshness age, skew, gen)"| R2_LEDGER
+  R2_CTRL -.->|"Lost CAS race fails closed (StayReplica)"| LS
+```
+
+### Kubernetes pod and container deployment architecture
+
+```mermaid
+flowchart TB
+  subgraph k8s ["Kubernetes StatefulSet Deployment Architecture"]
+    subgraph services ["Routing & Services Layer"]
+      SVC_WRITE["Service: hasqlite-writer\n(Routes write traffic via /ready=200)"]
+      SVC_SYNC["Headless Service: hasqlite-headless\n(Stable pod DNS for replication pull)"]
+      SVC_READ["Service: hasqlite-replicas\n(Optional load balancing for read-only traffic)"]
+    end
+
+    subgraph pod0 ["Pod: hasqlite-0 (Active Writer)"]
+      subgraph p0_containers ["Containers"]
+        P0_TLS["TLS Proxy Sidecar (Optional)\nEnvoy / Nginx (:50051 mTLS -> 127.0.0.1:50051)"]
+        P0_MAIN["Main Container: hasqlite-node (USER 1000:1000)\n- gRPC SQL Gateway (127.0.0.1:50051)\n- HA Controller (Role: writer:g)\n- Write Fence (Enforce Generation g)\n- HTTP Probes Server (:8088 /ready=200)"]
+      end
+
+      subgraph p0_vols ["Volumes & Storage"]
+        P0_PVC[("PVC: data-hasqlite-0\n(/var/lib/hasqlite: DB & WAL)")]
+        P0_CFG["ConfigMap: /etc/hasqlite/cluster.toml (ro)"]
+        P0_SEC["Secret: /run/secrets/hasqlite_token (mode 0400)"]
+      end
+
+      P0_HOOKS["Lifecycle & Probes\n- preStop: checkpoint WAL(TRUNCATE) & drain\n- readinessProbe: :8088/healthz\n- livenessProbe: :8088/live"]
+    end
+
+    subgraph pod1 ["Pod: hasqlite-1 (Standby Replica)"]
+      subgraph p1_containers ["Containers"]
+        P1_TLS["TLS Proxy Sidecar (Optional)\nEnvoy / Nginx (:50051 mTLS -> 127.0.0.1:50051)"]
+        P1_MAIN["Main Container: hasqlite-node (USER 1000:1000)\n- gRPC SQL Gateway (NOT_LEADER Redirect)\n- Sync Worker (Scheduled Page Sync Pull)\n- HA Controller (Observe Lease & CAS Promote)\n- HTTP Probes Server (:8088 /ready=503)"]
+      end
+
+      subgraph p1_vols ["Volumes & Storage"]
+        P1_PVC[("PVC: data-hasqlite-1\n(/var/lib/hasqlite: Exclusive Replica DB)")]
+        P1_LEDGER[("Freshness Ledger: /var/run/freshness.txt\n(Replica-bound sync timestamp & gen)")]
+      end
+
+      P1_HOOKS["Lifecycle & Probes\n- preStop: catchup sync before termination\n- readinessProbe: :8088/healthz\n- livenessProbe: :8088/live"]
+    end
+
+    subgraph pod2 ["Pod: hasqlite-2 (Peer Standby Replica)"]
+      subgraph p2_containers ["Containers"]
+        P2_MAIN["Main Container: hasqlite-node (USER 1000:1000)\nSync Worker, NOT_LEADER Gateway, Probes (:8088 /ready=503)"]
+      end
+
+      subgraph p2_vols ["Volumes & Storage"]
+        P2_PVC[("PVC: data-hasqlite-2\n(/var/lib/hasqlite: Replica DB)")]
+      end
+    end
+
+    subgraph k8s_coord ["Kubernetes Coordination API"]
+      K8S_LEASE[("K8s Lease: hasqlite-writer\n(holder: hasqlite-0, gen: g, resourceVersion)")]
+    end
+  end
+
+  SVC_WRITE -->|"Mutating SQL traffic (selected by /ready=200)"| P0_TLS
+  P0_TLS -->|"Plaintext gRPC"| P0_MAIN
+  SVC_READ -.->|"Read-only queries (allow_replica_reads)"| P1_TLS
+  P1_TLS -.->|"Plaintext gRPC"| P1_MAIN
+
+  P1_MAIN -->|"Pull page sync via hasqlite-0.hasqlite-headless"| SVC_SYNC
+  P2_MAIN -->|"Pull page sync via hasqlite-0.hasqlite-headless"| SVC_SYNC
+  SVC_SYNC -->|"Forward sync RPC to active writer"| P0_MAIN
+
+  P0_MAIN -->|"Read/Write"| P0_PVC
+  P0_MAIN -->|"Read configuration"| P0_CFG
+  P0_MAIN -->|"Read auth token"| P0_SEC
+
+  P1_MAIN -->|"Apply replicated pages"| P1_PVC
+  P1_MAIN -->|"Write last sync record"| P1_LEDGER
+  P2_MAIN -->|"Apply replicated pages"| P2_PVC
+
+  P0_MAIN -->|"Periodic lease renewal (generation g)"| K8S_LEASE
+  P1_MAIN -->|"Observe lease & atomic CAS acquire (gen g+1)"| K8S_LEASE
+  P2_MAIN -->|"Observe lease & atomic CAS acquire (gen g+1)"| K8S_LEASE
+```
+
+> **Container & Sidecar Model in hasqlite**:
+>
+> - **Consolidated Primary Container (`hasqlite-node`)**:
+>   Unlike legacy setups that split the synchronization sidecar, lease updater daemon, and HA runtime into separate processes, `hasqlite` consolidates all node responsibilities into a single node agent container running as non-root numeric `USER 1000:1000`. The container hosts the gRPC SQL Gateway, HA Controller reconcile loop, page sync worker, and HTTP health probes.
+>
+> - **TLS Termination Reverse Proxy Sidecar (Optional / Recommended for Multi-Host)**:
+>   Because the `hasqlite` gRPC SQL Gateway communicates in plaintext in v1 and does not provide built-in TLS termination, multi-host and production Kubernetes deployments co-locate a lightweight reverse proxy sidecar (e.g., Envoy, Traefik, or Nginx) in each pod to terminate external TLS / mTLS and forward decrypted requests to `127.0.0.1:50051`.
+>
+> - **Lease Updater Sidecar (Evaluated in Phase 4 / Optional Bridge)**:
+>   By default, `hasqlite-node` natively interacts with the Kubernetes Lease API (`coordination.k8s.io/v1`) in-process. In environments with restricted Pod RBAC where direct K8s API access is forbidden or when bridging file leases across shared volumes, an optional lease updater sidecar can manage the lease and bridge state to the node agent via volume files (see §5 Phase 4).
+>
+> - **Lifecycle Hooks & Probe Separation**:
+>   Pods configure a `preStop` hook to checkpoint WAL frames and perform catch-up sync before `SIGTERM`. Kubernetes `readinessProbe` queries `/healthz` to prevent rolling update stalls during StatefulSet deployments, while the dedicated `hasqlite-writer` Service uses `/ready=200` to route write traffic strictly to the active leader.
 
 ### Layers
 
@@ -159,6 +324,42 @@ Events per tick (from rsync `ReconcileDecision` model):
 
 While `hasqlite` is primarily an HA clustering engine, single-node standalone operation
 is supported as an explicit first-class operational mode:
+
+```mermaid
+flowchart TB
+  subgraph host ["Host Environment / Container Platform"]
+    CLIENT["App Client / Local Service"]
+    PLATFORM["Docker Engine / Kubernetes Kubelet"]
+
+    subgraph container ["Standalone Container (Numeric USER 1000:1000)"]
+      CTRL["Node Supervisor (mode = standalone)"]
+      PREFLIGHT["Startup Pre-flight Check (data.dir & DB permissions)"]
+      GW["gRPC SQL Gateway (:50051)"]
+      FENCE["Write Fence (Generation g_prior + 1)"]
+      PROBES["HTTP Probes (:8088 /ready=200, /live, /healthz)"]
+    end
+
+    subgraph volume ["Persistent Data Volume (/var/lib/hasqlite)"]
+      LOCK[("Canonical Lease Lock (.hasqlite.lease via POSIX flock)")]
+      DB[("SQLite DB & WAL (*.db, *-wal, *-shm)")]
+    end
+
+    SECRET["Secret Token File (/run/secrets/hasqlite_token:ro)"]
+  end
+
+  PLATFORM -->|"Health & Readiness Probes"| PROBES
+  CLIENT -->|"gRPC SQL (mutations + reads)"| GW
+  SECRET -.->|"auth_token_file"| GW
+
+  CTRL -->|"Genesis writer bootstrap"| LOCK
+  CTRL -->|"Pre-flight permission scan"| PREFLIGHT
+  PREFLIGHT -->|"Verify write access"| DB
+  PREFLIGHT -->|"Verify lockfile write access"| LOCK
+
+  GW -->|"Mutating SQL gated by generation"| FENCE
+  FENCE -->|"Committed writes"| DB
+  CTRL -->|"SIGTERM: checkpoint WAL(TRUNCATE) & release flock"| DB
+```
 
 - **Direct genesis writer bootstrap**: In standalone mode (`mode = "standalone"` in `[node]` or CLI `--mode standalone`),
   the node skips peer freshness checks, acquires writer status via the authoritative file lease (`LeaseRecord`), and transitions
