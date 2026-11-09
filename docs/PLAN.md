@@ -196,7 +196,7 @@ is supported as an explicit first-class operational mode:
      safely replay any remaining committed WAL frames on the next startup.
   5. **Release lease**: Release the advisory POSIX file lock (`flock`) and exit cleanly with status code 0.
 - **Docker container runtime**: Designed to run inside standard Docker containers with a persistent
-  volume mount at `/var/lib/hasqlite`, running under non-root UID/GID (`1000:1000`), exposing:
+  volume mount at `/var/lib/hasqlite`, running under a configurable non-root user and group (defaulting to `hasqlite:hasqlite` with UID/GID `1000:1000` via build arguments `USER`/`GROUP`/`UID`/`GID`), exposing:
   - gRPC SQL Gateway (`127.0.0.1:50051`) for read/write queries.
   - HTTP Probes (`:8088` `/ready`, `/live`, `/healthz`).
 - **Seamless cluster upgrade path**: Upgrading from a standalone deployment to an HA cluster requires cleanly stopping
@@ -295,8 +295,8 @@ Deliverables:
 standalone Docker container weeks ahead of multi-node replication and clustering.*
 
 Scope:
-- Multi-stage `Dockerfile` (optimized Rust musl/debian-slim build, non-root user `hasqlite` UID/GID 1000:1000, persistent volume mount at `/var/lib/hasqlite`).
-- `deploy/docker/docker-compose.standalone.yml` and container quickstart scripts with host volume permission guidance.
+- Multi-stage `Dockerfile` (optimized Rust musl/debian-slim build, configurable non-root user and group defaulting to `hasqlite:hasqlite` and UID/GID 1000:1000 via `ARG USER=hasqlite`, `ARG GROUP=hasqlite`, `ARG UID=1000`, and `ARG GID=1000` build arguments, persistent volume mount at `/var/lib/hasqlite`).
+- `deploy/docker/docker-compose.standalone.yml` and container quickstart scripts with host volume permission guidance for default and custom user/group UID/GID execution.
 - Standalone mode profile in `hasqlite-core` and `hasqlite-node`:
   - `mode = "standalone"` in `ClusterConfig` (or `--mode standalone` CLI / `HASQLITE_MODE=standalone`).
   - Auto-acquire genesis writer lease (POSIX `flock` on file lease) writing an authoritative `LeaseRecord` at `new_gen = g_prior + 1` (defaulting to `1` on first boot, or incrementing `max(g_lease, g_db)` observed from prior volume state) without requiring peer sync history or freshness section.
@@ -305,9 +305,9 @@ Scope:
   - Graceful shutdown handling: synchronous `sqlite3_wal_checkpoint_v2(TRUNCATE)`, in-flight connection draining, and lease release within Docker's 10s grace window on `SIGTERM`/`SIGINT`.
 
 Deliverables:
-- Production `Dockerfile` and `deploy/docker/docker-compose.standalone.yml`.
+- Production `Dockerfile` with configurable non-root build arguments (`ARG USER=hasqlite`, `ARG GROUP=hasqlite`, `ARG UID=1000`, `ARG GID=1000`) and `deploy/docker/docker-compose.standalone.yml`.
 - `hasqlite run --mode standalone` or `hasqlite run --config standalone.toml`.
-- Standalone container smoke test in CI (`docker build` + boot container + execute SQL via gRPC + assert `/ready` 200 OK), feature-gated with `--features=docker-tests`.
+- Standalone container smoke test in CI (`docker build` + boot container + execute SQL via gRPC + assert `/ready` 200 OK), verifying both default and custom username/groupname and UID/GID images, feature-gated with `--features=docker-tests`.
 
 ### Phase 2 — Sync orchestration (weeks 4–6)
 
@@ -391,7 +391,7 @@ Deliverables:
 | `grpc_replication.rs` | native replication transport | `grpc_replication.rs` |
 | `shutdown_sync.rs` | preStop catch-up | new |
 | `readonly_replica_reads.rs` | `--allow-replica-reads` | gateway flags |
-| `docker_standalone.rs` | Standalone single-node container boot, volume persistence, gRPC SQL CRUD, probe health | new (Phase 1b) |
+| `docker_standalone.rs` | Standalone single-node container boot (default and custom user/group & UID/GID), volume persistence, gRPC SQL CRUD, probe health | new (Phase 1b) |
 
 Run: `cargo test --workspace` (default). Heavy cluster tests gated with
 `--features=k8s-tests` or env `HASQLITE_K8S_TESTS=1`. Docker smoke tests gated with
@@ -544,14 +544,25 @@ http_bind = "0.0.0.0:8088"
 >
 > All required configuration fields (`node.id`, `data.dir`, `lease.source`, `gateway.bind`, `probes.http_bind`) are supplied by mounting the standalone TOML configuration. In Phase 1b, the image entrypoint will also support synthesizing minimal standalone defaults if config mounts are omitted.
 >
+> **Configurable Non-Root User & Volume Permissions**: The image defaults to non-root user and group `hasqlite:hasqlite` with UID:GID `1000:1000`. Custom user/group names and UID/GID values can be configured at build time using `--build-arg USER=<user> --build-arg GROUP=<group> --build-arg UID=<uid> --build-arg GID=<gid>`, ensuring file ownership of `/var/lib/hasqlite` matches host directory or volume permissions when using host bind mounts.
+>
 > **Plaintext Gateway & Network Security**: The gRPC SQL Gateway communicates in plaintext in v1 and does not provide built-in TLS termination. The host port mapping binds strictly to host loopback (`127.0.0.1:50051:50051`) to avoid publishing the unencrypted gateway on public interfaces. Any remote or multi-host access MUST traverse an external TLS termination reverse proxy or ingress sidecar (such as Envoy, Traefik, or Nginx).
 
 ```bash
+# Optional: build with custom non-root user/group and UID/GID (defaults to hasqlite:hasqlite and 1000:1000 if omitted)
+# docker build \
+#   --build-arg USER=customuser \
+#   --build-arg GROUP=customgroup \
+#   --build-arg UID=1001 \
+#   --build-arg GID=1001 \
+#   -t hasqlite:${HASQLITE_VERSION:-0.1.0} \
+#   -f deploy/docker/Dockerfile .
+
 docker run -d \
   --name hasqlite \
   -p 127.0.0.1:50051:50051 \
   -p 8088:8088 \
-  -u 1000:1000 \
+  -u ${HASQLITE_UID:-1000}:${HASQLITE_GID:-1000} \
   -v /path/to/standalone.toml:/etc/hasqlite/cluster.toml:ro \
   -v hasqlite-data:/var/lib/hasqlite \
   -v /path/to/token.txt:/run/secrets/hasqlite_token:ro \
