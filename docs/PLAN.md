@@ -704,6 +704,7 @@ transport_auth_token_env = "HASQLITE_GRPC_AUTH_TOKEN"
 bind = "0.0.0.0:50051"
 auth_token_env = "HASQLITE_GRPC_AUTH_TOKEN"
 # auth_token_file = "/run/secrets/hasqlite_token"
+# allow_unauthenticated = false
 allow_replica_reads = false
 
 [probes]
@@ -737,6 +738,7 @@ path = "/var/lib/hasqlite/.hasqlite.lease"
 bind = "0.0.0.0:50051"
 auth_token_file = "/run/secrets/hasqlite_token" # Mutually exclusive with auth_token_env
 # auth_token_env = "HASQLITE_GRPC_AUTH_TOKEN"
+# allow_unauthenticated = false
 allow_replica_reads = false
 
 [probes]

@@ -195,6 +195,21 @@ impl ClusterConfig {
                 "cannot specify both gateway.auth_token_env and gateway.auth_token_file (choose one credential source)".to_string(),
             ));
         }
+        if (self.gateway.auth_token_env.is_some() || self.gateway.auth_token_file.is_some())
+            && self.gateway.allow_unauthenticated
+        {
+            return Err(HasqliteError::Validation(
+                "cannot specify gateway credentials together with gateway.allow_unauthenticated = true".to_string(),
+            ));
+        }
+        if self.gateway.auth_token_env.is_none()
+            && self.gateway.auth_token_file.is_none()
+            && !self.gateway.allow_unauthenticated
+        {
+            return Err(HasqliteError::Validation(
+                "gateway requires authentication credentials (set gateway.auth_token_env or gateway.auth_token_file, or explicitly enable gateway.allow_unauthenticated = true)".to_string(),
+            ));
+        }
         if let Some(ref env) = self.gateway.auth_token_env
             && env.trim().is_empty()
         {
@@ -286,12 +301,14 @@ impl ClusterConfig {
                 "sync.interval_secs must be greater than 0".to_string(),
             ));
         }
-        if let Some(ref ep) = sync.origin_endpoint
-            && ep.trim().is_empty()
-        {
-            return Err(HasqliteError::Validation(
-                "sync.origin_endpoint must not be empty when specified".to_string(),
-            ));
+        if let Some(ref ep) = sync.origin_endpoint {
+            let trimmed = ep.trim();
+            if trimmed.is_empty() || ep.contains(char::is_whitespace) {
+                return Err(HasqliteError::Validation(
+                    "sync.origin_endpoint must not be empty or contain whitespace when specified"
+                        .to_string(),
+                ));
+            }
         }
         if sync.transport_auth_token_env.is_some() && sync.transport_auth_token_file.is_some() {
             return Err(HasqliteError::Validation(
@@ -419,6 +436,9 @@ pub struct GatewaySection {
     /// Whether to permit read-only SQL queries on replicas.
     #[serde(default)]
     pub allow_replica_reads: bool,
+    /// Whether to permit unauthenticated gateway access (insecure; disabled by default).
+    #[serde(default)]
+    pub allow_unauthenticated: bool,
 }
 
 /// Health and readiness HTTP probes section.
@@ -479,6 +499,7 @@ mod tests {
                 auth_token_env: Some("HASQLITE_GRPC_AUTH_TOKEN".to_string()),
                 auth_token_file: None,
                 allow_replica_reads: false,
+                allow_unauthenticated: false,
             },
             probes: ProbesSection {
                 http_bind: "0.0.0.0:8088".to_string(),
@@ -530,6 +551,7 @@ interval_secs = 1
 
 [gateway]
 bind = "127.0.0.1:50051"
+allow_unauthenticated = true
 
 [probes]
 http_bind = "127.0.0.1:8088"
@@ -540,6 +562,7 @@ http_bind = "127.0.0.1:8088"
         assert_eq!(parsed.node.mode, NodeMode::Clustered);
         assert_eq!(parsed.lease.source, LeaseSourceType::File);
         assert!(!parsed.gateway.allow_replica_reads);
+        assert!(parsed.gateway.allow_unauthenticated);
         assert_eq!(parsed.gateway.auth_token_env, None);
         assert_eq!(parsed.gateway.auth_token_file, None);
         assert_eq!(parsed.sync.as_ref().unwrap().origin_endpoint, None);
@@ -548,6 +571,11 @@ http_bind = "127.0.0.1:8088"
             None
         );
         assert!(parsed.validate().is_ok());
+
+        let default_gw: GatewaySection =
+            toml::from_str("bind = \"127.0.0.1:50051\"").expect("default gateway section");
+        assert!(!default_gw.allow_unauthenticated);
+        assert!(!default_gw.allow_replica_reads);
 
         let serialized = toml::to_string(&parsed).expect("should serialize to toml");
         let reloaded: ClusterConfig =
@@ -590,301 +618,259 @@ http_bind = "0.0.0.0:8088"
             parsed.gateway.auth_token_file,
             Some(PathBuf::from("/run/secrets/hasqlite_token"))
         );
+        assert!(!parsed.gateway.allow_unauthenticated);
         assert!(parsed.validate().is_ok());
+    }
+
+    fn assert_validation_err<F>(mutate: F, expected_substr: &str)
+    where
+        F: FnOnce(&mut ClusterConfig),
+    {
+        let mut config = valid_test_config();
+        mutate(&mut config);
+        let err = config.validate().unwrap_err();
+        match err {
+            HasqliteError::Validation(msg) => {
+                assert!(
+                    msg.contains(expected_substr),
+                    "expected error containing '{expected_substr}', got '{msg}'"
+                );
+            }
+            other => panic!("expected Validation error, got '{other:?}'"),
+        }
     }
 
     #[test]
     fn clustered_mode_requires_freshness_sync_promotion() {
-        let mut config = valid_test_config();
-        config.freshness = None;
-        assert_eq!(
-            config.validate().unwrap_err(),
-            HasqliteError::Validation(
-                "freshness section is required in clustered mode".to_string()
-            )
+        assert_validation_err(
+            |c| c.freshness = None,
+            "freshness section is required in clustered mode",
         );
-
-        let mut config2 = valid_test_config();
-        config2.sync = None;
-        assert_eq!(
-            config2.validate().unwrap_err(),
-            HasqliteError::Validation("sync section is required in clustered mode".to_string())
+        assert_validation_err(
+            |c| c.sync = None,
+            "sync section is required in clustered mode",
         );
-
-        let mut config3 = valid_test_config();
-        config3.promotion = None;
-        assert_eq!(
-            config3.validate().unwrap_err(),
-            HasqliteError::Validation(
-                "promotion section is required in clustered mode".to_string()
-            )
+        assert_validation_err(
+            |c| c.promotion = None,
+            "promotion section is required in clustered mode",
         );
     }
 
     #[test]
     fn standalone_mode_rejects_kubernetes_lease() {
-        let mut config = valid_test_config();
-        config.node.mode = NodeMode::Standalone;
-        config.lease.source = LeaseSourceType::Kubernetes;
-        let err = config.validate().unwrap_err();
-        assert_eq!(
-            err,
-            HasqliteError::Validation(
-                "node.mode is 'standalone' but lease.source is not 'file' (standalone mode requires file-backed lease for flock mutual exclusion)".to_string()
-            )
+        assert_validation_err(
+            |c| {
+                c.node.mode = NodeMode::Standalone;
+                c.lease.source = LeaseSourceType::Kubernetes;
+            },
+            "node.mode is 'standalone' but lease.source is not 'file'",
         );
     }
 
     #[test]
     fn standalone_mode_rejects_non_canonical_lease_path() {
-        let mut config = valid_test_config();
-        config.node.mode = NodeMode::Standalone;
-        config.lease.source = LeaseSourceType::File;
-        config.lease.file = Some(FileLeaseSection {
-            path: PathBuf::from("/var/lib/hasqlite/other.lease"),
-        });
-        let err = config.validate().unwrap_err();
-        assert_eq!(
-            err,
-            HasqliteError::Validation(
-                "standalone mode requires canonical lease lock path '/var/lib/hasqlite/.hasqlite.lease', found '/var/lib/hasqlite/other.lease'".to_string()
-            )
+        assert_validation_err(
+            |c| {
+                c.node.mode = NodeMode::Standalone;
+                c.lease.source = LeaseSourceType::File;
+                c.lease.file = Some(FileLeaseSection {
+                    path: PathBuf::from("/var/lib/hasqlite/other.lease"),
+                });
+            },
+            "standalone mode requires canonical lease lock path",
         );
     }
 
     #[test]
     fn gateway_rejects_both_auth_token_env_and_file() {
-        let mut config = valid_test_config();
-        config.gateway.auth_token_env = Some("HASQLITE_AUTH_TOKEN".to_string());
-        config.gateway.auth_token_file = Some(PathBuf::from("/etc/hasqlite/token.txt"));
-        let err = config.validate().unwrap_err();
-        assert_eq!(
-            err,
-            HasqliteError::Validation(
-                "cannot specify both gateway.auth_token_env and gateway.auth_token_file (choose one credential source)".to_string()
-            )
+        assert_validation_err(
+            |c| {
+                c.gateway.auth_token_env = Some("HASQLITE_AUTH_TOKEN".to_string());
+                c.gateway.auth_token_file = Some(PathBuf::from("/etc/hasqlite/token.txt"));
+            },
+            "cannot specify both gateway.auth_token_env and gateway.auth_token_file",
+        );
+    }
+
+    #[test]
+    fn gateway_rejects_credentials_with_allow_unauthenticated() {
+        assert_validation_err(
+            |c| {
+                c.gateway.auth_token_env = Some("HASQLITE_AUTH_TOKEN".to_string());
+                c.gateway.allow_unauthenticated = true;
+            },
+            "cannot specify gateway credentials together with gateway.allow_unauthenticated = true",
+        );
+        assert_validation_err(
+            |c| {
+                c.gateway.auth_token_env = None;
+                c.gateway.auth_token_file = Some(PathBuf::from("/etc/hasqlite/token.txt"));
+                c.gateway.allow_unauthenticated = true;
+            },
+            "cannot specify gateway credentials together with gateway.allow_unauthenticated = true",
+        );
+    }
+
+    #[test]
+    fn gateway_rejects_unauthenticated_without_flag() {
+        assert_validation_err(
+            |c| {
+                c.gateway.auth_token_env = None;
+                c.gateway.auth_token_file = None;
+                c.gateway.allow_unauthenticated = false;
+            },
+            "gateway requires authentication credentials",
         );
     }
 
     #[test]
     fn validation_rejects_empty_node_id() {
-        let mut config = valid_test_config();
-        config.node.id = NodeId::from("   ");
-        let err = config.validate().unwrap_err();
-        assert_eq!(
-            err,
-            HasqliteError::Validation("node.id must not be empty".to_string())
+        assert_validation_err(
+            |c| c.node.id = NodeId::from("   "),
+            "node.id must not be empty",
         );
     }
 
     #[test]
     fn validation_rejects_zero_sync_interval() {
-        let mut config = valid_test_config();
-        config.sync.as_mut().unwrap().interval_secs = 0;
-        let err = config.validate().unwrap_err();
-        assert_eq!(
-            err,
-            HasqliteError::Validation("sync.interval_secs must be greater than 0".to_string())
+        assert_validation_err(
+            |c| c.sync.as_mut().unwrap().interval_secs = 0,
+            "sync.interval_secs must be greater than 0",
         );
     }
 
     #[test]
     fn validation_rejects_zero_freshness_max_age() {
-        let mut config = valid_test_config();
-        config.freshness.as_mut().unwrap().max_age_secs = 0;
-        let err = config.validate().unwrap_err();
-        assert_eq!(
-            err,
-            HasqliteError::Validation("freshness.max_age_secs must be greater than 0".to_string())
+        assert_validation_err(
+            |c| c.freshness.as_mut().unwrap().max_age_secs = 0,
+            "freshness.max_age_secs must be greater than 0",
         );
     }
 
     #[test]
     fn validation_rejects_missing_kubernetes_section() {
-        let mut config = valid_test_config();
-        config.lease.source = LeaseSourceType::Kubernetes;
-        config.lease.kubernetes = None;
-        let err = config.validate().unwrap_err();
-        assert_eq!(
-            err,
-            HasqliteError::Validation(
-                "lease.source is 'kubernetes' but lease.kubernetes section is missing".to_string()
-            )
+        assert_validation_err(
+            |c| {
+                c.lease.source = LeaseSourceType::Kubernetes;
+                c.lease.kubernetes = None;
+            },
+            "lease.source is 'kubernetes' but lease.kubernetes section is missing",
         );
     }
 
     #[test]
     fn validation_rejects_missing_file_section() {
-        let mut config = valid_test_config();
-        config.lease.source = LeaseSourceType::File;
-        config.lease.file = None;
-        let err = config.validate().unwrap_err();
-        assert_eq!(
-            err,
-            HasqliteError::Validation(
-                "lease.source is 'file' but lease.file section is missing".to_string()
-            )
+        assert_validation_err(
+            |c| {
+                c.lease.source = LeaseSourceType::File;
+                c.lease.file = None;
+            },
+            "lease.source is 'file' but lease.file section is missing",
         );
     }
 
     #[test]
     fn validation_rejects_invalid_socket_address() {
-        let mut config = valid_test_config();
-        config.gateway.bind = "invalid-address".to_string();
-        let err = config.validate().unwrap_err();
-        assert!(matches!(err, HasqliteError::Validation(msg) if msg.contains("gateway.bind")));
-
-        let mut config2 = valid_test_config();
-        config2.probes.http_bind = "999.999.999.999:80".to_string();
-        let err2 = config2.validate().unwrap_err();
-        assert!(matches!(err2, HasqliteError::Validation(msg) if msg.contains("probes.http_bind")));
+        assert_validation_err(
+            |c| c.gateway.bind = "invalid-address".to_string(),
+            "gateway.bind 'invalid-address' is not a valid socket address",
+        );
+        assert_validation_err(
+            |c| c.probes.http_bind = "999.999.999.999:80".to_string(),
+            "probes.http_bind '999.999.999.999:80' is not a valid socket address",
+        );
     }
 
     #[test]
-    fn validation_rejects_empty_paths() {
-        let mut config = valid_test_config();
-        config.data.dir = PathBuf::from("");
-        let err = config.validate().unwrap_err();
-        assert_eq!(
-            err,
-            HasqliteError::Validation("data.dir must not be empty".to_string())
-        );
-
-        let mut config2 = valid_test_config();
-        config2.freshness.as_mut().unwrap().path = PathBuf::from("");
-        let err2 = config2.validate().unwrap_err();
-        assert_eq!(
-            err2,
-            HasqliteError::Validation("freshness.path must not be empty".to_string())
-        );
+    fn validation_rejects_empty_and_whitespace_paths() {
+        for invalid_path in ["", "   ", " \t "] {
+            assert_validation_err(
+                |c| c.data.dir = PathBuf::from(invalid_path),
+                "data.dir must not be empty",
+            );
+            assert_validation_err(
+                |c| c.freshness.as_mut().unwrap().path = PathBuf::from(invalid_path),
+                "freshness.path must not be empty",
+            );
+            assert_validation_err(
+                |c| {
+                    c.lease.source = LeaseSourceType::File;
+                    c.lease.kubernetes = None;
+                    c.lease.file = Some(FileLeaseSection {
+                        path: PathBuf::from(invalid_path),
+                    });
+                },
+                "lease.file.path must not be empty",
+            );
+        }
     }
 
     #[test]
     fn validation_rejects_excessive_clock_skew() {
-        let mut config = valid_test_config();
-        config.promotion.as_mut().unwrap().max_future_skew_secs = 301;
-        let err = config.validate().unwrap_err();
-        assert_eq!(
-            err,
-            HasqliteError::Validation(
-                "promotion.max_future_skew_secs must not exceed 300 seconds".to_string()
-            )
+        assert_validation_err(
+            |c| c.promotion.as_mut().unwrap().max_future_skew_secs = 301,
+            "promotion.max_future_skew_secs must not exceed 300 seconds",
         );
     }
 
     #[test]
     fn validation_rejects_empty_strings_in_optional_fields() {
-        let mut config = valid_test_config();
-        config.sync.as_mut().unwrap().origin_endpoint = Some("   ".to_string());
-        let err = config.validate().unwrap_err();
-        assert_eq!(
-            err,
-            HasqliteError::Validation(
-                "sync.origin_endpoint must not be empty when specified".to_string()
-            )
+        assert_validation_err(
+            |c| c.sync.as_mut().unwrap().origin_endpoint = Some("   ".to_string()),
+            "sync.origin_endpoint must not be empty or contain whitespace",
         );
-
-        let mut config2 = valid_test_config();
-        config2.sync.as_mut().unwrap().transport_auth_token_env = Some("".to_string());
-        let err2 = config2.validate().unwrap_err();
-        assert_eq!(
-            err2,
-            HasqliteError::Validation(
-                "sync.transport_auth_token_env must not be empty when specified".to_string()
-            )
+        assert_validation_err(
+            |c| {
+                c.sync.as_mut().unwrap().origin_endpoint =
+                    Some("grpc://writer endpoint:50051".to_string())
+            },
+            "sync.origin_endpoint must not be empty or contain whitespace",
         );
-
-        let mut config3 = valid_test_config();
-        config3.gateway.auth_token_env = Some("   ".to_string());
-        let err3 = config3.validate().unwrap_err();
-        assert_eq!(
-            err3,
-            HasqliteError::Validation(
-                "gateway.auth_token_env must not be empty when specified".to_string()
-            )
+        assert_validation_err(
+            |c| c.sync.as_mut().unwrap().transport_auth_token_env = Some("".to_string()),
+            "sync.transport_auth_token_env must not be empty",
         );
-
-        let mut config4 = valid_test_config();
-        config4.gateway.auth_token_env = None;
-        config4.gateway.auth_token_file = Some(PathBuf::from("   "));
-        let err4 = config4.validate().unwrap_err();
-        assert_eq!(
-            err4,
-            HasqliteError::Validation(
-                "gateway.auth_token_file must not be empty when specified".to_string()
-            )
+        assert_validation_err(
+            |c| c.gateway.auth_token_env = Some("   ".to_string()),
+            "gateway.auth_token_env must not be empty",
         );
-
-        let mut config5 = valid_test_config();
-        config5.lease.kubernetes.as_mut().unwrap().lease_name = "   ".to_string();
-        let err5 = config5.validate().unwrap_err();
-        assert_eq!(
-            err5,
-            HasqliteError::Validation("lease.kubernetes.lease_name must not be empty".to_string())
+        assert_validation_err(
+            |c| {
+                c.gateway.auth_token_env = None;
+                c.gateway.auth_token_file = Some(PathBuf::from("   "));
+            },
+            "gateway.auth_token_file must not be empty",
         );
-
-        let mut config6 = valid_test_config();
-        config6.lease.kubernetes.as_mut().unwrap().namespace = "".to_string();
-        let err6 = config6.validate().unwrap_err();
-        assert_eq!(
-            err6,
-            HasqliteError::Validation("lease.kubernetes.namespace must not be empty".to_string())
+        assert_validation_err(
+            |c| c.lease.kubernetes.as_mut().unwrap().lease_name = "   ".to_string(),
+            "lease.kubernetes.lease_name must not be empty",
         );
-    }
-
-    #[test]
-    fn validation_rejects_whitespace_only_paths() {
-        let mut config = valid_test_config();
-        config.data.dir = PathBuf::from("   ");
-        assert_eq!(
-            config.validate().unwrap_err(),
-            HasqliteError::Validation("data.dir must not be empty".to_string())
-        );
-
-        let mut config2 = valid_test_config();
-        config2.freshness.as_mut().unwrap().path = PathBuf::from(" \t ");
-        assert_eq!(
-            config2.validate().unwrap_err(),
-            HasqliteError::Validation("freshness.path must not be empty".to_string())
-        );
-
-        let mut config3 = valid_test_config();
-        config3.lease.source = LeaseSourceType::File;
-        config3.lease.kubernetes = None;
-        config3.lease.file = Some(FileLeaseSection {
-            path: PathBuf::from("   "),
-        });
-        assert_eq!(
-            config3.validate().unwrap_err(),
-            HasqliteError::Validation("lease.file.path must not be empty".to_string())
+        assert_validation_err(
+            |c| c.lease.kubernetes.as_mut().unwrap().namespace = "".to_string(),
+            "lease.kubernetes.namespace must not be empty",
         );
     }
 
     #[test]
     fn sync_rejects_both_auth_token_env_and_file() {
-        let mut config = valid_test_config();
-        config.sync.as_mut().unwrap().transport_auth_token_env = Some("ENV_TOKEN".to_string());
-        config.sync.as_mut().unwrap().transport_auth_token_file = Some(PathBuf::from("/etc/token"));
-        let err = config.validate().unwrap_err();
-        assert_eq!(
-            err,
-            HasqliteError::Validation(
-                "cannot specify both sync.transport_auth_token_env and sync.transport_auth_token_file (choose one credential source)".to_string()
-            )
+        assert_validation_err(
+            |c| {
+                c.sync.as_mut().unwrap().transport_auth_token_env = Some("ENV_TOKEN".to_string());
+                c.sync.as_mut().unwrap().transport_auth_token_file =
+                    Some(PathBuf::from("/etc/token"));
+            },
+            "cannot specify both sync.transport_auth_token_env and sync.transport_auth_token_file",
         );
     }
 
     #[test]
     fn sync_rejects_whitespace_auth_token_file() {
-        let mut config = valid_test_config();
-        config.sync.as_mut().unwrap().transport_auth_token_env = None;
-        config.sync.as_mut().unwrap().transport_auth_token_file = Some(PathBuf::from("   "));
-        let err = config.validate().unwrap_err();
-        assert_eq!(
-            err,
-            HasqliteError::Validation(
-                "sync.transport_auth_token_file must not be empty when specified".to_string()
-            )
+        assert_validation_err(
+            |c| {
+                c.sync.as_mut().unwrap().transport_auth_token_env = None;
+                c.sync.as_mut().unwrap().transport_auth_token_file = Some(PathBuf::from("   "));
+            },
+            "sync.transport_auth_token_file must not be empty when specified",
         );
     }
 
@@ -916,6 +902,7 @@ interval_secs = 1
 
 [gateway]
 bind = "127.0.0.1:50051"
+allow_unauthenticated = true
 
 [probes]
 http_bind = "127.0.0.1:8088"
