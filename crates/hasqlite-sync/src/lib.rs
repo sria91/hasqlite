@@ -1,5 +1,8 @@
 //! Sync orchestration policies (Phase 2).
 
+use hasqlite_core::SyncSection;
+use std::path::Path;
+
 /// Sync scheduler policy identifiers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SyncTrigger {
@@ -31,11 +34,144 @@ pub enum SyncError {
     /// Authentication failed when connecting to the origin gRPC service.
     #[error("authentication failed with origin endpoint")]
     AuthFailed,
+    /// Sync configuration is invalid or does not specify an origin endpoint.
+    #[error("invalid sync configuration: {0}")]
+    InvalidConfiguration(String),
+    /// The configured authentication environment variable is unavailable.
+    #[error("sync authentication environment variable '{name}' is unavailable")]
+    AuthTokenEnvironmentVariable {
+        /// Environment variable name configured for the sync token.
+        name: String,
+    },
+    /// Reading the configured token file failed.
+    #[error("failed to read sync authentication token file '{path}': {message}")]
+    AuthTokenFile {
+        /// Configured token file path.
+        path: String,
+        /// File read error, without including the token contents.
+        message: String,
+    },
+    /// A configured authentication source contained no token.
+    #[error("sync authentication token must not be empty")]
+    EmptyAuthToken,
+    /// The underlying replication pull failed.
+    #[error("replication pull failed: {0}")]
+    Replication(String),
+}
+
+/// Pulls a database replica from the configured origin.
+///
+/// The configured environment or file credential is loaded and passed to the
+/// replication client, which attaches it to the authenticated gRPC request.
+pub async fn pull_replica(
+    sync: &SyncSection,
+    replica_path: &Path,
+    database: &str,
+) -> Result<(), SyncError> {
+    sync.validate()
+        .map_err(|error| SyncError::InvalidConfiguration(error.to_string()))?;
+    let endpoint = sync.origin_endpoint.as_deref().ok_or_else(|| {
+        SyncError::InvalidConfiguration("sync.origin_endpoint is required for replication".into())
+    })?;
+    let auth_token = load_sync_auth_token(sync).await?;
+
+    rsqlite_rsync::grpc_pull_sync(replica_path, endpoint, database, auth_token.as_deref())
+        .await
+        .map_err(|error| SyncError::Replication(error.to_string()))
+}
+
+async fn load_sync_auth_token(sync: &SyncSection) -> Result<Option<String>, SyncError> {
+    let token = match (
+        sync.transport_auth_token_env.as_deref(),
+        sync.transport_auth_token_file.as_deref(),
+    ) {
+        (Some(name), None) => {
+            Some(
+                std::env::var(name).map_err(|_| SyncError::AuthTokenEnvironmentVariable {
+                    name: name.to_string(),
+                })?,
+            )
+        }
+        (None, Some(path)) => Some(tokio::fs::read_to_string(path).await.map_err(|error| {
+            SyncError::AuthTokenFile {
+                path: path.display().to_string(),
+                message: error.to_string(),
+            }
+        })?),
+        (None, None) => None,
+        (Some(_), Some(_)) => {
+            return Err(SyncError::InvalidConfiguration(
+                "sync authentication environment variable and file are mutually exclusive".into(),
+            ));
+        }
+    };
+
+    token
+        .map(|token| {
+            let token = token.trim().to_string();
+            if token.is_empty() {
+                Err(SyncError::EmptyAuthToken)
+            } else {
+                Ok(token)
+            }
+        })
+        .transpose()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    fn sync_config() -> SyncSection {
+        SyncSection {
+            interval_secs: 1,
+            origin_endpoint: Some("https://writer:50443".into()),
+            transport_auth_token_env: None,
+            transport_auth_token_file: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_auth_token_is_loaded_from_file() {
+        let directory = tempfile::tempdir().expect("create temporary directory");
+        let token_path = directory.path().join("sync-token");
+        std::fs::write(&token_path, "test-replication-token\n").expect("write token");
+        let mut sync = sync_config();
+        sync.transport_auth_token_file = Some(token_path);
+
+        assert_eq!(
+            load_sync_auth_token(&sync)
+                .await
+                .expect("load token")
+                .as_deref(),
+            Some("test-replication-token")
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_auth_token_file_errors_do_not_expose_contents() {
+        let mut sync = sync_config();
+        sync.transport_auth_token_file = Some(PathBuf::from("/missing/sync-token"));
+
+        let error = load_sync_auth_token(&sync).await.unwrap_err();
+        assert!(matches!(error, SyncError::AuthTokenFile { .. }));
+        assert!(!error.to_string().contains("test-replication-token"));
+    }
+
+    #[tokio::test]
+    async fn sync_auth_token_file_rejects_empty_token() {
+        let directory = tempfile::tempdir().expect("create temporary directory");
+        let token_path = directory.path().join("sync-token");
+        std::fs::write(&token_path, " \n").expect("write token");
+        let mut sync = sync_config();
+        sync.transport_auth_token_file = Some(token_path);
+
+        assert_eq!(
+            load_sync_auth_token(&sync).await.unwrap_err(),
+            SyncError::EmptyAuthToken
+        );
+    }
 
     #[test]
     fn sync_triggers_equality_and_hashing() {

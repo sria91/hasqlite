@@ -86,7 +86,7 @@ fn is_valid_sync_origin_endpoint(endpoint: &str) -> bool {
         return false;
     }
 
-    let (host, port, is_ipv6) = if let Some(bracketed_host) = authority.strip_prefix('[') {
+    let (host, port) = if let Some(bracketed_host) = authority.strip_prefix('[') {
         let Some((host, suffix)) = bracketed_host.split_once(']') else {
             return false;
         };
@@ -96,7 +96,7 @@ fn is_valid_sync_origin_endpoint(endpoint: &str) -> bool {
         if host.parse::<std::net::Ipv6Addr>().is_err() {
             return false;
         }
-        (host, port, true)
+        (host, port)
     } else {
         let Some((host, port)) = authority.rsplit_once(':') else {
             return false;
@@ -104,21 +104,33 @@ fn is_valid_sync_origin_endpoint(endpoint: &str) -> bool {
         if host.is_empty() || host.contains(':') {
             return false;
         }
-        (host, port, false)
+        (host, port)
     };
 
-    let valid_host = is_ipv6
-        || (host.len() <= 253
-            && host.split('.').all(|label| {
-                !label.is_empty()
-                    && label.len() <= 63
-                    && !label.starts_with('-')
-                    && !label.ends_with('-')
-                    && label
-                        .bytes()
-                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-            }));
-    valid_host && port.parse::<u16>().is_ok_and(|port| port != 0)
+    let host = host.strip_suffix('.').unwrap_or(host);
+    if host.is_empty() {
+        return false;
+    }
+
+    let ip = host.parse::<std::net::IpAddr>().ok();
+    let valid_hostname = host.len() <= 253
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        });
+    let valid_host = ip.is_some() || valid_hostname;
+    let loopback = ip.is_some_and(|ip| ip.is_loopback())
+        || host.eq_ignore_ascii_case("localhost")
+        || host.to_ascii_lowercase().ends_with(".localhost");
+
+    valid_host
+        && port.parse::<u16>().is_ok_and(|port| port != 0)
+        && (scheme == "https" || (scheme == "grpc" && loopback))
 }
 
 /// Supported coordination backend types for writer leases.
@@ -196,7 +208,7 @@ impl ClusterConfig {
                         "sync section is required in clustered mode".to_string(),
                     )
                 })?;
-                Self::validate_sync(sync)?;
+                sync.validate()?;
 
                 let promotion = self.promotion.as_ref().ok_or_else(|| {
                     HasqliteError::Validation(
@@ -228,7 +240,7 @@ impl ClusterConfig {
                     Self::validate_freshness(freshness)?;
                 }
                 if let Some(ref sync) = self.sync {
-                    Self::validate_sync(sync)?;
+                    sync.validate()?;
                 }
                 if let Some(ref promotion) = self.promotion {
                     Self::validate_promotion_section(promotion)?;
@@ -341,41 +353,6 @@ impl ClusterConfig {
         Ok(())
     }
 
-    fn validate_sync(sync: &SyncSection) -> Result<(), HasqliteError> {
-        if sync.interval_secs == 0 {
-            return Err(HasqliteError::Validation(
-                "sync.interval_secs must be greater than 0".to_string(),
-            ));
-        }
-        if let Some(ref ep) = sync.origin_endpoint
-            && !is_valid_sync_origin_endpoint(ep)
-        {
-            return Err(HasqliteError::Validation(
-                "sync.origin_endpoint must be a grpc:// or https:// endpoint with a valid host and non-zero port when specified".to_string(),
-            ));
-        }
-        if sync.transport_auth_token_env.is_some() && sync.transport_auth_token_file.is_some() {
-            return Err(HasqliteError::Validation(
-                "cannot specify both sync.transport_auth_token_env and sync.transport_auth_token_file (choose one credential source)".to_string(),
-            ));
-        }
-        if let Some(ref env) = sync.transport_auth_token_env
-            && env.trim().is_empty()
-        {
-            return Err(HasqliteError::Validation(
-                "sync.transport_auth_token_env must not be empty when specified".to_string(),
-            ));
-        }
-        if let Some(ref path) = sync.transport_auth_token_file
-            && is_empty_or_whitespace(path)
-        {
-            return Err(HasqliteError::Validation(
-                "sync.transport_auth_token_file must not be empty when specified".to_string(),
-            ));
-        }
-        Ok(())
-    }
-
     fn validate_promotion_section(promotion: &PromotionSection) -> Result<(), HasqliteError> {
         if promotion.max_future_skew_secs > 300 {
             return Err(HasqliteError::Validation(
@@ -466,6 +443,44 @@ pub struct SyncSection {
     pub transport_auth_token_file: Option<PathBuf>,
 }
 
+impl SyncSection {
+    /// Validates sync intervals, origin security, and credential source settings.
+    pub fn validate(&self) -> Result<(), HasqliteError> {
+        if self.interval_secs == 0 {
+            return Err(HasqliteError::Validation(
+                "sync.interval_secs must be greater than 0".to_string(),
+            ));
+        }
+        if let Some(ref endpoint) = self.origin_endpoint
+            && !is_valid_sync_origin_endpoint(endpoint)
+        {
+            return Err(HasqliteError::Validation(
+                "sync.origin_endpoint must use HTTPS for remote origins; grpc:// is limited to loopback addresses, with a valid host and non-zero port".to_string(),
+            ));
+        }
+        if self.transport_auth_token_env.is_some() && self.transport_auth_token_file.is_some() {
+            return Err(HasqliteError::Validation(
+                "cannot specify both sync.transport_auth_token_env and sync.transport_auth_token_file (choose one credential source)".to_string(),
+            ));
+        }
+        if let Some(ref env) = self.transport_auth_token_env
+            && env.trim().is_empty()
+        {
+            return Err(HasqliteError::Validation(
+                "sync.transport_auth_token_env must not be empty when specified".to_string(),
+            ));
+        }
+        if let Some(ref path) = self.transport_auth_token_file
+            && is_empty_or_whitespace(path)
+        {
+            return Err(HasqliteError::Validation(
+                "sync.transport_auth_token_file must not be empty when specified".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// SQL gateway listener and authentication configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GatewaySection {
@@ -534,7 +549,7 @@ mod tests {
             }),
             sync: Some(SyncSection {
                 interval_secs: 2,
-                origin_endpoint: Some("grpc://writer:50051".to_string()),
+                origin_endpoint: Some("https://writer:50443".to_string()),
                 transport_auth_token_env: Some("HASQLITE_GRPC_AUTH_TOKEN".to_string()),
                 transport_auth_token_file: None,
             }),
@@ -861,14 +876,14 @@ http_bind = "0.0.0.0:8088"
     fn validation_rejects_empty_strings_in_optional_fields() {
         assert_validation_err(
             |c| c.sync.as_mut().unwrap().origin_endpoint = Some("   ".to_string()),
-            "sync.origin_endpoint must be a grpc:// or https:// endpoint",
+            "sync.origin_endpoint must use HTTPS for remote origins",
         );
         assert_validation_err(
             |c| {
                 c.sync.as_mut().unwrap().origin_endpoint =
                     Some("grpc://writer endpoint:50051".to_string())
             },
-            "sync.origin_endpoint must be a grpc:// or https:// endpoint",
+            "sync.origin_endpoint must use HTTPS for remote origins",
         );
         assert_validation_err(
             |c| c.sync.as_mut().unwrap().transport_auth_token_env = Some("".to_string()),
@@ -898,9 +913,13 @@ http_bind = "0.0.0.0:8088"
     #[test]
     fn sync_accepts_supported_origin_endpoint_formats() {
         for endpoint in [
-            "grpc://writer:50051",
             "https://writer:50443",
+            "https://writer.example.com.:50443",
             "grpc://127.0.0.1:50051",
+            "grpc://127.0.0.2:50051",
+            "grpc://localhost:50051",
+            "grpc://localhost.:50051",
+            "grpc://writer.localhost:50051",
             "grpc://[::1]:50051",
         ] {
             let mut config = valid_test_config();
@@ -917,6 +936,8 @@ http_bind = "0.0.0.0:8088"
         for endpoint in [
             "",
             "http://writer:50051",
+            "grpc://writer:50051",
+            "grpc://writer.example.com.:50051",
             "grpc://",
             "grpc://writer",
             "grpc://writer:abc",
@@ -929,7 +950,7 @@ http_bind = "0.0.0.0:8088"
         ] {
             assert_validation_err(
                 |config| config.sync.as_mut().unwrap().origin_endpoint = Some(endpoint.to_string()),
-                "sync.origin_endpoint must be a grpc:// or https:// endpoint",
+                "sync.origin_endpoint must use HTTPS for remote origins",
             );
         }
     }
@@ -996,6 +1017,14 @@ http_bind = "127.0.0.1:8088"
         let invalid_toml = "invalid toml syntax [[";
         let err = ClusterConfig::from_toml(invalid_toml).unwrap_err();
         assert!(matches!(err, HasqliteError::Config(_)));
+
+        let semantically_invalid_toml = toml_str.replace("interval_secs = 1", "interval_secs = 0");
+        let err = ClusterConfig::from_toml(&semantically_invalid_toml).unwrap_err();
+        assert!(matches!(
+            err,
+            HasqliteError::Validation(message)
+                if message == "sync.interval_secs must be greater than 0"
+        ));
     }
 
     #[test]

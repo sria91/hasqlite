@@ -108,7 +108,7 @@ flowchart TB
   WRITER -->|"Periodic lease renewal (generation g)"| LEASE
   REPLICAS -->|"Observe & Atomic CAS (generation g+1)"| LEASE
 
-  REPLICAS -->|"Pull page sync batches (BLAKE3 hash)"| WRITER
+  REPLICAS -->|"Pull page sync batches (TLS for remote origins)"| WRITER
 ```
 
 ### Detailed cluster interaction topology
@@ -168,11 +168,11 @@ flowchart TB
   W_CTRL -->|"Sets probe readiness (/ready=200)"| W_PROBE
   W_CTRL -->|"Periodic lease renewal (generation g)"| LS
 
-  R1_SYNC -->|"Pull page sync batches (gRPC / BLAKE3 hash)"| W_DB
+  R1_SYNC -->|"Pull page sync batches (TLS for remote origins)"| W_DB
   R1_SYNC -->|"Apply consistent snapshot"| R1_DB
   R1_SYNC -->|"Record synced_at_secs & source_gen"| R1_LEDGER
 
-  R2_SYNC -->|"Pull page sync batches (gRPC / BLAKE3 hash)"| W_DB
+  R2_SYNC -->|"Pull page sync batches (TLS for remote origins)"| W_DB
   R2_SYNC -->|"Apply consistent snapshot"| R2_DB
   R2_SYNC -->|"Record synced_at_secs & source_gen"| R2_LEDGER
 
@@ -192,14 +192,16 @@ flowchart TB
 flowchart TB
   subgraph k8s ["Kubernetes StatefulSet Deployment Architecture"]
     subgraph services ["Routing & Services Layer"]
-      SVC_WRITE["Service: hasqlite-writer\n(Routes write traffic via /ready=200)"]
+      SVC_WRITE["Service: hasqlite-writer\n(Routes writes to writer EndpointSlice)"]
       SVC_SYNC["Headless Service: hasqlite-headless\n(Stable pod DNS for replication pull)"]
       SVC_READ["Service: hasqlite-replicas\n(Optional load balancing for read-only traffic)"]
+      WRITER_EPS_CTRL["Writer EndpointSlice controller\n(Checks each pod's /ready)"]
+      WRITER_EPS["hasqlite-writer EndpointSlice\n(Only active /ready=200 endpoint)"]
     end
 
     subgraph pod0 ["Pod: hasqlite-0 (Active Writer)"]
       subgraph p0_containers ["Containers"]
-        P0_TLS["TLS Proxy Sidecar (Optional)\nEnvoy / Nginx (:50443 mTLS -> 127.0.0.1:50051)"]
+        P0_TLS["TLS Proxy Sidecar (Required for remote traffic)\nEnvoy / Nginx (:50443 TLS -> 127.0.0.1:50051)"]
         P0_MAIN["Main Container: hasqlite-node (USER 1000:1000)\n- gRPC SQL Gateway (127.0.0.1:50051 with sidecar, or 0.0.0.0:50051 direct)\n- HA Controller (Role: writer:g)\n- Write Fence (Enforce Generation g)\n- HTTP Probes Server (:8088 /ready=200)"]
       end
 
@@ -214,25 +216,28 @@ flowchart TB
 
     subgraph pod1 ["Pod: hasqlite-1 (Standby Replica)"]
       subgraph p1_containers ["Containers"]
-        P1_TLS["TLS Proxy Sidecar (Optional)\nEnvoy / Nginx (:50443 mTLS -> 127.0.0.1:50051)"]
+        P1_TLS["TLS Proxy Sidecar (Required for remote traffic)\nEnvoy / Nginx (:50443 TLS -> 127.0.0.1:50051)"]
         P1_MAIN["Main Container: hasqlite-node (USER 1000:1000)\n- gRPC SQL Gateway (127.0.0.1:50051 NOT_LEADER Redirect)\n- Sync Worker (Scheduled Page Sync Pull)\n- HA Controller (Observe Lease & CAS Promote)\n- HTTP Probes Server (:8088 /ready=503)"]
       end
 
       subgraph p1_vols ["Volumes & Storage"]
         P1_PVC[("PVC: data-hasqlite-1\n(/var/lib/hasqlite: Exclusive Replica DB)")]
         P1_LEDGER[("Freshness Ledger: /var/run/freshness.txt\n(Replica-bound sync timestamp & gen)")]
+        P1_SEC["Secret: /run/secrets/hasqlite_token (mode 0400)"]
       end
 
       P1_HOOKS["Lifecycle & Probes\n- preStop: catchup sync before termination\n- readinessProbe: :8088/healthz\n- livenessProbe: :8088/live"]
     end
 
-    subgraph pod2 ["Pod: hasqlite-2 (Peer Standby Replica - Direct / No Sidecar)"]
+    subgraph pod2 ["Pod: hasqlite-2 (Peer Standby Replica)"]
       subgraph p2_containers ["Containers"]
-        P2_MAIN["Main Container: hasqlite-node (USER 1000:1000)\n- gRPC SQL Gateway (Direct 0.0.0.0:50051)\n- Sync Worker, NOT_LEADER Gateway\n- HTTP Probes Server (:8088 /ready=503)"]
+        P2_TLS["TLS Proxy Sidecar\nEnvoy / Nginx (:50443 TLS -> 127.0.0.1:50051)"]
+        P2_MAIN["Main Container: hasqlite-node (USER 1000:1000)\n- gRPC SQL Gateway (127.0.0.1:50051 NOT_LEADER Redirect)\n- Sync Worker, NOT_LEADER Gateway\n- HTTP Probes Server (:8088 /ready=503)"]
       end
 
       subgraph p2_vols ["Volumes & Storage"]
         P2_PVC[("PVC: data-hasqlite-2\n(/var/lib/hasqlite: Replica DB)")]
+        P2_SEC["Secret: /run/secrets/hasqlite_token (mode 0400)"]
       end
     end
 
@@ -241,15 +246,19 @@ flowchart TB
     end
   end
 
-  SVC_WRITE -->|"Mutating SQL traffic (:50443 mTLS via sidecar)"| P0_TLS
+  SVC_WRITE -->|"Mutating SQL traffic (:50443 TLS via sidecar)"| P0_TLS
   P0_TLS -->|"Plaintext gRPC (127.0.0.1:50051)"| P0_MAIN
-  SVC_READ -.->|"Read-only queries (:50443 mTLS via sidecar)"| P1_TLS
+  P0_MAIN -->|"Role status (/ready)"| WRITER_EPS_CTRL
+  WRITER_EPS_CTRL -->|"Maintains active-writer endpoint"| WRITER_EPS
+  WRITER_EPS -.->|"Endpoint list used by"| SVC_WRITE
+  SVC_READ -.->|"Read-only queries (:50443 TLS via sidecar)"| P1_TLS
   P1_TLS -.->|"Plaintext gRPC (127.0.0.1:50051)"| P1_MAIN
-  SVC_READ -.->|"Read-only queries (direct 0.0.0.0:50051 without sidecar)"| P2_MAIN
+  SVC_READ -.->|"Read-only queries (:50443 TLS via sidecar)"| P2_TLS
+  P2_TLS -.->|"Plaintext gRPC (127.0.0.1:50051)"| P2_MAIN
 
-  P1_MAIN -->|"Pull page sync via hasqlite-0.hasqlite-headless"| SVC_SYNC
-  P2_MAIN -->|"Pull page sync via hasqlite-0.hasqlite-headless"| SVC_SYNC
-  SVC_SYNC -->|"Forward sync RPC (:50443 mTLS via sidecar, or direct :50051)"| P0_TLS
+  P1_MAIN -->|"Pull pages via HTTPS with bearer token"| SVC_SYNC
+  P2_MAIN -->|"Pull pages via HTTPS with bearer token"| SVC_SYNC
+  SVC_SYNC -->|"Forward sync RPC (:50443 TLS via sidecar)"| P0_TLS
 
   P0_MAIN -->|"Read/Write"| P0_PVC
   P0_MAIN -->|"Read configuration"| P0_CFG
@@ -257,7 +266,9 @@ flowchart TB
 
   P1_MAIN -->|"Apply replicated pages"| P1_PVC
   P1_MAIN -->|"Write last sync record"| P1_LEDGER
+  P1_MAIN -->|"Read replica sync auth token"| P1_SEC
   P2_MAIN -->|"Apply replicated pages"| P2_PVC
+  P2_MAIN -->|"Read replica sync auth token"| P2_SEC
 
   P0_MAIN -->|"Periodic lease renewal (generation g)"| K8S_LEASE
   P1_MAIN -->|"Observe lease & atomic CAS acquire (gen g+1)"| K8S_LEASE
@@ -269,14 +280,14 @@ flowchart TB
 > - **Consolidated Primary Container (`hasqlite-node`)**:
 >   Unlike legacy setups that split the synchronization sidecar, lease updater daemon, and HA runtime into separate processes, `hasqlite` consolidates all node responsibilities into a single node agent container running as non-root numeric `USER 1000:1000`. The container hosts the gRPC SQL Gateway, HA Controller reconcile loop, page sync worker, and HTTP health probes.
 >
-> - **TLS Termination Reverse Proxy Sidecar (Optional / Recommended for Multi-Host)**:
->   Because the `hasqlite` gRPC SQL Gateway communicates in plaintext in v1 and does not provide built-in TLS termination, multi-host and production Kubernetes deployments co-locate a lightweight reverse proxy sidecar (e.g., Envoy, Traefik, or Nginx) in each pod. The sidecar listens on a distinct external port (e.g., `:50443` for mTLS) and forwards decrypted requests to `127.0.0.1:50051`, avoiding port conflicts with the main container within the shared pod network namespace. In deployments without a TLS sidecar, the main container binds directly to `0.0.0.0:50051`.
+> - **TLS Termination Reverse Proxy Sidecar (Required for Remote Sync)**:
+>   The `hasqlite` gRPC Gateway does not provide built-in TLS termination. Remote replication origins must use `https://` and a TLS endpoint (for example, a TLS sidecar on `:50443`); plaintext `grpc://` origins are accepted only for loopback connections. Replicas mount the sync credential Secret so the sync worker can authenticate its pull requests. The sidecar forwards decrypted requests to `127.0.0.1:50051`.
 >
 > - **Lease Updater Sidecar (Evaluated in Phase 4 / Optional Bridge)**:
 >   By default, `hasqlite-node` natively interacts with the Kubernetes Lease API (`coordination.k8s.io/v1`) in-process. In environments with restricted Pod RBAC where direct K8s API access is forbidden or when bridging file leases across shared volumes, an optional lease updater sidecar can manage the lease and bridge state to the node agent via volume files (see §5 Phase 4).
 >
 > - **Lifecycle Hooks & Probe Separation**:
->   Pods configure a `preStop` hook to checkpoint WAL frames and perform catch-up sync before `SIGTERM`. Kubernetes `readinessProbe` queries `/healthz` to prevent rolling update stalls during StatefulSet deployments, while the dedicated `hasqlite-writer` Service uses `/ready=200` to route write traffic strictly to the active leader.
+>   Pods configure a `preStop` hook to checkpoint WAL frames and perform catch-up sync before `SIGTERM`. Kubernetes `readinessProbe` queries `/healthz` for pod health. A standard Service is not writer-aware, so a separate EndpointSlice controller must check each pod's `/ready` and publish only the active writer in the `hasqlite-writer` EndpointSlice. The optional replica read Service selects replica pods independently.
 
 ### Layers
 
@@ -697,7 +708,7 @@ max_future_skew_secs = 2
 
 [sync]
 interval_secs = 2
-origin_endpoint = "grpc://writer:50051" # role-dependent (or "https://writer:50443" when using TLS sidecar)
+origin_endpoint = "https://writer:50443" # remote origins require TLS; grpc:// is loopback-only
 transport_auth_token_env = "HASQLITE_GRPC_AUTH_TOKEN"
 # transport_auth_token_file = "/run/secrets/hasqlite_token"
 
@@ -755,7 +766,7 @@ http_bind = "0.0.0.0:8088"
 >
 > **Configurable Non-Root User & Volume Permissions**: The image defaults to non-root user and group `hasqlite:hasqlite` with UID:GID `1000:1000`. Custom user/group names and UID/GID values can be configured at build time using `--build-arg USER=<user> --build-arg GROUP=<group> --build-arg UID=<uid> --build-arg GID=<gid>`. Note that build arguments configure the image's internal user identity and default directory permissions, but do not change ownership or permissions on host bind mounts. When mounting a host directory to `/var/lib/hasqlite`, users must ensure the host directory and any existing database/lease files grant write access to the runtime identity (e.g., `chown -R <uid>:<gid> /path/to/host/data`, or assigning group ownership `chgrp -R <gid> /path/to/host/data` paired with `chmod -R 0770 /path/to/host/data`). When running under rootless Docker or user namespace remapping (`userns-remap`), container UIDs/GIDs are translated to subordinate host ID ranges defined in `/etc/subuid` and `/etc/subgid` (or mapped to the rootless daemon user); operators must determine the translated host UID/GID and apply ownership or permissions using those mapped host IDs rather than container-internal values. The image configures numeric `USER ${UID}:${GID}` so runtime `-u` flags are unnecessary unless explicitly overriding the container user at runtime.
 >
-> **Secret File Permissions**: When using `auth_token_file` with mounted secrets (e.g. `/run/secrets/hasqlite_token`), ensure the secret file is readable (read access) by the configured runtime UID/GID (or mapped host ID under rootless/userns-remap) without exposing credentials to other local users. Recommend file mode `0400` (read-only by runtime UID) or `0440` (read-only by runtime UID and restricted group); do not use world-readable permissions (`0444`).
+> **Secret File Permissions**: When using `auth_token_file` or `transport_auth_token_file` with mounted secrets (e.g. `/run/secrets/hasqlite_token`), ensure each node that reads the secret can access it as the configured runtime UID/GID (or mapped host ID under rootless/userns-remap) without exposing credentials to other local users. Recommend file mode `0400` (read-only by runtime UID) or `0440` (read-only by runtime UID and restricted group); do not use world-readable permissions (`0444`).
 >
 > **Plaintext Gateway & Network Security**: The gRPC SQL Gateway communicates in plaintext in v1 and does not provide built-in TLS termination. The host port mapping binds strictly to host loopback (`127.0.0.1:50051:50051`) to avoid publishing the unencrypted gateway on public interfaces. Any remote or multi-host access MUST traverse an external TLS termination reverse proxy or ingress sidecar (such as Envoy, Traefik, or Nginx).
 
