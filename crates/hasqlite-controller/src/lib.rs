@@ -54,6 +54,9 @@ pub enum PromotionError {
         /// Node ID attempting promotion.
         promoting_node: NodeId,
     },
+    /// Source writer origin node ID is empty or invalid.
+    #[error("freshness ledger contains empty or invalid source node ID")]
+    InvalidSourceNode,
 }
 
 /// Validates whether a replica meets all freshness and fencing criteria to promote to writer (§7).
@@ -66,6 +69,10 @@ pub fn validate_promotion(
     max_future_skew_secs: u64,
 ) -> Result<(), PromotionError> {
     let ledger = freshness.ok_or(PromotionError::NoFreshnessRecord)?;
+
+    if ledger.source_node_id.as_str().trim().is_empty() {
+        return Err(PromotionError::InvalidSourceNode);
+    }
 
     if let Some(ref bound_node) = ledger.destination_node_id
         && bound_node != promoting_node
@@ -223,6 +230,34 @@ mod tests {
                 promoting_node: NodeId::from("node-2")
             }
         );
+    }
+
+    #[test]
+    fn validate_promotion_rejects_empty_source_node() {
+        let promoting_node = NodeId::from("node-2");
+        let ledger = FreshnessLedger {
+            source_node_id: NodeId::from("   "),
+            source_generation: 5,
+            synced_at_secs: 1_000,
+            destination_node_id: Some(promoting_node.clone()),
+        };
+
+        let result = validate_promotion(Some(&ledger), &promoting_node, 1_005, 10, 1, 2);
+        assert_eq!(result.unwrap_err(), PromotionError::InvalidSourceNode);
+    }
+
+    #[test]
+    fn validate_promotion_accepts_zero_age_exact_sync() {
+        let promoting_node = NodeId::from("node-2");
+        let ledger = FreshnessLedger {
+            source_node_id: NodeId::from("node-1"),
+            source_generation: 5,
+            synced_at_secs: 1_000,
+            destination_node_id: Some(promoting_node.clone()),
+        };
+
+        let result = validate_promotion(Some(&ledger), &promoting_node, 1_000, 10, 1, 2);
+        assert!(result.is_ok());
     }
 
     use proptest::prelude::*;

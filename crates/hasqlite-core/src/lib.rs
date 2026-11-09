@@ -70,6 +70,11 @@ pub enum NodeMode {
 /// Canonical file name for standalone advisory lease locks within the database volume.
 pub const STANDALONE_CANONICAL_LEASE_FILENAME: &str = ".hasqlite.lease";
 
+/// Returns true if a path is empty or contains only whitespace characters.
+fn is_empty_or_whitespace(path: &std::path::Path) -> bool {
+    path.as_os_str().is_empty() || path.to_str().map(|s| s.trim().is_empty()).unwrap_or(false)
+}
+
 /// Supported coordination backend types for writer leases.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -105,6 +110,14 @@ pub struct ClusterConfig {
 }
 
 impl ClusterConfig {
+    /// Parses a `ClusterConfig` from a TOML string and runs semantic validation.
+    pub fn from_toml(toml_str: &str) -> Result<Self, HasqliteError> {
+        let config: Self =
+            toml::from_str(toml_str).map_err(|e| HasqliteError::Config(e.to_string()))?;
+        config.validate()?;
+        Ok(config)
+    }
+
     /// Returns the canonical standalone file lease path within the database data directory.
     pub fn canonical_standalone_lease_path(&self) -> PathBuf {
         self.data.dir.join(STANDALONE_CANONICAL_LEASE_FILENAME)
@@ -117,7 +130,7 @@ impl ClusterConfig {
                 "node.id must not be empty".to_string(),
             ));
         }
-        if self.data.dir.as_os_str().is_empty() {
+        if is_empty_or_whitespace(&self.data.dir) {
             return Err(HasqliteError::Validation(
                 "data.dir must not be empty".to_string(),
             ));
@@ -144,7 +157,7 @@ impl ClusterConfig {
                         "promotion section is required in clustered mode".to_string(),
                     )
                 })?;
-                Self::validate_promotion(promotion)?;
+                Self::validate_promotion_section(promotion)?;
             }
             NodeMode::Standalone => {
                 if self.lease.source != LeaseSourceType::File {
@@ -172,7 +185,7 @@ impl ClusterConfig {
                     Self::validate_sync(sync)?;
                 }
                 if let Some(ref promotion) = self.promotion {
-                    Self::validate_promotion(promotion)?;
+                    Self::validate_promotion_section(promotion)?;
                 }
             }
         }
@@ -190,8 +203,7 @@ impl ClusterConfig {
             ));
         }
         if let Some(ref path) = self.gateway.auth_token_file
-            && (path.as_os_str().is_empty()
-                || path.to_str().map(|s| s.trim().is_empty()).unwrap_or(false))
+            && is_empty_or_whitespace(path)
         {
             return Err(HasqliteError::Validation(
                 "gateway.auth_token_file must not be empty when specified".to_string(),
@@ -244,7 +256,7 @@ impl ClusterConfig {
                         "lease.source is 'file' but lease.file section is missing".to_string(),
                     )
                 })?;
-                if file.path.as_os_str().is_empty() {
+                if is_empty_or_whitespace(&file.path) {
                     return Err(HasqliteError::Validation(
                         "lease.file.path must not be empty".to_string(),
                     ));
@@ -255,7 +267,7 @@ impl ClusterConfig {
     }
 
     fn validate_freshness(freshness: &FreshnessSection) -> Result<(), HasqliteError> {
-        if freshness.path.as_os_str().is_empty() {
+        if is_empty_or_whitespace(&freshness.path) {
             return Err(HasqliteError::Validation(
                 "freshness.path must not be empty".to_string(),
             ));
@@ -281,6 +293,11 @@ impl ClusterConfig {
                 "sync.origin_endpoint must not be empty when specified".to_string(),
             ));
         }
+        if sync.transport_auth_token_env.is_some() && sync.transport_auth_token_file.is_some() {
+            return Err(HasqliteError::Validation(
+                "cannot specify both sync.transport_auth_token_env and sync.transport_auth_token_file (choose one credential source)".to_string(),
+            ));
+        }
         if let Some(ref env) = sync.transport_auth_token_env
             && env.trim().is_empty()
         {
@@ -288,10 +305,17 @@ impl ClusterConfig {
                 "sync.transport_auth_token_env must not be empty when specified".to_string(),
             ));
         }
+        if let Some(ref path) = sync.transport_auth_token_file
+            && is_empty_or_whitespace(path)
+        {
+            return Err(HasqliteError::Validation(
+                "sync.transport_auth_token_file must not be empty when specified".to_string(),
+            ));
+        }
         Ok(())
     }
 
-    fn validate_promotion(promotion: &PromotionSection) -> Result<(), HasqliteError> {
+    fn validate_promotion_section(promotion: &PromotionSection) -> Result<(), HasqliteError> {
         if promotion.max_future_skew_secs > 300 {
             return Err(HasqliteError::Validation(
                 "promotion.max_future_skew_secs must not exceed 300 seconds".to_string(),
@@ -373,9 +397,12 @@ pub struct SyncSection {
     /// Origin gRPC endpoint to pull replication pages from.
     #[serde(default)]
     pub origin_endpoint: Option<String>,
-    /// Environment variable containing the replication authentication token.
+    /// Environment variable containing the replication authentication token (mutually exclusive with `transport_auth_token_file`).
     #[serde(default)]
     pub transport_auth_token_env: Option<String>,
+    /// File path containing the replication authentication token (mutually exclusive with `transport_auth_token_env`).
+    #[serde(default)]
+    pub transport_auth_token_file: Option<PathBuf>,
 }
 
 /// SQL gateway listener and authentication configuration.
@@ -445,6 +472,7 @@ mod tests {
                 interval_secs: 2,
                 origin_endpoint: Some("grpc://writer:50051".to_string()),
                 transport_auth_token_env: Some("HASQLITE_GRPC_AUTH_TOKEN".to_string()),
+                transport_auth_token_file: None,
             }),
             gateway: GatewaySection {
                 bind: "0.0.0.0:50051".to_string(),
@@ -515,6 +543,10 @@ http_bind = "127.0.0.1:8088"
         assert_eq!(parsed.gateway.auth_token_env, None);
         assert_eq!(parsed.gateway.auth_token_file, None);
         assert_eq!(parsed.sync.as_ref().unwrap().origin_endpoint, None);
+        assert_eq!(
+            parsed.sync.as_ref().unwrap().transport_auth_token_file,
+            None
+        );
         assert!(parsed.validate().is_ok());
 
         let serialized = toml::to_string(&parsed).expect("should serialize to toml");
@@ -797,6 +829,111 @@ http_bind = "0.0.0.0:8088"
         assert_eq!(
             err6,
             HasqliteError::Validation("lease.kubernetes.namespace must not be empty".to_string())
+        );
+    }
+
+    #[test]
+    fn validation_rejects_whitespace_only_paths() {
+        let mut config = valid_test_config();
+        config.data.dir = PathBuf::from("   ");
+        assert_eq!(
+            config.validate().unwrap_err(),
+            HasqliteError::Validation("data.dir must not be empty".to_string())
+        );
+
+        let mut config2 = valid_test_config();
+        config2.freshness.as_mut().unwrap().path = PathBuf::from(" \t ");
+        assert_eq!(
+            config2.validate().unwrap_err(),
+            HasqliteError::Validation("freshness.path must not be empty".to_string())
+        );
+
+        let mut config3 = valid_test_config();
+        config3.lease.source = LeaseSourceType::File;
+        config3.lease.kubernetes = None;
+        config3.lease.file = Some(FileLeaseSection {
+            path: PathBuf::from("   "),
+        });
+        assert_eq!(
+            config3.validate().unwrap_err(),
+            HasqliteError::Validation("lease.file.path must not be empty".to_string())
+        );
+    }
+
+    #[test]
+    fn sync_rejects_both_auth_token_env_and_file() {
+        let mut config = valid_test_config();
+        config.sync.as_mut().unwrap().transport_auth_token_env = Some("ENV_TOKEN".to_string());
+        config.sync.as_mut().unwrap().transport_auth_token_file = Some(PathBuf::from("/etc/token"));
+        let err = config.validate().unwrap_err();
+        assert_eq!(
+            err,
+            HasqliteError::Validation(
+                "cannot specify both sync.transport_auth_token_env and sync.transport_auth_token_file (choose one credential source)".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn sync_rejects_whitespace_auth_token_file() {
+        let mut config = valid_test_config();
+        config.sync.as_mut().unwrap().transport_auth_token_env = None;
+        config.sync.as_mut().unwrap().transport_auth_token_file = Some(PathBuf::from("   "));
+        let err = config.validate().unwrap_err();
+        assert_eq!(
+            err,
+            HasqliteError::Validation(
+                "sync.transport_auth_token_file must not be empty when specified".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn from_toml_parses_and_validates() {
+        let toml_str = r#"
+[node]
+id = "node-alpha"
+
+[data]
+dir = "/tmp/data"
+
+[lease]
+source = "file"
+
+[lease.file]
+path = "/tmp/lease.txt"
+
+[freshness]
+path = "/tmp/freshness.txt"
+max_age_secs = 5
+
+[promotion]
+min_source_generation = 1
+max_future_skew_secs = 3
+
+[sync]
+interval_secs = 1
+
+[gateway]
+bind = "127.0.0.1:50051"
+
+[probes]
+http_bind = "127.0.0.1:8088"
+"#;
+        let config = ClusterConfig::from_toml(toml_str).expect("should parse valid toml");
+        assert_eq!(config.node.id.as_str(), "node-alpha");
+
+        let invalid_toml = "invalid toml syntax [[";
+        let err = ClusterConfig::from_toml(invalid_toml).unwrap_err();
+        assert!(matches!(err, HasqliteError::Config(_)));
+    }
+
+    #[test]
+    fn canonical_standalone_lease_path_matches_expected() {
+        let config = valid_test_config();
+        assert_eq!(
+            config.canonical_standalone_lease_path(),
+            PathBuf::from("/var/lib/hasqlite/.hasqlite.lease")
         );
     }
 

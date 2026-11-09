@@ -698,6 +698,7 @@ max_future_skew_secs = 2
 interval_secs = 2
 origin_endpoint = "grpc://writer:50051" # role-dependent
 transport_auth_token_env = "HASQLITE_GRPC_AUTH_TOKEN"
+# transport_auth_token_file = "/run/secrets/hasqlite_token"
 
 [gateway]
 bind = "0.0.0.0:50051"
