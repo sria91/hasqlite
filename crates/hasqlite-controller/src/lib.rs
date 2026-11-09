@@ -6,30 +6,52 @@ use hasqlite_lease::{FreshnessLedger, LeaseRecord};
 /// Placeholder for the tick outcome type (will match rsqlite-rsync `HaController`).
 #[derive(Debug, Clone)]
 pub struct ControllerTick {
+    /// Active writer lease status observed during this tick.
     pub lease: LeaseRecord,
+    /// Freshness ledger record observed on the local node, if any.
     pub freshness: Option<FreshnessLedger>,
 }
 
 /// Promotion validation errors reflecting §7 of the Safety Contract.
 #[derive(thiserror::Error, Debug, PartialEq, Eq)]
 pub enum PromotionError {
+    /// No freshness ledger was found for the candidate replica.
     #[error("no freshness ledger recorded for replica")]
     NoFreshnessRecord,
+    /// Replica data age exceeds the maximum permissible threshold.
     #[error("freshness age {age_secs}s exceeds max allowed age {max_age_secs}s")]
-    StaleReplica { age_secs: u64, max_age_secs: u64 },
+    StaleReplica {
+        /// Age of the replica snapshot in seconds.
+        age_secs: u64,
+        /// Maximum allowed freshness age in seconds.
+        max_age_secs: u64,
+    },
+    /// Replica generation is strictly lower than the minimum required generation.
     #[error("source generation {source_gen} is below minimum allowed generation {min_gen}")]
-    GenerationTooLow { source_gen: u64, min_gen: u64 },
+    GenerationTooLow {
+        /// Generation counter observed on the replica.
+        source_gen: u64,
+        /// Minimum permissible generation counter.
+        min_gen: u64,
+    },
+    /// Replica snapshot timestamp is ahead of local wall-clock time beyond tolerance.
     #[error(
         "snapshot timestamp {synced_at_secs}s is in the future by {skew_secs}s (max allowed {max_skew_secs}s)"
     )]
     ClockSkewExceeded {
+        /// Recorded sync timestamp in seconds.
         synced_at_secs: u64,
+        /// Calculated forward clock skew in seconds.
         skew_secs: u64,
+        /// Maximum allowed future skew in seconds.
         max_skew_secs: u64,
     },
+    /// Freshness ledger is pinned to a different destination replica.
     #[error("freshness ledger bound to node {bound_to}, but promoting node is {promoting_node}")]
     ReplicaMismatch {
+        /// Node ID the ledger was recorded for.
         bound_to: NodeId,
+        /// Node ID attempting promotion.
         promoting_node: NodeId,
     },
 }

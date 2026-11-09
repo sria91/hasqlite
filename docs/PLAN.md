@@ -22,6 +22,10 @@ production patterns already proven in
    `rsqlite-rsync-client` / shared protobuf).
 5. **Library-first**: embed the HA controller in custom agents; ship a
    batteries-included `hasqlite` node binary.
+6. **First-class standalone single-node Docker support (fast-track)**: Out-of-the-box
+   capability to run a single `hasqlite` node in a standalone Docker container
+   (file-based lease or auto-granted genesis lease, zero peer dependencies, gRPC SQL gateway,
+   HTTP probes) for local development, edge, and single-host production before multi-node failover.
 
 ### Future goals (non-goals for v1)
 
@@ -29,7 +33,8 @@ production patterns already proven in
   extension).
 - Cross-region active/active.
 - Replacing rsqlite-rsync’s standalone sync CLI (keep compatibility; call sync
-  as a library).
+  as a library). Note: running `hasqlite` *itself* as a standalone single-node database
+  service in Docker is explicitly a goal and fast-tracked (see §1.6 and §5 Phase 1b).
 - Built-in TLS termination on the gateway (document mesh/proxy patterns instead).
 
 ### Success criteria (v1.0)
@@ -150,6 +155,58 @@ Events per tick (from rsync `ReconcileDecision` model):
 - Promotion rejected when `validate_promotion` fails (stale freshness, generation mismatch, unattributed freshness ledger).
 - Replica DB not written except by sync engine (exclusive replica).
 
+### Standalone single-node mode (Docker / edge / local)
+
+While `hasqlite` is primarily an HA clustering engine, single-node standalone operation
+is supported as an explicit first-class operational mode:
+
+- **Direct genesis writer bootstrap**: In standalone mode (`mode = "standalone"` in `[node]` or CLI `--mode standalone`),
+  the node skips peer freshness checks, acquires writer status via the authoritative file lease (`LeaseRecord`), and transitions
+  directly from `Starting → Writer(g)`, bypassing the intermediate `Replica` state. Standalone configurations strictly require
+  `lease.source = "file"`; Kubernetes lease backends are rejected because they do not provide single-node host filesystem mutual exclusion.
+- **Generation continuity & authoritative source of truth**: The lease record (`LeaseRecord.generation` stored in the lease file)
+  is the authoritative source of truth for writer identity and generation (per `docs/safety-contract.md` §2).
+  - **First boot**: On a fresh volume with no prior lease file or database state, initial generation is explicitly `1`.
+  - **Volume reuse**: When bootstrapping on an existing volume, the node reads the prior lease generation `g_lease`
+    and database user metadata `g_db`, setting `g_prior = max(g_lease, g_db)`.
+  - **Monotonic lease acquisition**: Standalone bootstrap writes an updated `LeaseRecord` with `generation = g_prior + 1`
+    (or `1` if `g_prior == 0`) under advisory POSIX file locking (`flock`), guaranteeing generation monotonicity.
+    When migrating the volume into an HA cluster, a fenced migration procedure seeds the new authoritative Kubernetes
+    lease (e.g. lease metadata annotation/counter) with `g_prior` from the standalone file lease before any cluster CAS
+    acquisition begins. This preserves the generation invariant in the safety contract (§2) so switching coordination
+    backends cannot reset the generation or allow competing lease updates during transfer.
+- **Mutual exclusion via canonical lock identity on shared volume**: Standalone configurations enforce exactly one
+  canonical lock identity per database volume: `${data.dir}/.hasqlite.lease`. `ClusterConfig::validate()` strictly
+  rejects configurations specifying any other `lease.file.path`. Allowing arbitrary paths on the volume would risk two
+  containers configuring different file names (e.g. `lease.txt` vs `lock.file`), acquiring independent advisory locks on
+  different inodes, and causing split-brain write corruption against the same database. By enforcing the single canonical
+  path, every standalone container sharing the database volume contends for the exact same file inode via advisory POSIX
+  file locking (`flock`/`fcntl`), ensuring any concurrent instance immediately fails fast with `EWOULDBLOCK`.
+- **Zero-sync overhead**: Peer replication loops are dormant; write fence is active locally for writer generation `g`.
+- **Graceful shutdown on `SIGTERM`**: Handles container stop signals within Docker's default 10s grace window through an
+  ordered shutdown sequence:
+  1. **Stop accepting requests**: Demote HTTP probe readiness (`/ready` returns 503) and reject incoming gRPC gateway calls
+     with `UNAVAILABLE`.
+  2. **Drain in-flight writes**: Drain active transactions and in-flight queries up to a bounded timeout (e.g., 5 seconds).
+  3. **WAL checkpoint truncate**: Execute a blocking SQLite WAL checkpoint via `sqlite3_wal_checkpoint_v2(..., SQLITE_CHECKPOINT_TRUNCATE, ...)`
+     to flush all committed database pages from the WAL into the primary database file and truncate the WAL file to zero bytes.
+  4. **Deadline & fallback handling**: If `SQLITE_CHECKPOINT_TRUNCATE` cannot complete before the shutdown deadline (e.g., blocked
+     by lingering reader locks or slow I/O, returning `SQLITE_BUSY`), the node logs a warning, falls back to a non-blocking passive
+     checkpoint (`SQLITE_CHECKPOINT_PASSIVE`) without truncating, and cleanly proceeds with shutdown. SQLite WAL crash recovery will
+     safely replay any remaining committed WAL frames on the next startup.
+  5. **Release lease**: Release the advisory POSIX file lock (`flock`) and exit cleanly with status code 0.
+- **Docker container runtime**: Designed to run inside standard Docker containers with a persistent
+  volume mount at `/var/lib/hasqlite`, running under non-root UID/GID (`1000:1000`), exposing:
+  - gRPC SQL Gateway (`127.0.0.1:50051`) for read/write queries.
+  - HTTP Probes (`:8088` `/ready`, `/live`, `/healthz`).
+- **Seamless cluster upgrade path**: Upgrading from a standalone deployment to an HA cluster requires cleanly stopping
+  and fencing the standalone writer before creating or acquiring writer authority under the new coordination backend
+  (e.g., Kubernetes Lease API). Because the standalone file lock and Kubernetes Lease API are independent coordination
+  mechanisms, running both concurrently without prior fencing would create a dual-writer split-brain hazard. The migration
+  procedure requires: (1) terminate the standalone container and verify the POSIX lock is released, (2) inspect the standalone
+  lease file to seed the initial generation `g_k8s = g_prior` on the Kubernetes Lease object, and (3) launch the HA cluster
+  nodes under Kubernetes lease coordination where the first promote CAS will increment to `g_k8s + 1`.
+
 ---
 
 ## 4. Repository layout
@@ -166,8 +223,8 @@ hasqlite/
     hasqlite-node/           # runtime: tokio supervisor, gateway bind
   hasqlite/                  # binary CLI (package name hasqlite)
   deploy/
+    docker/                  # Multi-stage Dockerfile, docker-compose.standalone.yml
     k8s/                     # StatefulSet, RBAC, lease, sync contract
-    docker/
   docs/
     PLAN.md                  # this file
     safety-contract.md
@@ -232,6 +289,26 @@ Deliverables:
 - Single-winner verification: dual replica failover simulation asserting exactly one node promotes
 - No SQLite I/O in this crate (fast CI)
 
+### Phase 1b — Fast-track: Standalone single-node & Docker (weeks 3–4)
+
+*Delivered early immediately following Phase 1 controller logic, unlocking a fully usable
+standalone Docker container weeks ahead of multi-node replication and clustering.*
+
+Scope:
+- Multi-stage `Dockerfile` (optimized Rust musl/debian-slim build, non-root user `hasqlite` UID/GID 1000:1000, persistent volume mount at `/var/lib/hasqlite`).
+- `deploy/docker/docker-compose.standalone.yml` and container quickstart scripts with host volume permission guidance.
+- Standalone mode profile in `hasqlite-core` and `hasqlite-node`:
+  - `mode = "standalone"` in `ClusterConfig` (or `--mode standalone` CLI / `HASQLITE_MODE=standalone`).
+  - Auto-acquire genesis writer lease (POSIX `flock` on file lease) writing an authoritative `LeaseRecord` at `new_gen = g_prior + 1` (defaulting to `1` on first boot, or incrementing `max(g_lease, g_db)` observed from prior volume state) without requiring peer sync history or freshness section.
+  - Secret file credential support: `auth_token_file` (or `HASQLITE_GRPC_AUTH_TOKEN_FILE`) for secure credential mounting via Docker secrets or volume files.
+  - Minimal node supervisor: bind gRPC SQL gateway engine and HTTP probe server (`/ready`, `/live`, `/healthz`).
+  - Graceful shutdown handling: synchronous `sqlite3_wal_checkpoint_v2(TRUNCATE)`, in-flight connection draining, and lease release within Docker's 10s grace window on `SIGTERM`/`SIGINT`.
+
+Deliverables:
+- Production `Dockerfile` and `deploy/docker/docker-compose.standalone.yml`.
+- `hasqlite run --mode standalone` or `hasqlite run --config standalone.toml`.
+- Standalone container smoke test in CI (`docker build` + boot container + execute SQL via gRPC + assert `/ready` 200 OK), feature-gated with `--features=docker-tests`.
+
 ### Phase 2 — Sync orchestration (weeks 4–6)
 
 `hasqlite-sync`:
@@ -246,19 +323,19 @@ Deliverables:
 - Integration tests: writer emits writes → replica converges within N syncs
 - `live_writes` parity test (fork pattern from rsync)
 
-### Phase 3 — Node runtime (weeks 6–9)
+### Phase 3 — HA cluster supervisor & local 3-node runtime (weeks 6–9)
 
-`hasqlite-node` + `hasqlite` binary:
+`hasqlite-node` multi-process cluster runtime:
 
-- Single process: controller tick loop + sync worker + optional gateway
+- Full HA cluster supervisor: background controller tick loop + sync worker task + dynamic gateway failover
 - CLI flags mirroring rsync `--ha-*` for migration (deprecation table in docs)
-- HTTP probes (`hasqlite-probes`) with Kubernetes semantics documented
-- Graceful shutdown: preStop sync, demote, drain gateway
+- HTTP probes (`hasqlite-probes`) with Kubernetes readiness vs liveness semantics documented
+- Graceful shutdown: preStop catchup sync, leader demote, drain gateway
 
 Deliverables:
 
 - Local 3-node simulation (three data dirs, shared lease file dir)
-- Docker image `hasqlite:<version>`
+- Multi-node Docker Compose test harness (`deploy/docker/docker-compose.cluster.yml`)
 
 ### Phase 4 — Kubernetes opinionated deploy (weeks 9–11)
 
@@ -314,9 +391,12 @@ Deliverables:
 | `grpc_replication.rs` | native replication transport | `grpc_replication.rs` |
 | `shutdown_sync.rs` | preStop catch-up | new |
 | `readonly_replica_reads.rs` | `--allow-replica-reads` | gateway flags |
+| `docker_standalone.rs` | Standalone single-node container boot, volume persistence, gRPC SQL CRUD, probe health | new (Phase 1b) |
 
-Run: `cargo test --workspace` (default). Heavy tests gated with
-`--features=k8s-tests` or env `HASQLITE_K8S_TESTS=1`.
+Run: `cargo test --workspace` (default). Heavy cluster tests gated with
+`--features=k8s-tests` or env `HASQLITE_K8S_TESTS=1`. Docker smoke tests gated with
+`--features=docker-tests` or env `HASQLITE_DOCKER_TESTS=1` so standard `cargo test` passes
+in container-less environments.
 
 ### 6.3 Fault injection (`tests/chaos/`, feature `chaos`)
 
@@ -391,9 +471,15 @@ dir = "/var/lib/hasqlite"
 
 [lease]
 source = "kubernetes" # or "file"
-# file.path = "/var/run/lease.txt"
-# kubernetes.lease_name = "hasqlite-writer"
-# kubernetes.namespace = "default"
+
+# If lease.source = "file":
+# [lease.file]
+# path = "/var/run/lease.txt"
+
+# If lease.source = "kubernetes":
+[lease.kubernetes]
+lease_name = "hasqlite-writer"
+namespace = "default"
 
 [freshness]
 path = "/var/run/freshness.txt"
@@ -411,6 +497,7 @@ transport_auth_token_env = "HASQLITE_GRPC_AUTH_TOKEN"
 [gateway]
 bind = "0.0.0.0:50051"
 auth_token_env = "HASQLITE_GRPC_AUTH_TOKEN"
+# auth_token_file = "/run/secrets/hasqlite_token"
 allow_replica_reads = false
 
 [probes]
@@ -418,6 +505,59 @@ http_bind = "0.0.0.0:8088"
 ```
 
 CLI: `hasqlite run --config cluster.toml` plus env overrides.
+
+### Standalone single-node profile (Docker / edge)
+
+For running a single standalone node in Docker without replication peers:
+
+```toml
+[node]
+id = "standalone-0"
+mode = "standalone" # Auto-promotes to genesis writer at generation g_prior + 1 (1 on first boot)
+
+[data]
+dir = "/var/lib/hasqlite"
+
+[lease]
+source = "file" # Standalone mode strictly requires file-backed lease
+
+[lease.file]
+# Standalone mode enforces this exact canonical path within data.dir to guarantee mutual exclusion
+path = "/var/lib/hasqlite/.hasqlite.lease"
+
+# Note: [freshness], [promotion], and [sync] sections are omitted in standalone mode
+
+[gateway]
+bind = "0.0.0.0:50051"
+auth_token_file = "/run/secrets/hasqlite_token" # Mutually exclusive with auth_token_env
+# auth_token_env = "HASQLITE_GRPC_AUTH_TOKEN"
+allow_replica_reads = false
+
+[probes]
+http_bind = "0.0.0.0:8088"
+```
+
+### Standalone Docker invocation
+
+> [!NOTE]
+> **Phase 1b Target**: The Docker invocation below illustrates the planned deployment workflow once the Phase 1b runtime and packaging land. (In the current Phase 0 repository, the binary outputs a bootstrap log and exits).
+>
+> All required configuration fields (`node.id`, `data.dir`, `lease.source`, `gateway.bind`, `probes.http_bind`) are supplied by mounting the standalone TOML configuration. In Phase 1b, the image entrypoint will also support synthesizing minimal standalone defaults if config mounts are omitted.
+>
+> **Plaintext Gateway & Network Security**: The gRPC SQL Gateway communicates in plaintext in v1 and does not provide built-in TLS termination. The host port mapping binds strictly to host loopback (`127.0.0.1:50051:50051`) to avoid publishing the unencrypted gateway on public interfaces. Any remote or multi-host access MUST traverse an external TLS termination reverse proxy or ingress sidecar (such as Envoy, Traefik, or Nginx).
+
+```bash
+docker run -d \
+  --name hasqlite \
+  -p 127.0.0.1:50051:50051 \
+  -p 8088:8088 \
+  -u 1000:1000 \
+  -v /path/to/standalone.toml:/etc/hasqlite/cluster.toml:ro \
+  -v hasqlite-data:/var/lib/hasqlite \
+  -v /path/to/token.txt:/run/secrets/hasqlite_token:ro \
+  hasqlite:${HASQLITE_VERSION:-0.1.0} \
+  run --config /etc/hasqlite/cluster.toml
+```
 
 ---
 
@@ -456,8 +596,9 @@ Alerts (recommended):
 |-----------|-------------|-------|
 | M0 | Workspace + PLAN | CI green on empty crates |
 | M1 | Controller parity | unit + proptest |
+| M1.5 (Fast-track) | Standalone Single-Node Docker | Multi-stage Dockerfile, standalone writer gateway, probes |
 | M2 | Sync worker | integration convergence |
-| M3 | Node binary + probes | 3-node local HA |
+| M3 | HA cluster runtime | 3-node local HA |
 | M4 | K8s deploy | manifest + k3d smoke |
 | M5 | 0.1.0 release | soak + security suite |
 

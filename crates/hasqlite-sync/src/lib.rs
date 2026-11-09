@@ -3,19 +3,32 @@
 /// Sync scheduler policy identifiers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncTrigger {
+    /// Scheduled periodic background replication.
     Periodic,
+    /// Pre-shutdown catch-up replication to minimize RPO.
     PreShutdown,
+    /// Post-promotion catch-up synchronization.
     PostPromoteCatchUp,
+    /// Triggered replication on observed writer lease transition.
     OnLeaseChange,
 }
 
 /// Sync execution errors encountered during scheduled or triggered replication.
 #[derive(thiserror::Error, Debug, PartialEq, Eq)]
 pub enum SyncError {
+    /// Remote origin endpoint is unreachable or refused connection.
     #[error("sync origin unreachable: {endpoint}")]
-    OriginUnreachable { endpoint: String },
+    OriginUnreachable {
+        /// The destination endpoint that failed to connect.
+        endpoint: String,
+    },
+    /// Replication RPC exceeded the allotted timeout.
     #[error("sync timed out after {timeout_secs}s")]
-    Timeout { timeout_secs: u64 },
+    Timeout {
+        /// Timeout duration in seconds.
+        timeout_secs: u64,
+    },
+    /// Authentication failed when connecting to the origin gRPC service.
     #[error("authentication failed with origin endpoint")]
     AuthFailed,
 }

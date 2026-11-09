@@ -6,9 +6,13 @@ use serde::{Deserialize, Serialize};
 /// Authoritative writer lease (mirrors rsqlite-rsync `LeaseRecord`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LeaseRecord {
+    /// Identifier of the current lease holder node, or `None` if unassigned.
     pub holder_node_id: Option<NodeId>,
+    /// Monotonically increasing lease epoch generation counter.
     pub generation: u64,
+    /// Wall-clock timestamp (Unix seconds) when the lease was acquired or renewed.
     pub renewed_at_secs: u64,
+    /// Lease time-to-live duration in seconds before expiry.
     pub ttl_secs: u64,
 }
 
@@ -27,9 +31,13 @@ impl LeaseRecord {
 /// Last successful replica sync metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FreshnessLedger {
+    /// Node identifier of the writer origin that produced the snapshot.
     pub source_node_id: NodeId,
+    /// Generation counter of the writer origin at sync time.
     pub source_generation: u64,
+    /// Wall-clock timestamp (Unix seconds) when the sync snapshot was taken.
     pub synced_at_secs: u64,
+    /// Node identifier of the destination replica bound to this ledger record.
     #[serde(default)]
     pub destination_node_id: Option<NodeId>,
 }
@@ -37,13 +45,28 @@ pub struct FreshnessLedger {
 /// Common errors encountered in lease evaluation and coordination.
 #[derive(thiserror::Error, Debug, PartialEq, Eq)]
 pub enum LeaseError {
+    /// Lease TTL expired without timely renewal.
     #[error("lease expired: renewed at {renewed_at_secs}s with TTL {ttl_secs}s")]
-    Expired { renewed_at_secs: u64, ttl_secs: u64 },
+    Expired {
+        /// Timestamp when the expired lease was renewed.
+        renewed_at_secs: u64,
+        /// Time-to-live in seconds.
+        ttl_secs: u64,
+    },
+    /// Compare-and-swap conflict when updating the lease generation.
     #[error("lease CAS conflict: expected generation {expected}, observed {observed}")]
-    CasConflict { expected: u64, observed: u64 },
+    CasConflict {
+        /// Expected lease generation.
+        expected: u64,
+        /// Observed lease generation in the backend.
+        observed: u64,
+    },
+    /// Action attempted by a node that does not hold the active lease.
     #[error("unauthorized holder: expected {expected}, held by {actual:?}")]
     UnauthorizedHolder {
+        /// The node identity expected to hold the lease.
         expected: NodeId,
+        /// The actual current lease holder.
         actual: Option<NodeId>,
     },
 }

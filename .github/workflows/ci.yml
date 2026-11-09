@@ -25,5 +25,9 @@ jobs:
         run: cargo fmt --all -- --check
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: docstring coverage & docs
+        run: cargo doc --no-deps --workspace
+        env:
+          RUSTDOCFLAGS: -D warnings -D missing_docs
       - name: test
         run: cargo test --workspace
