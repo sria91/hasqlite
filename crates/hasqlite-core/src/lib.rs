@@ -347,12 +347,12 @@ impl ClusterConfig {
                 "sync.interval_secs must be greater than 0".to_string(),
             ));
         }
-        if let Some(ref ep) = sync.origin_endpoint {
-            if !is_valid_sync_origin_endpoint(ep) {
-                return Err(HasqliteError::Validation(
-                    "sync.origin_endpoint must be a grpc:// or https:// endpoint with a valid host and non-zero port when specified".to_string(),
-                ));
-            }
+        if let Some(ref ep) = sync.origin_endpoint
+            && !is_valid_sync_origin_endpoint(ep)
+        {
+            return Err(HasqliteError::Validation(
+                "sync.origin_endpoint must be a grpc:// or https:// endpoint with a valid host and non-zero port when specified".to_string(),
+            ));
         }
         if sync.transport_auth_token_env.is_some() && sync.transport_auth_token_file.is_some() {
             return Err(HasqliteError::Validation(
