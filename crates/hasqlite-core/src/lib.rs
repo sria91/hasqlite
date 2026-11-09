@@ -75,6 +75,52 @@ fn is_empty_or_whitespace(path: &std::path::Path) -> bool {
     path.as_os_str().is_empty() || path.to_str().map(|s| s.trim().is_empty()).unwrap_or(false)
 }
 
+fn is_valid_sync_origin_endpoint(endpoint: &str) -> bool {
+    let Some((scheme, authority)) = endpoint.split_once("://") else {
+        return false;
+    };
+    if !matches!(scheme, "grpc" | "https")
+        || authority.is_empty()
+        || authority.contains(['/', '?', '#', '@'])
+    {
+        return false;
+    }
+
+    let (host, port, is_ipv6) = if let Some(bracketed_host) = authority.strip_prefix('[') {
+        let Some((host, suffix)) = bracketed_host.split_once(']') else {
+            return false;
+        };
+        let Some(port) = suffix.strip_prefix(':') else {
+            return false;
+        };
+        if host.parse::<std::net::Ipv6Addr>().is_err() {
+            return false;
+        }
+        (host, port, true)
+    } else {
+        let Some((host, port)) = authority.rsplit_once(':') else {
+            return false;
+        };
+        if host.is_empty() || host.contains(':') {
+            return false;
+        }
+        (host, port, false)
+    };
+
+    let valid_host = is_ipv6
+        || (host.len() <= 253
+            && host.split('.').all(|label| {
+                !label.is_empty()
+                    && label.len() <= 63
+                    && !label.starts_with('-')
+                    && !label.ends_with('-')
+                    && label
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            }));
+    valid_host && port.parse::<u16>().is_ok_and(|port| port != 0)
+}
+
 /// Supported coordination backend types for writer leases.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -302,11 +348,9 @@ impl ClusterConfig {
             ));
         }
         if let Some(ref ep) = sync.origin_endpoint {
-            let trimmed = ep.trim();
-            if trimmed.is_empty() || ep.contains(char::is_whitespace) {
+            if !is_valid_sync_origin_endpoint(ep) {
                 return Err(HasqliteError::Validation(
-                    "sync.origin_endpoint must not be empty or contain whitespace when specified"
-                        .to_string(),
+                    "sync.origin_endpoint must be a grpc:// or https:// endpoint with a valid host and non-zero port when specified".to_string(),
                 ));
             }
         }
@@ -411,7 +455,7 @@ pub struct PromotionSection {
 pub struct SyncSection {
     /// Interval in seconds between periodic background sync passes.
     pub interval_secs: u64,
-    /// Origin gRPC endpoint to pull replication pages from.
+    /// Origin endpoint to pull replication pages from (`grpc://host:port` or `https://host:port`).
     #[serde(default)]
     pub origin_endpoint: Option<String>,
     /// Environment variable containing the replication authentication token (mutually exclusive with `transport_auth_token_file`).
@@ -817,14 +861,14 @@ http_bind = "0.0.0.0:8088"
     fn validation_rejects_empty_strings_in_optional_fields() {
         assert_validation_err(
             |c| c.sync.as_mut().unwrap().origin_endpoint = Some("   ".to_string()),
-            "sync.origin_endpoint must not be empty or contain whitespace",
+            "sync.origin_endpoint must be a grpc:// or https:// endpoint",
         );
         assert_validation_err(
             |c| {
                 c.sync.as_mut().unwrap().origin_endpoint =
                     Some("grpc://writer endpoint:50051".to_string())
             },
-            "sync.origin_endpoint must not be empty or contain whitespace",
+            "sync.origin_endpoint must be a grpc:// or https:// endpoint",
         );
         assert_validation_err(
             |c| c.sync.as_mut().unwrap().transport_auth_token_env = Some("".to_string()),
@@ -849,6 +893,45 @@ http_bind = "0.0.0.0:8088"
             |c| c.lease.kubernetes.as_mut().unwrap().namespace = "".to_string(),
             "lease.kubernetes.namespace must not be empty",
         );
+    }
+
+    #[test]
+    fn sync_accepts_supported_origin_endpoint_formats() {
+        for endpoint in [
+            "grpc://writer:50051",
+            "https://writer:50443",
+            "grpc://127.0.0.1:50051",
+            "grpc://[::1]:50051",
+        ] {
+            let mut config = valid_test_config();
+            config.sync.as_mut().unwrap().origin_endpoint = Some(endpoint.to_string());
+            assert!(
+                config.validate().is_ok(),
+                "expected endpoint '{endpoint}' to be valid"
+            );
+        }
+    }
+
+    #[test]
+    fn sync_rejects_malformed_origin_endpoints() {
+        for endpoint in [
+            "",
+            "http://writer:50051",
+            "grpc://",
+            "grpc://writer",
+            "grpc://writer:abc",
+            "grpc://writer:0",
+            "grpc://writer:65536",
+            "grpc://bad_host:50051",
+            "grpc://user@writer:50051",
+            "grpc://writer:50051/path",
+            "grpc://[not-ipv6]:50051",
+        ] {
+            assert_validation_err(
+                |config| config.sync.as_mut().unwrap().origin_endpoint = Some(endpoint.to_string()),
+                "sync.origin_endpoint must be a grpc:// or https:// endpoint",
+            );
+        }
     }
 
     #[test]
