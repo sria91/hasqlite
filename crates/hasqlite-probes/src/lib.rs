@@ -1,8 +1,10 @@
 //! Probe endpoints: `/live`, `/healthz`, `/ready` (Phase 3).
 
-/// Probe path constants aligned with rsqlite-rsync HA HTTP server.
+/// Liveness probe endpoint path for basic process liveness checks.
 pub const PATH_LIVE: &str = "/live";
+/// Healthz probe endpoint path for rolling deployment traffic checks.
 pub const PATH_HEALTHZ: &str = "/healthz";
+/// Readiness probe endpoint path indicating active writer leadership.
 pub const PATH_READY: &str = "/ready";
 
 #[cfg(test)]

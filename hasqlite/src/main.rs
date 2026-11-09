@@ -1,3 +1,5 @@
+//! Entry point for the hasqlite node daemon CLI.
+
 use tracing_subscriber::EnvFilter;
 
 fn main() {

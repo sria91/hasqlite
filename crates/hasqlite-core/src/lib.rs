@@ -8,14 +8,17 @@ use std::path::PathBuf;
 pub struct NodeId(String);
 
 impl NodeId {
+    /// Creates a new `NodeId` from the provided string identifier.
     pub fn new(id: impl Into<String>) -> Self {
         Self(id.into())
     }
 
+    /// Returns the string slice of the `NodeId`.
     pub fn as_str(&self) -> &str {
         &self.0
     }
 
+    /// Consumes the `NodeId` and returns the inner `String`.
     pub fn into_inner(self) -> String {
         self.0
     }
@@ -64,31 +67,49 @@ pub enum NodeMode {
     Standalone,
 }
 
+/// Canonical file name for standalone advisory lease locks within the database volume.
+pub const STANDALONE_CANONICAL_LEASE_FILENAME: &str = ".hasqlite.lease";
+
 /// Supported coordination backend types for writer leases.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LeaseSourceType {
+    /// Kubernetes Lease API coordination.
     Kubernetes,
+    /// File-backed lease with advisory POSIX locking (`flock`).
     File,
 }
 
 /// Top-level cluster configuration (see `docs/PLAN.md` §7).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClusterConfig {
+    /// Identity and execution mode of the node.
     pub node: NodeSection,
+    /// Storage directory paths for SQLite databases and lockfiles.
     pub data: DataSection,
+    /// Authoritative writer lease coordination settings.
     pub lease: LeaseSection,
+    /// Freshness ledger metadata path and retention limits (required in clustered mode).
     #[serde(default)]
     pub freshness: Option<FreshnessSection>,
+    /// Promotion eligibility thresholds (required in clustered mode).
     #[serde(default)]
     pub promotion: Option<PromotionSection>,
+    /// Incremental sync schedule and origin connection parameters (required in clustered mode).
     #[serde(default)]
     pub sync: Option<SyncSection>,
+    /// Application gRPC SQL Gateway binding and authentication settings.
     pub gateway: GatewaySection,
+    /// HTTP health probe listener configuration.
     pub probes: ProbesSection,
 }
 
 impl ClusterConfig {
+    /// Returns the canonical standalone file lease path within the database data directory.
+    pub fn canonical_standalone_lease_path(&self) -> PathBuf {
+        self.data.dir.join(STANDALONE_CANONICAL_LEASE_FILENAME)
+    }
+
     /// Validates semantic correctness, required backend sections, positive intervals, path presence, and socket address formats.
     pub fn validate(&self) -> Result<(), HasqliteError> {
         if self.node.id.as_str().trim().is_empty() {
@@ -130,6 +151,19 @@ impl ClusterConfig {
                     return Err(HasqliteError::Validation(
                         "node.mode is 'standalone' but lease.source is not 'file' (standalone mode requires file-backed lease for flock mutual exclusion)".to_string(),
                     ));
+                }
+                let file = self.lease.file.as_ref().ok_or_else(|| {
+                    HasqliteError::Validation(
+                        "lease.source is 'file' but lease.file section is missing".to_string(),
+                    )
+                })?;
+                let canonical_lock = self.canonical_standalone_lease_path();
+                if file.path != canonical_lock {
+                    return Err(HasqliteError::Validation(format!(
+                        "standalone mode requires canonical lease lock path '{}', found '{}'",
+                        canonical_lock.display(),
+                        file.path.display()
+                    )));
                 }
                 if let Some(ref freshness) = self.freshness {
                     Self::validate_freshness(freshness)?;
@@ -262,61 +296,87 @@ impl ClusterConfig {
     }
 }
 
+/// Node identity and operating mode section.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeSection {
+    /// Unique identifier for this cluster or standalone node.
     pub id: NodeId,
+    /// Operating mode (clustered vs standalone).
     #[serde(default)]
     pub mode: NodeMode,
 }
 
+/// Data storage directories section.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DataSection {
+    /// Base directory for SQLite databases and volume lockfiles.
     pub dir: PathBuf,
 }
 
+/// Writer lease backend coordination section.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LeaseSection {
+    /// Coordination source type (`kubernetes` or `file`).
     pub source: LeaseSourceType,
+    /// Configuration for file-backed lease coordination.
     #[serde(default)]
     pub file: Option<FileLeaseSection>,
+    /// Configuration for Kubernetes Lease API coordination.
     #[serde(default)]
     pub kubernetes: Option<KubernetesLeaseSection>,
 }
 
+/// File-backed lease configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileLeaseSection {
+    /// Path to the lease lockfile.
     pub path: PathBuf,
 }
 
+/// Kubernetes Lease API configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KubernetesLeaseSection {
+    /// Name of the Kubernetes `Lease` resource.
     pub lease_name: String,
+    /// Kubernetes namespace where the `Lease` resource is created.
     pub namespace: String,
 }
 
+/// Replica freshness tracking configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FreshnessSection {
+    /// Path to the freshness ledger state file.
     pub path: PathBuf,
+    /// Maximum allowed staleness of the last sync in seconds.
     pub max_age_secs: u64,
 }
 
+/// Writer promotion criteria and thresholds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PromotionSection {
+    /// Minimum required source generation for replica promotion.
     pub min_source_generation: u64,
+    /// Maximum allowable future clock skew in seconds.
     pub max_future_skew_secs: u64,
 }
 
+/// Page-level incremental synchronization configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncSection {
+    /// Interval in seconds between periodic background sync passes.
     pub interval_secs: u64,
+    /// Origin gRPC endpoint to pull replication pages from.
     #[serde(default)]
     pub origin_endpoint: Option<String>,
+    /// Environment variable containing the replication authentication token.
     #[serde(default)]
     pub transport_auth_token_env: Option<String>,
 }
 
+/// SQL gateway listener and authentication configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GatewaySection {
+    /// Socket address (`IP:PORT`) on which the gRPC gateway listens.
     pub bind: String,
     /// Environment variable containing the bearer auth token (mutually exclusive with `auth_token_file`).
     #[serde(default)]
@@ -324,19 +384,25 @@ pub struct GatewaySection {
     /// File path containing the bearer auth token (mutually exclusive with `auth_token_env`).
     #[serde(default)]
     pub auth_token_file: Option<PathBuf>,
+    /// Whether to permit read-only SQL queries on replicas.
     #[serde(default)]
     pub allow_replica_reads: bool,
 }
 
+/// Health and readiness HTTP probes section.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProbesSection {
+    /// Socket address (`IP:PORT`) on which HTTP probes listen.
     pub http_bind: String,
 }
 
+/// Root error type for configuration parsing and semantic validation.
 #[derive(thiserror::Error, Debug, PartialEq, Eq)]
 pub enum HasqliteError {
+    /// Deserialization or syntax error in configuration.
     #[error("configuration error: {0}")]
     Config(String),
+    /// Semantic validation error in configuration constraints.
     #[error("validation error: {0}")]
     Validation(String),
 }
@@ -466,7 +532,7 @@ dir = "/var/lib/hasqlite"
 source = "file"
 
 [lease.file]
-path = "/var/lib/hasqlite/lease.txt"
+path = "/var/lib/hasqlite/.hasqlite.lease"
 
 [gateway]
 bind = "0.0.0.0:50051"
@@ -528,6 +594,23 @@ http_bind = "0.0.0.0:8088"
             err,
             HasqliteError::Validation(
                 "node.mode is 'standalone' but lease.source is not 'file' (standalone mode requires file-backed lease for flock mutual exclusion)".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn standalone_mode_rejects_non_canonical_lease_path() {
+        let mut config = valid_test_config();
+        config.node.mode = NodeMode::Standalone;
+        config.lease.source = LeaseSourceType::File;
+        config.lease.file = Some(FileLeaseSection {
+            path: PathBuf::from("/var/lib/hasqlite/other.lease"),
+        });
+        let err = config.validate().unwrap_err();
+        assert_eq!(
+            err,
+            HasqliteError::Validation(
+                "standalone mode requires canonical lease lock path '/var/lib/hasqlite/.hasqlite.lease', found '/var/lib/hasqlite/other.lease'".to_string()
             )
         );
     }

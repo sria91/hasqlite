@@ -170,23 +170,42 @@ is supported as an explicit first-class operational mode:
   - **Volume reuse**: When bootstrapping on an existing volume, the node reads the prior lease generation `g_lease`
     and database user metadata `g_db`, setting `g_prior = max(g_lease, g_db)`.
   - **Monotonic lease acquisition**: Standalone bootstrap writes an updated `LeaseRecord` with `generation = g_prior + 1`
-    (or `1` if `g_prior == 0`) under advisory POSIX file locking (`flock`), guaranteeing generation monotonicity
-    if the volume is subsequently migrated into an HA cluster.
-- **Mutual exclusion via POSIX file locking (`flock`) on shared volume**: The file lease path MUST reside on the shared
-  database volume (e.g. `/var/lib/hasqlite/lease.txt`). The file lease source enforces advisory POSIX file locking (`flock`/`fcntl`)
-  on that path. Because the lock targets the shared volume filesystem rather than a container-local path (such as `/var/run/`),
-  any concurrent container sharing the database volume contends for the exact same file inode and fails fast with `EWOULDBLOCK`,
-  preventing split-brain write corruption.
+    (or `1` if `g_prior == 0`) under advisory POSIX file locking (`flock`), guaranteeing generation monotonicity.
+    When migrating the volume into an HA cluster, a fenced migration procedure seeds the new authoritative Kubernetes
+    lease (e.g. lease metadata annotation/counter) with `g_prior` from the standalone file lease before any cluster CAS
+    acquisition begins. This preserves the generation invariant in the safety contract (§2) so switching coordination
+    backends cannot reset the generation or allow competing lease updates during transfer.
+- **Mutual exclusion via canonical lock identity on shared volume**: Standalone configurations enforce exactly one
+  canonical lock identity per database volume: `${data.dir}/.hasqlite.lease`. `ClusterConfig::validate()` strictly
+  rejects configurations specifying any other `lease.file.path`. Allowing arbitrary paths on the volume would risk two
+  containers configuring different file names (e.g. `lease.txt` vs `lock.file`), acquiring independent advisory locks on
+  different inodes, and causing split-brain write corruption against the same database. By enforcing the single canonical
+  path, every standalone container sharing the database volume contends for the exact same file inode via advisory POSIX
+  file locking (`flock`/`fcntl`), ensuring any concurrent instance immediately fails fast with `EWOULDBLOCK`.
 - **Zero-sync overhead**: Peer replication loops are dormant; write fence is active locally for writer generation `g`.
-- **Graceful shutdown on `SIGTERM`**: Handles container stop signals within Docker's default 10s grace window by
-  executing a synchronous passive WAL checkpoint (`sqlite3_wal_checkpoint_v2(TRUNCATE)`), draining in-flight gRPC
-  queries, and releasing the lease lock before exit to eliminate dirty recovery on restart.
+- **Graceful shutdown on `SIGTERM`**: Handles container stop signals within Docker's default 10s grace window through an
+  ordered shutdown sequence:
+  1. **Stop accepting requests**: Demote HTTP probe readiness (`/ready` returns 503) and reject incoming gRPC gateway calls
+     with `UNAVAILABLE`.
+  2. **Drain in-flight writes**: Drain active transactions and in-flight queries up to a bounded timeout (e.g., 5 seconds).
+  3. **WAL checkpoint truncate**: Execute a blocking SQLite WAL checkpoint via `sqlite3_wal_checkpoint_v2(..., SQLITE_CHECKPOINT_TRUNCATE, ...)`
+     to flush all committed database pages from the WAL into the primary database file and truncate the WAL file to zero bytes.
+  4. **Deadline & fallback handling**: If `SQLITE_CHECKPOINT_TRUNCATE` cannot complete before the shutdown deadline (e.g., blocked
+     by lingering reader locks or slow I/O, returning `SQLITE_BUSY`), the node logs a warning, falls back to a non-blocking passive
+     checkpoint (`SQLITE_CHECKPOINT_PASSIVE`) without truncating, and cleanly proceeds with shutdown. SQLite WAL crash recovery will
+     safely replay any remaining committed WAL frames on the next startup.
+  5. **Release lease**: Release the advisory POSIX file lock (`flock`) and exit cleanly with status code 0.
 - **Docker container runtime**: Designed to run inside standard Docker containers with a persistent
   volume mount at `/var/lib/hasqlite`, running under non-root UID/GID (`1000:1000`), exposing:
-  - gRPC SQL Gateway (`:50051`) for read/write queries.
+  - gRPC SQL Gateway (`127.0.0.1:50051`) for read/write queries.
   - HTTP Probes (`:8088` `/ready`, `/live`, `/healthz`).
-- **Seamless cluster upgrade path**: A standalone node's database and volume are 100% compatible
-  with upgrading into an HA cluster later by attaching replicas and switching coordination to K8s or shared lease.
+- **Seamless cluster upgrade path**: Upgrading from a standalone deployment to an HA cluster requires cleanly stopping
+  and fencing the standalone writer before creating or acquiring writer authority under the new coordination backend
+  (e.g., Kubernetes Lease API). Because the standalone file lock and Kubernetes Lease API are independent coordination
+  mechanisms, running both concurrently without prior fencing would create a dual-writer split-brain hazard. The migration
+  procedure requires: (1) terminate the standalone container and verify the POSIX lock is released, (2) inspect the standalone
+  lease file to seed the initial generation `g_k8s = g_prior` on the Kubernetes Lease object, and (3) launch the HA cluster
+  nodes under Kubernetes lease coordination where the first promote CAS will increment to `g_k8s + 1`.
 
 ---
 
@@ -503,8 +522,8 @@ dir = "/var/lib/hasqlite"
 source = "file" # Standalone mode strictly requires file-backed lease
 
 [lease.file]
-# MUST reside on the shared database volume (/var/lib/hasqlite) so flock protects all containers
-path = "/var/lib/hasqlite/lease.txt"
+# Standalone mode enforces this exact canonical path within data.dir to guarantee mutual exclusion
+path = "/var/lib/hasqlite/.hasqlite.lease"
 
 # Note: [freshness], [promotion], and [sync] sections are omitted in standalone mode
 
@@ -524,11 +543,13 @@ http_bind = "0.0.0.0:8088"
 > **Phase 1b Target**: The Docker invocation below illustrates the planned deployment workflow once the Phase 1b runtime and packaging land. (In the current Phase 0 repository, the binary outputs a bootstrap log and exits).
 >
 > All required configuration fields (`node.id`, `data.dir`, `lease.source`, `gateway.bind`, `probes.http_bind`) are supplied by mounting the standalone TOML configuration. In Phase 1b, the image entrypoint will also support synthesizing minimal standalone defaults if config mounts are omitted.
+>
+> **Plaintext Gateway & Network Security**: The gRPC SQL Gateway communicates in plaintext in v1 and does not provide built-in TLS termination. The host port mapping binds strictly to host loopback (`127.0.0.1:50051:50051`) to avoid publishing the unencrypted gateway on public interfaces. Any remote or multi-host access MUST traverse an external TLS termination reverse proxy or ingress sidecar (such as Envoy, Traefik, or Nginx).
 
 ```bash
 docker run -d \
   --name hasqlite \
-  -p 50051:50051 \
+  -p 127.0.0.1:50051:50051 \
   -p 8088:8088 \
   -u 1000:1000 \
   -v /path/to/standalone.toml:/etc/hasqlite/cluster.toml:ro \
