@@ -726,10 +726,12 @@ name = "hasqlite-sync"
 version = "0.0.0"
 dependencies = [
  "hasqlite-core",
+ "libsqlite3-sys",
  "rsqlite-rsync",
  "tempfile",
  "thiserror",
  "tokio",
+ "tonic",
 ]
 
 [[package]]
@@ -1421,7 +1423,7 @@ dependencies = [
 [[package]]
 name = "rsqlite-rsync"
 version = "0.4.0"
-source = "git+https://github.com/sria91/rsqlite-rsync?branch=master#1ef8d2f26228c9c3410cf9f60679cfce4a485204"
+source = "git+https://github.com/sria91/rsqlite-rsync?rev=1ef8d2f26228c9c3410cf9f60679cfce4a485204#1ef8d2f26228c9c3410cf9f60679cfce4a485204"
 dependencies = [
  "async-trait",
  "bincode",
@@ -1451,7 +1453,7 @@ dependencies = [
 [[package]]
 name = "rsqlite-rsync-client"
 version = "0.4.0"
-source = "git+https://github.com/sria91/rsqlite-rsync?branch=master#1ef8d2f26228c9c3410cf9f60679cfce4a485204"
+source = "git+https://github.com/sria91/rsqlite-rsync?rev=1ef8d2f26228c9c3410cf9f60679cfce4a485204#1ef8d2f26228c9c3410cf9f60679cfce4a485204"
 dependencies = [
  "async-trait",
  "rsqlite-rsync-proto",
@@ -1463,7 +1465,7 @@ dependencies = [
 [[package]]
 name = "rsqlite-rsync-proto"
 version = "0.4.0"
-source = "git+https://github.com/sria91/rsqlite-rsync?branch=master#1ef8d2f26228c9c3410cf9f60679cfce4a485204"
+source = "git+https://github.com/sria91/rsqlite-rsync?rev=1ef8d2f26228c9c3410cf9f60679cfce4a485204#1ef8d2f26228c9c3410cf9f60679cfce4a485204"
 dependencies = [
  "prost",
  "protoc-bin-vendored",

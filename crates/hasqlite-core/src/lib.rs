@@ -285,11 +285,21 @@ impl ClusterConfig {
             ));
         }
         Self::validate_lease(&self.lease)?;
-        if self.gateway.bind.parse::<std::net::SocketAddr>().is_err() {
-            return Err(HasqliteError::Validation(format!(
-                "gateway.bind '{}' is not a valid socket address (expected IP:PORT)",
-                self.gateway.bind
-            )));
+        let gateway_bind = self
+            .gateway
+            .bind
+            .parse::<std::net::SocketAddr>()
+            .map_err(|_| {
+                HasqliteError::Validation(format!(
+                    "gateway.bind '{}' is not a valid socket address (expected IP:PORT)",
+                    self.gateway.bind
+                ))
+            })?;
+        if self.gateway.allow_unauthenticated && !gateway_bind.ip().is_loopback() {
+            return Err(HasqliteError::Validation(
+                "gateway.allow_unauthenticated requires gateway.bind to use a loopback address"
+                    .to_string(),
+            ));
         }
         if self
             .probes
@@ -434,7 +444,7 @@ pub struct PromotionSection {
 pub struct SyncSection {
     /// Interval in seconds between periodic background sync passes.
     pub interval_secs: u64,
-    /// Origin endpoint to pull replication pages from (`grpc://host:port` or `https://host:port`).
+    /// Origin endpoint to pull replication pages from (`https://host:port`, or `grpc://host:port` for loopback only).
     #[serde(default)]
     pub origin_endpoint: Option<String>,
     /// Environment variable containing the replication authentication token (mutually exclusive with `transport_auth_token_file`).
@@ -497,7 +507,7 @@ pub struct GatewaySection {
     /// Whether to permit read-only SQL queries on replicas.
     #[serde(default)]
     pub allow_replica_reads: bool,
-    /// Whether to permit unauthenticated gateway access (insecure; disabled by default).
+    /// Whether to permit unauthenticated gateway access (insecure; loopback binds only, disabled by default).
     #[serde(default)]
     pub allow_unauthenticated: bool,
 }
@@ -782,6 +792,29 @@ http_bind = "0.0.0.0:8088"
             },
             "gateway requires authentication credentials",
         );
+    }
+
+    #[test]
+    fn gateway_rejects_unauthenticated_public_bind() {
+        assert_validation_err(
+            |c| {
+                c.gateway.auth_token_env = None;
+                c.gateway.auth_token_file = None;
+                c.gateway.allow_unauthenticated = true;
+                c.gateway.bind = "0.0.0.0:50051".to_string();
+            },
+            "gateway.allow_unauthenticated requires gateway.bind to use a loopback address",
+        );
+    }
+
+    #[test]
+    fn gateway_allows_unauthenticated_loopback_bind() {
+        let mut config = valid_test_config();
+        config.gateway.auth_token_env = None;
+        config.gateway.auth_token_file = None;
+        config.gateway.allow_unauthenticated = true;
+        config.gateway.bind = "127.0.0.1:50051".to_string();
+        assert!(config.validate().is_ok());
     }
 
     #[test]

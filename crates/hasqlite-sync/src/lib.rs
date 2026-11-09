@@ -17,7 +17,7 @@ pub enum SyncTrigger {
 }
 
 /// Sync execution errors encountered during scheduled or triggered replication.
-#[derive(thiserror::Error, Debug, PartialEq, Eq)]
+#[derive(thiserror::Error, Debug)]
 pub enum SyncError {
     /// Remote origin endpoint is unreachable or refused connection.
     #[error("sync origin unreachable: {endpoint}")]
@@ -56,7 +56,7 @@ pub enum SyncError {
     EmptyAuthToken,
     /// The underlying replication pull failed.
     #[error("replication pull failed: {0}")]
-    Replication(String),
+    Replication(#[source] rsqlite_rsync::error::SyncError),
 }
 
 /// Pulls a database replica from the configured origin.
@@ -77,7 +77,7 @@ pub async fn pull_replica(
 
     rsqlite_rsync::grpc_pull_sync(replica_path, endpoint, database, auth_token.as_deref())
         .await
-        .map_err(|error| SyncError::Replication(error.to_string()))
+        .map_err(SyncError::Replication)
 }
 
 async fn load_sync_auth_token(sync: &SyncSection) -> Result<Option<String>, SyncError> {
@@ -167,10 +167,10 @@ mod tests {
         let mut sync = sync_config();
         sync.transport_auth_token_file = Some(token_path);
 
-        assert_eq!(
+        assert!(matches!(
             load_sync_auth_token(&sync).await.unwrap_err(),
             SyncError::EmptyAuthToken
-        );
+        ));
     }
 
     #[test]
