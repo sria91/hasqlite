@@ -19,7 +19,7 @@ pub enum SyncError {
     /// Remote origin endpoint is unreachable or refused connection.
     #[error("sync origin unreachable: {endpoint}")]
     OriginUnreachable {
-        /// The destination endpoint that failed to connect.
+        /// The origin endpoint that failed to connect.
         endpoint: String,
     },
     /// Replication RPC exceeded the allotted timeout.
