@@ -197,9 +197,31 @@ impl ClusterConfig {
                 "gateway.auth_token_file must not be empty when specified".to_string(),
             ));
         }
-        match self.lease.source {
+        Self::validate_lease(&self.lease)?;
+        if self.gateway.bind.parse::<std::net::SocketAddr>().is_err() {
+            return Err(HasqliteError::Validation(format!(
+                "gateway.bind '{}' is not a valid socket address (expected IP:PORT)",
+                self.gateway.bind
+            )));
+        }
+        if self
+            .probes
+            .http_bind
+            .parse::<std::net::SocketAddr>()
+            .is_err()
+        {
+            return Err(HasqliteError::Validation(format!(
+                "probes.http_bind '{}' is not a valid socket address (expected IP:PORT)",
+                self.probes.http_bind
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_lease(lease: &LeaseSection) -> Result<(), HasqliteError> {
+        match lease.source {
             LeaseSourceType::Kubernetes => {
-                let k8s = self.lease.kubernetes.as_ref().ok_or_else(|| {
+                let k8s = lease.kubernetes.as_ref().ok_or_else(|| {
                     HasqliteError::Validation(
                         "lease.source is 'kubernetes' but lease.kubernetes section is missing"
                             .to_string(),
@@ -217,7 +239,7 @@ impl ClusterConfig {
                 }
             }
             LeaseSourceType::File => {
-                let file = self.lease.file.as_ref().ok_or_else(|| {
+                let file = lease.file.as_ref().ok_or_else(|| {
                     HasqliteError::Validation(
                         "lease.source is 'file' but lease.file section is missing".to_string(),
                     )
@@ -228,23 +250,6 @@ impl ClusterConfig {
                     ));
                 }
             }
-        }
-        if self.gateway.bind.parse::<std::net::SocketAddr>().is_err() {
-            return Err(HasqliteError::Validation(format!(
-                "gateway.bind '{}' is not a valid socket address (expected IP:PORT)",
-                self.gateway.bind
-            )));
-        }
-        if self
-            .probes
-            .http_bind
-            .parse::<std::net::SocketAddr>()
-            .is_err()
-        {
-            return Err(HasqliteError::Validation(format!(
-                "probes.http_bind '{}' is not a valid socket address (expected IP:PORT)",
-                self.probes.http_bind
-            )));
         }
         Ok(())
     }
@@ -776,6 +781,22 @@ http_bind = "0.0.0.0:8088"
             HasqliteError::Validation(
                 "gateway.auth_token_file must not be empty when specified".to_string()
             )
+        );
+
+        let mut config5 = valid_test_config();
+        config5.lease.kubernetes.as_mut().unwrap().lease_name = "   ".to_string();
+        let err5 = config5.validate().unwrap_err();
+        assert_eq!(
+            err5,
+            HasqliteError::Validation("lease.kubernetes.lease_name must not be empty".to_string())
+        );
+
+        let mut config6 = valid_test_config();
+        config6.lease.kubernetes.as_mut().unwrap().namespace = "".to_string();
+        let err6 = config6.validate().unwrap_err();
+        assert_eq!(
+            err6,
+            HasqliteError::Validation("lease.kubernetes.namespace must not be empty".to_string())
         );
     }
 

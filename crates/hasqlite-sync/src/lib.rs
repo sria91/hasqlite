@@ -1,7 +1,7 @@
 //! Sync orchestration policies (Phase 2).
 
 /// Sync scheduler policy identifiers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SyncTrigger {
     /// Scheduled periodic background replication.
     Periodic,
@@ -19,7 +19,7 @@ pub enum SyncError {
     /// Remote origin endpoint is unreachable or refused connection.
     #[error("sync origin unreachable: {endpoint}")]
     OriginUnreachable {
-        /// The destination endpoint that failed to connect.
+        /// The origin endpoint that failed to connect.
         endpoint: String,
     },
     /// Replication RPC exceeded the allotted timeout.
@@ -38,19 +38,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sync_triggers_equality() {
+    fn sync_triggers_equality_and_hashing() {
+        use std::collections::HashSet;
+
         assert_eq!(SyncTrigger::Periodic, SyncTrigger::Periodic);
         assert_ne!(SyncTrigger::PreShutdown, SyncTrigger::Periodic);
+
+        let mut triggers = HashSet::new();
+        triggers.insert(SyncTrigger::Periodic);
+        triggers.insert(SyncTrigger::PreShutdown);
+        triggers.insert(SyncTrigger::PostPromoteCatchUp);
+        triggers.insert(SyncTrigger::OnLeaseChange);
+        assert_eq!(triggers.len(), 4);
+        assert!(triggers.contains(&SyncTrigger::Periodic));
     }
 
     #[test]
     fn sync_error_display() {
-        let err = SyncError::OriginUnreachable {
+        let err1 = SyncError::OriginUnreachable {
             endpoint: "grpc://10.0.0.1:50051".to_string(),
         };
         assert_eq!(
-            err.to_string(),
+            err1.to_string(),
             "sync origin unreachable: grpc://10.0.0.1:50051"
+        );
+
+        let err2 = SyncError::Timeout { timeout_secs: 15 };
+        assert_eq!(err2.to_string(), "sync timed out after 15s");
+
+        let err3 = SyncError::AuthFailed;
+        assert_eq!(
+            err3.to_string(),
+            "authentication failed with origin endpoint"
         );
     }
 }
