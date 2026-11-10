@@ -6,66 +6,128 @@ protocol.
 
 ## Ownership
 
-1. **One active writer** per cluster/database scope at any instant.
+1. **One node accepts commits** per cluster at any instant, across all
+   generations, under the timing assumption in rule 5.
 2. **Lease is authoritative** for writer identity: `holder_node_id`, `generation`,
-   `renewed_at_secs`, `ttl_secs`.
-3. **Generation increases** on every successful writer transfer (never reuse).
+   `renewed_at_secs`, `ttl_secs`, an opaque `version` that changes on every
+   lease write, and the last **activated writer epoch** (`writer`: node ID,
+   generation, last renewal). Acquiring the lease does not change `writer`; only
+   activation does (rule 10).
+3. **Generation increases** on every successful acquisition (never reused).
+   Renewals and releases never change it.
+
+## Lease timing and write fencing
+
+4. **Candidates never compare wall clocks.** A candidate treats the lease as
+   expired only when it is released (no holder) or its `version` has stayed
+   unchanged for `lease.ttl_secs` measured on the candidate's local monotonic
+   clock. `renewed_at_secs` is informational.
+5. **Writers fence themselves.** A writer accepts a commit only before
+   `send time of its last successful renewal + lease.renew_deadline_secs`, on its
+   local monotonic clock. `enforce_write_fence` runs inside the write transaction
+   immediately before `COMMIT`. At the deadline the writer interrupts in-flight
+   statements (`sqlite3_interrupt`), sets `/ready` to 503 and demotes.
+   `lease.ttl_secs − lease.renew_deadline_secs` (at least 2 seconds) is the
+   fencing margin. Each node writes its own disk and no storage layer rejects
+   stale generations, so a writer stalled *inside* a commit for longer than the
+   margin can still commit after a peer promotes. This is an explicit
+   assumption, not a guarantee.
+6. **Every lease write is a compare-and-swap on `version`:**
+   - *Acquire* succeeds only if the version is unchanged since the candidate's
+     observation. The store sets `holder = self` and
+     `generation = observed + 1`; callers never supply the generation.
+   - *Renew*, *activate* and *release* succeed only if the version is unchanged
+     since the writer's last successful lease write, `holder == self`, and the
+     generation is unchanged.
+   - A conflict on renew, activate or release means immediate demotion. A
+     writer never overwrites a newer holder.
 
 ## Replication
 
-4. **Writer is sync origin**; replicas are **exclusive** targets (no concurrent
-   writers to replica files).
-5. **Origin may be live** (reads/writes); sync produces a consistent snapshot as
-   of sync start.
-6. **Freshness ledger** records last successful sync: `source_node_id`,
-   `source_generation`, `synced_at_secs`.
-   - **Replica binding**: Freshness must be bound to the replica that received
-     the snapshot by requiring replica-specific ledger storage (e.g. replica-private
-     state path) or recording the destination identity and validating it before
-     allowing promotion.
-   - **Snapshot start timestamp**: `synced_at_secs` defines freshness by the
-     snapshot start time (when origin snapshot began), not sync completion time.
-   - **Publication**: The timestamp and ledger record are published only after
-     the sync succeeds.
+7. **Writer is sync origin**; replicas are **exclusive** targets (no concurrent
+   writers to replica files). The sync engine never writes to a node whose role
+   is `Writer`.
+8. **Origin may be live** (reads/writes); sync produces a consistent snapshot as
+   of sync start. The origin stamps each snapshot with its node ID, its lease
+   generation and the snapshot start time (origin clock). It refuses to serve
+   unless it is the current lease holder and activated writer. Replicas reject a
+   snapshot whose stamped identity does not match the lease's `writer` epoch.
+9. **Freshness ledger** records the last successful sync: `source_node_id`,
+   `source_generation`, `synced_at_secs`, `destination_node_id`.
+   - **Replica binding**: `destination_node_id` is mandatory and must equal the
+     promoting node.
+   - **Snapshot start timestamp**: `synced_at_secs` is the origin-stamped
+     snapshot start time, not the sync completion time.
+   - **Crash-safe publication**: the ledger lives on the same filesystem as the
+     database. Before writing the first page, the replica invalidates the ledger
+     and fsyncs the invalidation. It publishes a new record only after the sync
+     succeeds and the database file and its directory are fsynced. Publication
+     uses temp file + rename + directory fsync. An interrupted sync therefore
+     always leaves the node unpromotable.
 
 ## Promotion
 
-7. A node may **promote to writer** only if:
-   - It successfully executes an atomic lease acquisition / compare-and-swap (CAS)
-     operation incrementing the generation counter (`new_gen = expected_gen + 1`)
-     with generation fencing, **and**
-   - `validate_promotion` passes: freshness bound to the replica, freshness age ≤
-     `max_freshness_age_secs`, generation ≥ `min_source_generation`, verified
-     `source_node_id`, and clock skew within bounds.
-   - If the atomic lease acquisition fails (e.g. concurrent claim lost to a peer),
-     promotion is denied and the node remains a replica (fail closed).
-8. **First-writer bootstrap**: for clusters with no writer and no successful sync
-   ledger, an explicit genesis procedure or verified seed-snapshot procedure
-   establishes the initial generation and writer. Normal failover strictly keeps
-   `validate_promotion` and its freshness, source identity, replica binding, and
-   fencing requirements intact.
-9. **Failed promotion** must not open writable SQL paths (fail closed).
+10. A node may **promote to writer** only if:
+    - `validate_promotion` passes against the lease it observed. The ledger is
+      bound to this replica. Its source node and generation equal the lease's
+      `writer` epoch. Its lag behind that writer's last renewal
+      (`writer.renewed_at_secs − synced_at_secs`) is at most
+      `freshness.max_lag_secs`; both timestamps come from the writer's clock.
+      `synced_at_secs` is at most `max_future_skew_secs` ahead of local time.
+    - It then wins the acquisition CAS (rule 6). Scheduled sync is paused while
+      it campaigns, so the validated inputs cannot change and no second
+      freshness check is needed.
+    - Before opening a writable handle, it *activates*: a CAS that records
+      `writer = (self, generation, now)`. If activation fails, or the renewal
+      deadline has passed, it stays a replica.
+    - A lost acquisition or activation CAS denies promotion (fail closed). An
+      acquired but never-activated generation leaves the previous `writer` epoch
+      in place, so peers synced from that writer remain promotable.
+11. **First-writer bootstrap**: for clusters with no activated writer, an
+    explicit genesis procedure or verified seed-snapshot procedure establishes
+    the initial generation and `writer` epoch. Normal failover always applies
+    the full rule 10.
+12. **Failed promotion** must not open writable SQL paths (fail closed).
+13. **Post-promotion catch-up** may only run before the writable handle opens,
+    and only from a peer whose ledger has the same `writer` epoch and a newer
+    `synced_at_secs`.
 
 ## Demotion
 
-10. On lease loss or TTL expiry while writer: **immediate demotion**; stop
-    accepting writes; gateway returns `NOT_LEADER` with redirect hint.
-11. Former writer **rejoins as replica** and must resync before eligible to
-    promote again.
+14. On a renewal conflict, missed renewal deadline or lease loss while writer:
+    **immediate demotion**. The node stops accepting writes, interrupts in-flight
+    statements, and the gateway returns `NOT_LEADER` with a redirect hint.
+15. A former writer **rejoins as replica** and must resync before it is eligible
+    to promote again. Before its first resync it preserves its database as
+    `*.diverged-g<generation>`, because commits it accepted after the last
+    replica sync are not on the new writer.
+16. **Planned switchover**: a stopping writer stops accepting writes, waits a
+    bounded time for replicas to complete a snapshot started after that point,
+    then *releases* the lease (holder cleared, generation unchanged, `writer`
+    renewal time updated) so a replica can acquire without waiting a TTL.
 
-## Fencing
+## Fencing and access control
 
-12. `enforce_write_fence` gates all mutating SQL on the writer path.
-13. **Authentication** (bearer token) is independent of fencing; both are required
-    in production configurations.
+17. `enforce_write_fence` gates all mutating SQL on the writer path. Statements
+    are classified with `sqlite3_stmt_readonly()` after preparation, never by
+    inspecting SQL text. Replica connections are opened read-only with
+    `PRAGMA query_only = 1`. An authorizer denies `ATTACH`, `DETACH`,
+    `VACUUM INTO` and non-allowlisted pragmas. `SQLITE_DBCONFIG_DEFENSIVE` is
+    on, extension loading is off, and `trusted_schema` is off.
+18. **Authentication** (bearer token) is independent of fencing; both are
+    required in production configurations. SQL gateway and replication use
+    distinct credentials, compared in constant time. Unauthenticated gateways
+    are permitted only in standalone mode on a loopback bind.
 
 ## Kubernetes
 
-14. **Rollout probes**: use `/healthz` for pod readiness during rolling updates;
-    write traffic must be routed only to the current writer, using a writer-aware
-    mechanism such as a controller-managed EndpointSlice or a proxy that checks
-    `/ready`. Clarify that `/healthz` readiness alone does not provide writer-only
-    routing.
-15. **preStop**: mandatory sync attempt before SIGTERM to tighten RPO.
+19. **Rollout probes**: use `/healthz` for pod readiness during rolling updates.
+    Write traffic is routed only to the current writer: the node labels its own
+    pod `hasqlite.io/role=writer` on activation and removes the label before
+    demotion completes, and the writer Service selects that label. `/healthz`
+    readiness alone does not provide writer-only routing. `/live` never touches
+    SQLite or the lease store.
+20. **preStop**: replicas attempt a final sync; the writer performs the planned
+    switchover in rule 16 before SIGTERM.
 
 Violations of this contract are **severity-0** bugs.

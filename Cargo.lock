@@ -698,6 +698,7 @@ dependencies = [
  "hasqlite-core",
  "serde",
  "thiserror",
+ "toml",
 ]
 
 [[package]]
@@ -1424,7 +1425,7 @@ dependencies = [
 [[package]]
 name = "rsqlite-rsync"
 version = "0.5.0"
-source = "git+https://github.com/sria91/rsqlite-rsync?tag=v0.5.0#6a836c9abcf418025c29762728e7f9e5af909433"
+source = "git+https://github.com/sria91/rsqlite-rsync?rev=6a836c9abcf418025c29762728e7f9e5af909433#6a836c9abcf418025c29762728e7f9e5af909433"
 dependencies = [
  "async-trait",
  "bincode",
@@ -1454,7 +1455,7 @@ dependencies = [
 [[package]]
 name = "rsqlite-rsync-client"
 version = "0.5.0"
-source = "git+https://github.com/sria91/rsqlite-rsync?tag=v0.5.0#6a836c9abcf418025c29762728e7f9e5af909433"
+source = "git+https://github.com/sria91/rsqlite-rsync?rev=6a836c9abcf418025c29762728e7f9e5af909433#6a836c9abcf418025c29762728e7f9e5af909433"
 dependencies = [
  "async-trait",
  "rsqlite-rsync-proto",
@@ -1466,7 +1467,7 @@ dependencies = [
 [[package]]
 name = "rsqlite-rsync-proto"
 version = "0.5.0"
-source = "git+https://github.com/sria91/rsqlite-rsync?tag=v0.5.0#6a836c9abcf418025c29762728e7f9e5af909433"
+source = "git+https://github.com/sria91/rsqlite-rsync?rev=6a836c9abcf418025c29762728e7f9e5af909433#6a836c9abcf418025c29762728e7f9e5af909433"
 dependencies = [
  "prost",
  "protoc-bin-vendored",

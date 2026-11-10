@@ -91,8 +91,13 @@ fn map_pull_error(error: rsqlite_rsync::error::SyncError) -> SyncError {
 
 /// Pulls a database replica from the configured origin.
 ///
-/// The configured environment or file credential is loaded and passed to the
-/// replication client, which attaches it to the authenticated gRPC request.
+/// The configured environment or file credential is re-read on every call, so a rotated token takes
+/// effect on the next pull, and is passed to the replication client, which attaches it to the
+/// authenticated gRPC request.
+///
+/// The transitional backend writes pages into `replica_path` in place, so an interrupted pull leaves a
+/// torn file. Callers must invalidate the freshness ledger before calling and publish a new one only
+/// after this returns `Ok`; on success the replica and its directory entry have been fsynced.
 pub async fn pull_replica(
     sync: &SyncSection,
     replica_path: &Path,
@@ -107,7 +112,38 @@ pub async fn pull_replica(
 
     rsqlite_rsync::grpc_pull_sync(replica_path, endpoint, database, auth_token.as_deref())
         .await
-        .map_err(map_pull_error)
+        .map_err(map_pull_error)?;
+    fsync_replica(replica_path).await
+}
+
+/// Flushes the replica file and, on Unix, its parent directory so a published ledger never outlives the data.
+async fn fsync_replica(replica_path: &Path) -> Result<(), SyncError> {
+    let fsync_error = |path: &Path, error: std::io::Error| {
+        SyncError::Replication(ReplicationError::Operation(format!(
+            "failed to fsync '{}': {error}",
+            path.display()
+        )))
+    };
+    tokio::fs::File::open(replica_path)
+        .await
+        .map_err(|error| fsync_error(replica_path, error))?
+        .sync_all()
+        .await
+        .map_err(|error| fsync_error(replica_path, error))?;
+
+    #[cfg(unix)]
+    if let Some(parent) = replica_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        tokio::fs::File::open(parent)
+            .await
+            .map_err(|error| fsync_error(parent, error))?
+            .sync_all()
+            .await
+            .map_err(|error| fsync_error(parent, error))?;
+    }
+    Ok(())
 }
 
 async fn load_sync_auth_token(sync: &SyncSection) -> Result<Option<String>, SyncError> {

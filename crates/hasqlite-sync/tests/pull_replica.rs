@@ -165,6 +165,37 @@ async fn pull_replica_reports_rejected_token_as_auth_failure() {
 }
 
 #[tokio::test]
+async fn pull_replica_uses_rotated_token_file_without_restart() {
+    let server = TestServer::start().await;
+    let database = "source.db";
+    seed_database(&server.database_path(database));
+
+    let directory = tempfile::tempdir().expect("create replica directory");
+    let token_file = directory.path().join("sync-token");
+    fs::write(&token_file, "stale-token").expect("write stale token");
+    let replica_path = directory.path().join("replica.db");
+    let sync = sync_config(server.endpoint(), token_file.clone());
+
+    let error = pull_replica(&sync, &replica_path, database)
+        .await
+        .expect_err("stale token should fail authentication");
+    assert!(
+        matches!(error, SyncError::AuthFailed { .. }),
+        "expected AuthFailed, got {error:?}"
+    );
+
+    fs::write(&token_file, TEST_TOKEN).expect("rotate token");
+    pull_replica(&sync, &replica_path, database)
+        .await
+        .expect("pull replica with rotated token");
+    assert_eq!(
+        fs::read(&replica_path).expect("read replica"),
+        fs::read(server.database_path(database)).expect("read source database"),
+    );
+    server.stop().await;
+}
+
+#[tokio::test]
 async fn pull_replica_rejects_origin_without_credential() {
     let sync = SyncSection {
         interval_secs: 1,

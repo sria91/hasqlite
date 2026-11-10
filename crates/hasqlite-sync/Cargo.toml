@@ -10,7 +10,8 @@ repository.workspace = true
 hasqlite-core = { path = "../hasqlite-core" }
 # Transitional implementation dependency; remove after the native backend and
 # dependency-free replication tests satisfy the cutover criteria in docs/PLAN.md.
-rsqlite-rsync = { git = "https://github.com/sria91/rsqlite-rsync", tag = "v0.5.0" }
+# Pinned by commit (v0.5.0) because tags can be moved.
+rsqlite-rsync = { git = "https://github.com/sria91/rsqlite-rsync", rev = "6a836c9abcf418025c29762728e7f9e5af909433" }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs"] }
 
