@@ -1,16 +1,17 @@
 use std::fs;
-use std::net::{SocketAddr, TcpListener};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 
 use hasqlite_core::SyncSection;
-use hasqlite_sync::{ReplicationError, SyncError, pull_replica};
+use hasqlite_sync::{SyncError, pull_replica};
 use libsqlite3_sys as ffi;
 use rsqlite_rsync::db::Connection;
 use rsqlite_rsync::gateway::{AuthConfig, DatabaseEngine, ReplicationServer};
 use rsqlite_rsync::proto::rsqlite::v1::replication_service_server::ReplicationServiceServer;
 use tempfile::TempDir;
 use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
+use tokio_stream::wrappers::TcpListenerStream;
 
 const TEST_TOKEN: &str = "test-replication-token";
 
@@ -19,6 +20,7 @@ struct TestServer {
     data_dir: PathBuf,
     _directory: TempDir,
     shutdown: Option<oneshot::Sender<()>>,
+    task: Option<JoinHandle<()>>,
 }
 
 impl TestServer {
@@ -27,9 +29,11 @@ impl TestServer {
         let data_dir = directory.path().join("databases");
         fs::create_dir_all(&data_dir).expect("create database directory");
 
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test port");
+        // Serving the already-bound listener avoids a bind-then-rebind race on the port.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test port");
         let address = listener.local_addr().expect("read test address");
-        drop(listener);
 
         let engine = DatabaseEngine::new(&data_dir).expect("create database engine");
         let replication = ReplicationServer::new(
@@ -41,29 +45,33 @@ impl TestServer {
         let service = ReplicationServiceServer::new(replication);
         let (shutdown, shutdown_rx) = oneshot::channel();
 
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             tonic::transport::Server::builder()
                 .add_service(service)
-                .serve_with_shutdown(address, async move {
+                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
                     let _ = shutdown_rx.await;
                 })
                 .await
                 .expect("run test replication server");
         });
 
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline {
-            if std::net::TcpStream::connect(address).is_ok() {
-                return Self {
-                    address,
-                    data_dir,
-                    _directory: directory,
-                    shutdown: Some(shutdown),
-                };
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+        Self {
+            address,
+            data_dir,
+            _directory: directory,
+            shutdown: Some(shutdown),
+            task: Some(task),
         }
-        panic!("test replication server did not start on {address}");
+    }
+
+    /// Shuts the server down and re-raises any panic from its task, which would otherwise go unobserved.
+    async fn stop(mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(task) = self.task.take() {
+            task.await.expect("test replication server task failed");
+        }
     }
 
     fn endpoint(&self) -> String {
@@ -127,10 +135,11 @@ async fn pull_replica_loads_file_token_and_copies_database() {
         fs::read(server.database_path(database)).expect("read source database"),
         "replica database should match the authenticated source"
     );
+    server.stop().await;
 }
 
 #[tokio::test]
-async fn pull_replica_preserves_replication_error_type() {
+async fn pull_replica_reports_rejected_token_as_auth_failure() {
     let server = TestServer::start().await;
     let database = "source.db";
     seed_database(&server.database_path(database));
@@ -148,10 +157,49 @@ async fn pull_replica_preserves_replication_error_type() {
     .await
     .expect_err("wrong token should fail authentication");
 
+    assert!(
+        matches!(error, SyncError::AuthFailed { .. }),
+        "expected AuthFailed, got {error:?}"
+    );
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn pull_replica_rejects_origin_without_credential() {
+    let sync = SyncSection {
+        interval_secs: 1,
+        origin_endpoint: Some("grpc://127.0.0.1:50051".to_string()),
+        transport_auth_token_env: None,
+        transport_auth_token_file: None,
+    };
+    let directory = tempfile::tempdir().expect("create replica directory");
+
+    let error = pull_replica(&sync, &directory.path().join("replica.db"), "source.db")
+        .await
+        .expect_err("origin without a credential must not be pulled unauthenticated");
+
     assert!(matches!(
-        &error,
-        SyncError::Replication(ReplicationError::Network(_))
+        error,
+        SyncError::InvalidConfiguration(message) if message.contains("requires a credential")
     ));
-    let source = std::error::Error::source(&error).expect("retain the replication error as source");
-    assert!(source.is::<ReplicationError>());
+}
+
+#[tokio::test]
+async fn pull_replica_requires_origin_endpoint() {
+    let sync = SyncSection {
+        interval_secs: 1,
+        origin_endpoint: None,
+        transport_auth_token_env: None,
+        transport_auth_token_file: None,
+    };
+    let directory = tempfile::tempdir().expect("create replica directory");
+
+    let error = pull_replica(&sync, &directory.path().join("replica.db"), "source.db")
+        .await
+        .expect_err("pull without an origin must fail");
+
+    assert!(matches!(
+        error,
+        SyncError::InvalidConfiguration(message) if message.contains("sync.origin_endpoint is required")
+    ));
 }

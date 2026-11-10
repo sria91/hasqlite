@@ -23,21 +23,12 @@ pub enum SyncTrigger {
 /// Sync execution errors encountered during scheduled or triggered replication.
 #[derive(thiserror::Error, Debug)]
 pub enum SyncError {
-    /// Remote origin endpoint is unreachable or refused connection.
-    #[error("sync origin unreachable: {endpoint}")]
-    OriginUnreachable {
-        /// The origin endpoint that failed to connect.
-        endpoint: String,
+    /// The origin rejected the configured credential.
+    #[error("authentication failed with origin endpoint: {message}")]
+    AuthFailed {
+        /// Transport error reported for the rejection (never contains the token).
+        message: String,
     },
-    /// Replication RPC exceeded the allotted timeout.
-    #[error("sync timed out after {timeout_secs}s")]
-    Timeout {
-        /// Timeout duration in seconds.
-        timeout_secs: u64,
-    },
-    /// Authentication failed when connecting to the origin gRPC service.
-    #[error("authentication failed with origin endpoint")]
-    AuthFailed,
     /// Sync configuration is invalid or does not specify an origin endpoint.
     #[error("invalid sync configuration: {0}")]
     InvalidConfiguration(String),
@@ -58,8 +49,8 @@ pub enum SyncError {
     /// A configured authentication source contained no token.
     #[error("sync authentication token must not be empty")]
     EmptyAuthToken,
-    /// The underlying replication pull failed.
-    #[error("replication pull failed: {0}")]
+    /// The underlying replication pull failed; the cause is available via `Error::source`.
+    #[error("replication pull failed")]
     Replication(#[source] ReplicationError),
 }
 
@@ -81,6 +72,23 @@ fn map_replication_error(error: rsqlite_rsync::error::SyncError) -> ReplicationE
     }
 }
 
+/// Description of the gRPC `Unauthenticated` status, which rsqlite-rsync embeds in its `Network` error when the origin rejects the token.
+///
+/// rsqlite-rsync has no typed auth variant and stringifies the tonic status, so this match is pinned by the
+/// `pull_replica_reports_rejected_token_as_auth_failure` integration test.
+const UNAUTHENTICATED_DESCRIPTION: &str = "does not have valid authentication credentials";
+
+fn map_pull_error(error: rsqlite_rsync::error::SyncError) -> SyncError {
+    match error {
+        rsqlite_rsync::error::SyncError::Network(message)
+            if message.contains(UNAUTHENTICATED_DESCRIPTION) =>
+        {
+            SyncError::AuthFailed { message }
+        }
+        error => SyncError::Replication(map_replication_error(error)),
+    }
+}
+
 /// Pulls a database replica from the configured origin.
 ///
 /// The configured environment or file credential is loaded and passed to the
@@ -99,7 +107,7 @@ pub async fn pull_replica(
 
     rsqlite_rsync::grpc_pull_sync(replica_path, endpoint, database, auth_token.as_deref())
         .await
-        .map_err(|error| SyncError::Replication(map_replication_error(error)))
+        .map_err(map_pull_error)
 }
 
 async fn load_sync_auth_token(sync: &SyncSection) -> Result<Option<String>, SyncError> {
@@ -143,7 +151,6 @@ async fn load_sync_auth_token(sync: &SyncSection) -> Result<Option<String>, Sync
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     fn sync_config() -> SyncSection {
         SyncSection {
@@ -173,8 +180,12 @@ mod tests {
 
     #[tokio::test]
     async fn sync_auth_token_file_errors_do_not_expose_contents() {
+        let directory = tempfile::tempdir().expect("create temporary directory");
+        let token_path = directory.path().join("sync-token");
+        // The invalid UTF-8 byte makes `read_to_string` fail after the token bytes are already on disk.
+        std::fs::write(&token_path, b"test-replication-token\xff").expect("write token");
         let mut sync = sync_config();
-        sync.transport_auth_token_file = Some(PathBuf::from("/missing/sync-token"));
+        sync.transport_auth_token_file = Some(token_path);
 
         let error = load_sync_auth_token(&sync).await.unwrap_err();
         assert!(matches!(error, SyncError::AuthTokenFile { .. }));
@@ -188,6 +199,51 @@ mod tests {
         std::fs::write(&token_path, " \n").expect("write token");
         let mut sync = sync_config();
         sync.transport_auth_token_file = Some(token_path);
+
+        assert!(matches!(
+            load_sync_auth_token(&sync).await.unwrap_err(),
+            SyncError::EmptyAuthToken
+        ));
+    }
+
+    // Each env-var test uses its own variable name so parallel tests never observe each other's mutations.
+    #[tokio::test]
+    async fn sync_auth_token_is_loaded_from_env() {
+        const NAME: &str = "HASQLITE_TEST_SYNC_TOKEN_LOADED";
+        // SAFETY: nothing in this test binary reads the environment through non-Rust code (e.g. libc
+        // `getenv`) concurrently; Rust-side reads are serialized by std's environment lock.
+        unsafe { std::env::set_var(NAME, " test-replication-token \n") };
+        let mut sync = sync_config();
+        sync.transport_auth_token_env = Some(NAME.into());
+
+        assert_eq!(
+            load_sync_auth_token(&sync)
+                .await
+                .expect("load token")
+                .as_deref(),
+            Some("test-replication-token")
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_auth_token_env_missing_is_reported_by_name() {
+        const NAME: &str = "HASQLITE_TEST_SYNC_TOKEN_MISSING";
+        let mut sync = sync_config();
+        sync.transport_auth_token_env = Some(NAME.into());
+
+        assert!(matches!(
+            load_sync_auth_token(&sync).await.unwrap_err(),
+            SyncError::AuthTokenEnvironmentVariable { name } if name == NAME
+        ));
+    }
+
+    #[tokio::test]
+    async fn sync_auth_token_env_rejects_blank_value() {
+        const NAME: &str = "HASQLITE_TEST_SYNC_TOKEN_BLANK";
+        // SAFETY: see `sync_auth_token_is_loaded_from_env`.
+        unsafe { std::env::set_var(NAME, "  ") };
+        let mut sync = sync_config();
+        sync.transport_auth_token_env = Some(NAME.into());
 
         assert!(matches!(
             load_sync_auth_token(&sync).await.unwrap_err(),
@@ -213,21 +269,49 @@ mod tests {
 
     #[test]
     fn sync_error_display() {
-        let err1 = SyncError::OriginUnreachable {
-            endpoint: "grpc://10.0.0.1:50051".to_string(),
+        let err = SyncError::AuthFailed {
+            message: "rejected".to_string(),
         };
         assert_eq!(
-            err1.to_string(),
-            "sync origin unreachable: grpc://10.0.0.1:50051"
+            err.to_string(),
+            "authentication failed with origin endpoint: rejected"
         );
+    }
 
-        let err2 = SyncError::Timeout { timeout_secs: 15 };
-        assert_eq!(err2.to_string(), "sync timed out after 15s");
+    #[test]
+    fn unauthenticated_network_error_maps_to_auth_failed() {
+        let error = map_pull_error(rsqlite_rsync::error::SyncError::Network(
+            "failed to establish gRPC stream: code: 'The request does not have valid authentication credentials', message: \"missing or invalid authorization credentials\""
+                .to_string(),
+        ));
+        assert!(matches!(
+            error,
+            SyncError::AuthFailed { message } if message.contains("missing or invalid authorization credentials")
+        ));
+    }
 
-        let err3 = SyncError::AuthFailed;
+    #[test]
+    fn other_network_errors_stay_replication_network_errors() {
+        let error = map_pull_error(rsqlite_rsync::error::SyncError::Network(
+            "failed to connect to gRPC server: connection refused".to_string(),
+        ));
+        assert!(matches!(
+            error,
+            SyncError::Replication(ReplicationError::Network(_))
+        ));
+    }
+
+    #[test]
+    fn replication_error_is_exposed_only_as_source() {
+        let error = map_pull_error(rsqlite_rsync::error::SyncError::Network(
+            "connection refused".to_string(),
+        ));
+        assert_eq!(error.to_string(), "replication pull failed");
+        let source = std::error::Error::source(&error).expect("retain the replication error");
+        assert!(source.is::<ReplicationError>());
         assert_eq!(
-            err3.to_string(),
-            "authentication failed with origin endpoint"
+            source.to_string(),
+            "replication network error: connection refused"
         );
     }
 }
