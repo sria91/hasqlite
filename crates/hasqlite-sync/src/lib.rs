@@ -65,6 +65,7 @@ pub enum ReplicationError {
     Operation(String),
 }
 
+/// Maps an adapter error into the hasqlite-owned replication error categories.
 fn map_replication_error(error: rsqlite_rsync::error::SyncError) -> ReplicationError {
     match error {
         rsqlite_rsync::error::SyncError::Network(message) => ReplicationError::Network(message),
@@ -78,6 +79,7 @@ fn map_replication_error(error: rsqlite_rsync::error::SyncError) -> ReplicationE
 /// `pull_replica_reports_rejected_token_as_auth_failure` integration test.
 const UNAUTHENTICATED_DESCRIPTION: &str = "does not have valid authentication credentials";
 
+/// Maps an adapter pull error, surfacing origin credential rejection as [`SyncError::AuthFailed`].
 fn map_pull_error(error: rsqlite_rsync::error::SyncError) -> SyncError {
     match error {
         rsqlite_rsync::error::SyncError::Network(message)
@@ -91,8 +93,13 @@ fn map_pull_error(error: rsqlite_rsync::error::SyncError) -> SyncError {
 
 /// Pulls a database replica from the configured origin.
 ///
-/// The configured environment or file credential is loaded and passed to the
-/// replication client, which attaches it to the authenticated gRPC request.
+/// The configured environment or file credential is re-read on every call, so a rotated token takes
+/// effect on the next pull, and is passed to the replication client, which attaches it to the
+/// authenticated gRPC request.
+///
+/// The transitional backend writes pages into `replica_path` in place, so an interrupted pull leaves a
+/// torn file. Callers must invalidate the freshness ledger before calling and publish a new one only
+/// after this returns `Ok`; on success the replica and its directory entry have been fsynced.
 pub async fn pull_replica(
     sync: &SyncSection,
     replica_path: &Path,
@@ -107,9 +114,44 @@ pub async fn pull_replica(
 
     rsqlite_rsync::grpc_pull_sync(replica_path, endpoint, database, auth_token.as_deref())
         .await
-        .map_err(map_pull_error)
+        .map_err(map_pull_error)?;
+    fsync_replica(replica_path).await
 }
 
+/// Flushes the replica file and, on Unix, its parent directory so a published ledger never outlives the data.
+async fn fsync_replica(replica_path: &Path) -> Result<(), SyncError> {
+    let fsync_error = |path: &Path, error: std::io::Error| {
+        SyncError::Replication(ReplicationError::Operation(format!(
+            "failed to fsync '{}': {error}",
+            path.display()
+        )))
+    };
+    // Windows `FlushFileBuffers` requires write access, so a read-only handle cannot be synced there.
+    tokio::fs::OpenOptions::new()
+        .write(true)
+        .open(replica_path)
+        .await
+        .map_err(|error| fsync_error(replica_path, error))?
+        .sync_all()
+        .await
+        .map_err(|error| fsync_error(replica_path, error))?;
+
+    #[cfg(unix)]
+    if let Some(parent) = replica_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        tokio::fs::File::open(parent)
+            .await
+            .map_err(|error| fsync_error(parent, error))?
+            .sync_all()
+            .await
+            .map_err(|error| fsync_error(parent, error))?;
+    }
+    Ok(())
+}
+
+/// Loads and trims the configured sync token from its environment variable or file, if one is configured.
 async fn load_sync_auth_token(sync: &SyncSection) -> Result<Option<String>, SyncError> {
     let token = match (
         sync.transport_auth_token_env.as_deref(),
@@ -152,6 +194,7 @@ async fn load_sync_auth_token(sync: &SyncSection) -> Result<Option<String>, Sync
 mod tests {
     use super::*;
 
+    /// Sync section with a remote origin and no credential source.
     fn sync_config() -> SyncSection {
         SyncSection {
             interval_secs: 1,

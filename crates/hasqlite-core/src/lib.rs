@@ -70,6 +70,20 @@ pub enum NodeMode {
 /// Canonical file name for standalone advisory lease locks within the database volume.
 pub const STANDALONE_CANONICAL_LEASE_FILENAME: &str = ".hasqlite.lease";
 
+/// Default lease TTL: candidates wait this long after the last observed lease change before acquiring.
+pub const DEFAULT_LEASE_TTL_SECS: u64 = 10;
+/// Default writer renewal deadline: commits stop this long after the last successful renewal was sent.
+pub const DEFAULT_LEASE_RENEW_DEADLINE_SECS: u64 = 6;
+/// Default interval between lease renewal or acquisition attempts.
+pub const DEFAULT_LEASE_RETRY_PERIOD_SECS: u64 = 2;
+/// Minimum gap between `lease.ttl_secs` and `lease.renew_deadline_secs`.
+///
+/// A writer stalled inside a commit for longer than this gap can still commit after a peer promotes,
+/// because no storage-level fence rejects stale generations; the margin is the tolerated stall.
+pub const MIN_LEASE_FENCING_MARGIN_SECS: u64 = 2;
+/// Maximum `lease.ttl_secs`; it also bounds `lease.renew_deadline_secs`, keeping writer deadlines representable.
+pub const MAX_LEASE_TTL_SECS: u64 = 3_600;
+
 /// Returns true if a path is empty or contains only whitespace characters.
 fn is_empty_or_whitespace(path: &std::path::Path) -> bool {
     path.as_os_str().is_empty() || path.to_str().map(|s| s.trim().is_empty()).unwrap_or(false)
@@ -104,6 +118,7 @@ fn validate_credential_source(
     Ok(())
 }
 
+/// Returns true if `endpoint` is `https://host:port`, or `grpc://host:port` with a loopback host.
 fn is_valid_sync_origin_endpoint(endpoint: &str) -> bool {
     let Some((scheme, authority)) = endpoint.split_once("://") else {
         return false;
@@ -255,6 +270,13 @@ impl ClusterConfig {
                         "sync.origin_endpoint is required in clustered mode".to_string(),
                     ));
                 }
+                // Steady-state lag reaches about one sync interval, so a smaller bound would deny every promotion.
+                if freshness.max_lag_secs <= sync.interval_secs {
+                    return Err(HasqliteError::Validation(format!(
+                        "freshness.max_lag_secs ({}) must exceed sync.interval_secs ({})",
+                        freshness.max_lag_secs, sync.interval_secs
+                    )));
+                }
 
                 let promotion = self.promotion.as_ref().ok_or_else(|| {
                     HasqliteError::Validation(
@@ -302,6 +324,13 @@ impl ClusterConfig {
                 "cannot specify gateway credentials together with gateway.allow_unauthenticated = true".to_string(),
             ));
         }
+        // A loopback bind does not imply local-only access: the clustered topology fronts the gateway with
+        // a TLS sidecar, which would expose unauthenticated SQL and replication to the network.
+        if self.gateway.allow_unauthenticated && self.node.mode == NodeMode::Clustered {
+            return Err(HasqliteError::Validation(
+                "gateway.allow_unauthenticated is only permitted in standalone mode".to_string(),
+            ));
+        }
         if self.gateway.auth_token_env.is_none()
             && self.gateway.auth_token_file.is_none()
             && !self.gateway.allow_unauthenticated
@@ -340,7 +369,39 @@ impl ClusterConfig {
         Ok(())
     }
 
+    /// Validates lease timing bounds and the section required by the selected lease backend.
     fn validate_lease(lease: &LeaseSection) -> Result<(), HasqliteError> {
+        if lease.retry_period_secs == 0 {
+            return Err(HasqliteError::Validation(
+                "lease.retry_period_secs must be greater than 0".to_string(),
+            ));
+        }
+        if lease.retry_period_secs >= lease.renew_deadline_secs {
+            return Err(HasqliteError::Validation(format!(
+                "lease.retry_period_secs ({}) must be less than lease.renew_deadline_secs ({})",
+                lease.retry_period_secs, lease.renew_deadline_secs
+            )));
+        }
+        if lease.ttl_secs > MAX_LEASE_TTL_SECS {
+            return Err(HasqliteError::Validation(format!(
+                "lease.ttl_secs must not exceed {MAX_LEASE_TTL_SECS} seconds"
+            )));
+        }
+        let min_ttl_secs = lease
+            .renew_deadline_secs
+            .checked_add(MIN_LEASE_FENCING_MARGIN_SECS)
+            .ok_or_else(|| {
+                HasqliteError::Validation(format!(
+                    "lease.renew_deadline_secs ({}) is too large",
+                    lease.renew_deadline_secs
+                ))
+            })?;
+        if lease.ttl_secs < min_ttl_secs {
+            return Err(HasqliteError::Validation(format!(
+                "lease.ttl_secs ({}) must exceed lease.renew_deadline_secs ({}) by at least {MIN_LEASE_FENCING_MARGIN_SECS} seconds",
+                lease.ttl_secs, lease.renew_deadline_secs
+            )));
+        }
         match lease.source {
             LeaseSourceType::Kubernetes => {
                 let k8s = lease.kubernetes.as_ref().ok_or_else(|| {
@@ -376,20 +437,22 @@ impl ClusterConfig {
         Ok(())
     }
 
+    /// Validates the freshness ledger path and lag bound.
     fn validate_freshness(freshness: &FreshnessSection) -> Result<(), HasqliteError> {
         if is_empty_or_whitespace(&freshness.path) {
             return Err(HasqliteError::Validation(
                 "freshness.path must not be empty".to_string(),
             ));
         }
-        if freshness.max_age_secs == 0 {
+        if freshness.max_lag_secs == 0 {
             return Err(HasqliteError::Validation(
-                "freshness.max_age_secs must be greater than 0".to_string(),
+                "freshness.max_lag_secs must be greater than 0".to_string(),
             ));
         }
         Ok(())
     }
 
+    /// Validates promotion thresholds.
     fn validate_promotion_section(promotion: &PromotionSection) -> Result<(), HasqliteError> {
         if promotion.max_future_skew_secs > 300 {
             return Err(HasqliteError::Validation(
@@ -431,6 +494,30 @@ pub struct LeaseSection {
     /// Configuration for Kubernetes Lease API coordination.
     #[serde(default)]
     pub kubernetes: Option<KubernetesLeaseSection>,
+    /// Seconds a candidate waits, on its local monotonic clock, after the last observed lease change.
+    #[serde(default = "default_lease_ttl_secs")]
+    pub ttl_secs: u64,
+    /// Seconds after sending its last successful renewal at which the writer stops accepting commits.
+    #[serde(default = "default_lease_renew_deadline_secs")]
+    pub renew_deadline_secs: u64,
+    /// Seconds between lease renewal or acquisition attempts.
+    #[serde(default = "default_lease_retry_period_secs")]
+    pub retry_period_secs: u64,
+}
+
+/// Serde default for `lease.ttl_secs`.
+fn default_lease_ttl_secs() -> u64 {
+    DEFAULT_LEASE_TTL_SECS
+}
+
+/// Serde default for `lease.renew_deadline_secs`.
+fn default_lease_renew_deadline_secs() -> u64 {
+    DEFAULT_LEASE_RENEW_DEADLINE_SECS
+}
+
+/// Serde default for `lease.retry_period_secs`.
+fn default_lease_retry_period_secs() -> u64 {
+    DEFAULT_LEASE_RETRY_PERIOD_SECS
 }
 
 /// File-backed lease configuration.
@@ -455,18 +542,16 @@ pub struct KubernetesLeaseSection {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FreshnessSection {
-    /// Path to the freshness ledger state file.
+    /// Path to the freshness ledger state file; keep it on the same filesystem as the database.
     pub path: PathBuf,
-    /// Maximum allowed staleness of the last sync in seconds.
-    pub max_age_secs: u64,
+    /// Maximum allowed lag, in seconds, of the last snapshot behind the writer's last lease renewal.
+    pub max_lag_secs: u64,
 }
 
 /// Writer promotion criteria and thresholds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PromotionSection {
-    /// Minimum required source generation for replica promotion.
-    pub min_source_generation: u64,
     /// Maximum allowable future clock skew in seconds.
     pub max_future_skew_secs: u64,
 }
@@ -579,10 +664,9 @@ path = "/tmp/hasqlite.lease"
 
 [freshness]
 path = "/tmp/freshness.txt"
-max_age_secs = 5
+max_lag_secs = 5
 
 [promotion]
-min_source_generation = 1
 max_future_skew_secs = 3
 
 [sync]
@@ -592,12 +676,13 @@ transport_auth_token_env = "HASQLITE_GRPC_AUTH_TOKEN"
 
 [gateway]
 bind = "127.0.0.1:50051"
-allow_unauthenticated = true
+auth_token_file = "/run/secrets/hasqlite_token"
 
 [probes]
 http_bind = "127.0.0.1:8088"
 "#;
 
+    /// Valid clustered configuration using a Kubernetes lease, mutated by individual tests.
     fn valid_test_config() -> ClusterConfig {
         ClusterConfig {
             node: NodeSection {
@@ -614,13 +699,15 @@ http_bind = "127.0.0.1:8088"
                     lease_name: "hasqlite-writer".to_string(),
                     namespace: "default".to_string(),
                 }),
+                ttl_secs: DEFAULT_LEASE_TTL_SECS,
+                renew_deadline_secs: DEFAULT_LEASE_RENEW_DEADLINE_SECS,
+                retry_period_secs: DEFAULT_LEASE_RETRY_PERIOD_SECS,
             },
             freshness: Some(FreshnessSection {
-                path: PathBuf::from("/var/run/freshness.txt"),
-                max_age_secs: 10,
+                path: PathBuf::from("/var/lib/hasqlite/.hasqlite.freshness"),
+                max_lag_secs: 10,
             }),
             promotion: Some(PromotionSection {
-                min_source_generation: 0,
                 max_future_skew_secs: 2,
             }),
             sync: Some(SyncSection {
@@ -642,6 +729,18 @@ http_bind = "127.0.0.1:8088"
         }
     }
 
+    /// Valid standalone configuration with the canonical file lease.
+    fn valid_standalone_config() -> ClusterConfig {
+        let mut config = valid_test_config();
+        config.node.mode = NodeMode::Standalone;
+        config.lease.source = LeaseSourceType::File;
+        config.lease.kubernetes = None;
+        config.lease.file = Some(FileLeaseSection {
+            path: PathBuf::from("/var/lib/hasqlite/.hasqlite.lease"),
+        });
+        config
+    }
+
     #[test]
     fn cluster_config_models_all_documented_sections() {
         let config = valid_test_config();
@@ -650,7 +749,7 @@ http_bind = "127.0.0.1:8088"
         assert_eq!(config.node.mode, NodeMode::Clustered);
         assert_eq!(config.data.dir, PathBuf::from("/var/lib/hasqlite"));
         assert_eq!(config.lease.source, LeaseSourceType::Kubernetes);
-        assert_eq!(config.freshness.as_ref().unwrap().max_age_secs, 10);
+        assert_eq!(config.freshness.as_ref().unwrap().max_lag_secs, 10);
         assert_eq!(config.promotion.as_ref().unwrap().max_future_skew_secs, 2);
         assert_eq!(config.sync.as_ref().unwrap().interval_secs, 2);
         assert_eq!(config.gateway.bind, "0.0.0.0:50051");
@@ -667,9 +766,21 @@ http_bind = "127.0.0.1:8088"
         assert_eq!(parsed.node.mode, NodeMode::Clustered);
         assert_eq!(parsed.lease.source, LeaseSourceType::File);
         assert!(!parsed.gateway.allow_replica_reads);
-        assert!(parsed.gateway.allow_unauthenticated);
+        assert!(!parsed.gateway.allow_unauthenticated);
         assert_eq!(parsed.gateway.auth_token_env, None);
-        assert_eq!(parsed.gateway.auth_token_file, None);
+        assert_eq!(
+            parsed.gateway.auth_token_file,
+            Some(PathBuf::from("/run/secrets/hasqlite_token"))
+        );
+        assert_eq!(parsed.lease.ttl_secs, DEFAULT_LEASE_TTL_SECS);
+        assert_eq!(
+            parsed.lease.renew_deadline_secs,
+            DEFAULT_LEASE_RENEW_DEADLINE_SECS
+        );
+        assert_eq!(
+            parsed.lease.retry_period_secs,
+            DEFAULT_LEASE_RETRY_PERIOD_SECS
+        );
         assert_eq!(
             parsed.sync.as_ref().unwrap().origin_endpoint.as_deref(),
             Some("https://hasqlite-writer:50443")
@@ -730,6 +841,7 @@ http_bind = "0.0.0.0:8088"
         assert!(parsed.validate().is_ok());
     }
 
+    /// Applies `mutate` to a valid clustered config and asserts validation fails with `expected_substr`.
     fn assert_validation_err<F>(mutate: F, expected_substr: &str)
     where
         F: FnOnce(&mut ClusterConfig),
@@ -855,25 +967,102 @@ http_bind = "0.0.0.0:8088"
 
     #[test]
     fn gateway_rejects_unauthenticated_public_bind() {
+        let mut config = valid_standalone_config();
+        config.gateway.auth_token_env = None;
+        config.gateway.allow_unauthenticated = true;
+        config.gateway.bind = "0.0.0.0:50051".to_string();
+        assert!(matches!(
+            config.validate().unwrap_err(),
+            HasqliteError::Validation(message)
+                if message.contains("gateway.allow_unauthenticated requires gateway.bind to use a loopback address")
+        ));
+    }
+
+    #[test]
+    fn gateway_allows_unauthenticated_loopback_bind_in_standalone_mode() {
+        let mut config = valid_standalone_config();
+        config.gateway.auth_token_env = None;
+        config.gateway.allow_unauthenticated = true;
+        config.gateway.bind = "127.0.0.1:50051".to_string();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn clustered_mode_rejects_unauthenticated_gateway_even_on_loopback() {
         assert_validation_err(
             |c| {
                 c.gateway.auth_token_env = None;
-                c.gateway.auth_token_file = None;
                 c.gateway.allow_unauthenticated = true;
-                c.gateway.bind = "0.0.0.0:50051".to_string();
+                c.gateway.bind = "127.0.0.1:50051".to_string();
             },
-            "gateway.allow_unauthenticated requires gateway.bind to use a loopback address",
+            "gateway.allow_unauthenticated is only permitted in standalone mode",
         );
     }
 
     #[test]
-    fn gateway_allows_unauthenticated_loopback_bind() {
+    fn lease_timing_must_leave_fencing_margin() {
+        assert_validation_err(
+            |c| {
+                c.lease.ttl_secs = 7;
+                c.lease.renew_deadline_secs = 6;
+            },
+            "lease.ttl_secs (7) must exceed lease.renew_deadline_secs (6) by at least 2 seconds",
+        );
         let mut config = valid_test_config();
-        config.gateway.auth_token_env = None;
-        config.gateway.auth_token_file = None;
-        config.gateway.allow_unauthenticated = true;
-        config.gateway.bind = "127.0.0.1:50051".to_string();
+        config.lease.ttl_secs = 8;
+        config.lease.renew_deadline_secs = 6;
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn lease_timing_rejects_unbounded_values() {
+        assert_validation_err(
+            |c| c.lease.ttl_secs = MAX_LEASE_TTL_SECS + 1,
+            "lease.ttl_secs must not exceed 3600 seconds",
+        );
+        assert_validation_err(
+            |c| c.lease.renew_deadline_secs = u64::MAX,
+            &format!("lease.renew_deadline_secs ({}) is too large", u64::MAX),
+        );
+        assert_validation_err(
+            |c| c.lease.renew_deadline_secs = u64::MAX - MIN_LEASE_FENCING_MARGIN_SECS,
+            "lease.ttl_secs (10) must exceed lease.renew_deadline_secs",
+        );
+        let mut config = valid_test_config();
+        config.lease.ttl_secs = MAX_LEASE_TTL_SECS;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn lease_retry_period_must_be_positive_and_below_renew_deadline() {
+        assert_validation_err(
+            |c| c.lease.retry_period_secs = 0,
+            "lease.retry_period_secs must be greater than 0",
+        );
+        assert_validation_err(
+            |c| c.lease.retry_period_secs = c.lease.renew_deadline_secs,
+            "lease.retry_period_secs (6) must be less than lease.renew_deadline_secs (6)",
+        );
+    }
+
+    #[test]
+    fn clustered_mode_requires_lag_bound_above_sync_interval() {
+        assert_validation_err(
+            |c| c.freshness.as_mut().unwrap().max_lag_secs = c.sync.as_ref().unwrap().interval_secs,
+            "freshness.max_lag_secs (2) must exceed sync.interval_secs (2)",
+        );
+    }
+
+    #[test]
+    fn lease_timing_overrides_parse_from_toml() {
+        let toml_str = FILE_LEASE_CLUSTER_TOML.replace(
+            "[lease]\nsource = \"file\"",
+            "[lease]\nsource = \"file\"\nttl_secs = 20\nrenew_deadline_secs = 12\nretry_period_secs = 3",
+        );
+        let config = ClusterConfig::from_toml(&toml_str).expect("parse lease timing overrides");
+        assert_eq!(config.lease.ttl_secs, 20);
+        assert_eq!(config.lease.renew_deadline_secs, 12);
+        assert_eq!(config.lease.retry_period_secs, 3);
     }
 
     #[test]
@@ -895,8 +1084,8 @@ http_bind = "0.0.0.0:8088"
     #[test]
     fn validation_rejects_zero_freshness_max_age() {
         assert_validation_err(
-            |c| c.freshness.as_mut().unwrap().max_age_secs = 0,
-            "freshness.max_age_secs must be greater than 0",
+            |c| c.freshness.as_mut().unwrap().max_lag_secs = 0,
+            "freshness.max_lag_secs must be greater than 0",
         );
     }
 
@@ -1091,13 +1280,7 @@ http_bind = "0.0.0.0:8088"
 
     #[test]
     fn standalone_mode_allows_missing_origin_and_credential() {
-        let mut config = valid_test_config();
-        config.node.mode = NodeMode::Standalone;
-        config.lease.source = LeaseSourceType::File;
-        config.lease.kubernetes = None;
-        config.lease.file = Some(FileLeaseSection {
-            path: PathBuf::from("/var/lib/hasqlite/.hasqlite.lease"),
-        });
+        let mut config = valid_standalone_config();
         config.sync.as_mut().unwrap().origin_endpoint = None;
         config.sync.as_mut().unwrap().transport_auth_token_env = None;
         assert!(config.validate().is_ok());

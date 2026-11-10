@@ -10,3 +10,6 @@ repository.workspace = true
 hasqlite-core = { path = "../hasqlite-core" }
 serde.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+toml.workspace = true

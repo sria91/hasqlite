@@ -2,6 +2,7 @@
 
 use tracing_subscriber::EnvFilter;
 
+/// Initializes logging from `RUST_LOG` (default `info`) and logs the bootstrap banner.
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
