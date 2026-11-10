@@ -112,9 +112,12 @@ pub struct RenewalDeadline {
 
 impl RenewalDeadline {
     /// Computes the deadline for a renewal that succeeded after being sent at `sent_at`.
+    ///
+    /// If the deadline is not representable it collapses to `sent_at`, so overflow fails closed and the
+    /// writer stops committing instead of treating the lease as never expiring.
     pub fn from_renewal_sent(sent_at: Instant, renew_deadline: Duration) -> Self {
         Self {
-            deadline: sent_at + renew_deadline,
+            deadline: sent_at.checked_add(renew_deadline).unwrap_or(sent_at),
         }
     }
 
@@ -272,6 +275,13 @@ mod tests {
         assert!(deadline.allows_commit_at(sent_at));
         assert!(deadline.allows_commit_at(sent_at + Duration::from_millis(5_999)));
         assert!(!deadline.allows_commit_at(sent_at + Duration::from_secs(6)));
+    }
+
+    #[test]
+    fn renewal_deadline_overflow_fails_closed() {
+        let sent_at = Instant::now();
+        let deadline = RenewalDeadline::from_renewal_sent(sent_at, Duration::MAX);
+        assert!(!deadline.allows_commit_at(sent_at));
     }
 
     #[test]

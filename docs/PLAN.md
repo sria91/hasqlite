@@ -938,8 +938,9 @@ Validation (`ClusterConfig::from_toml`) fails closed:
 - Unknown keys or sections are rejected, so a misspelled setting cannot silently fall back to its default.
 - Clustered mode requires `[freshness]`, `[promotion]`, `[sync]`, and `sync.origin_endpoint`, and
   `freshness.max_lag_secs` must exceed `sync.interval_secs` (otherwise steady-state lag would deny every promotion).
-- Lease timing: `retry_period_secs > 0`, `retry_period_secs < renew_deadline_secs`, and
-  `ttl_secs ≥ renew_deadline_secs + 2` (the fencing margin, §3).
+- Lease timing: `retry_period_secs > 0`, `retry_period_secs < renew_deadline_secs`,
+  `ttl_secs ≥ renew_deadline_secs + 2` (the fencing margin, §3, computed with checked arithmetic), and
+  `ttl_secs ≤ 3600`, which also bounds the writer's renewal deadline.
 - Plaintext `grpc://` origins are accepted only for literal loopback IPs and `localhost`; `*.localhost`
   subdomains are rejected because some resolvers forward them upstream, which would expose the token.
 - `sync.origin_endpoint` requires a sync credential, and the gateway requires a credential unless

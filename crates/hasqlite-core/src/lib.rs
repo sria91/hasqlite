@@ -81,6 +81,8 @@ pub const DEFAULT_LEASE_RETRY_PERIOD_SECS: u64 = 2;
 /// A writer stalled inside a commit for longer than this gap can still commit after a peer promotes,
 /// because no storage-level fence rejects stale generations; the margin is the tolerated stall.
 pub const MIN_LEASE_FENCING_MARGIN_SECS: u64 = 2;
+/// Maximum `lease.ttl_secs`; it also bounds `lease.renew_deadline_secs`, keeping writer deadlines representable.
+pub const MAX_LEASE_TTL_SECS: u64 = 3_600;
 
 /// Returns true if a path is empty or contains only whitespace characters.
 fn is_empty_or_whitespace(path: &std::path::Path) -> bool {
@@ -116,6 +118,7 @@ fn validate_credential_source(
     Ok(())
 }
 
+/// Returns true if `endpoint` is `https://host:port`, or `grpc://host:port` with a loopback host.
 fn is_valid_sync_origin_endpoint(endpoint: &str) -> bool {
     let Some((scheme, authority)) = endpoint.split_once("://") else {
         return false;
@@ -366,6 +369,7 @@ impl ClusterConfig {
         Ok(())
     }
 
+    /// Validates lease timing bounds and the section required by the selected lease backend.
     fn validate_lease(lease: &LeaseSection) -> Result<(), HasqliteError> {
         if lease.retry_period_secs == 0 {
             return Err(HasqliteError::Validation(
@@ -378,7 +382,21 @@ impl ClusterConfig {
                 lease.retry_period_secs, lease.renew_deadline_secs
             )));
         }
-        if lease.ttl_secs < lease.renew_deadline_secs + MIN_LEASE_FENCING_MARGIN_SECS {
+        if lease.ttl_secs > MAX_LEASE_TTL_SECS {
+            return Err(HasqliteError::Validation(format!(
+                "lease.ttl_secs must not exceed {MAX_LEASE_TTL_SECS} seconds"
+            )));
+        }
+        let min_ttl_secs = lease
+            .renew_deadline_secs
+            .checked_add(MIN_LEASE_FENCING_MARGIN_SECS)
+            .ok_or_else(|| {
+                HasqliteError::Validation(format!(
+                    "lease.renew_deadline_secs ({}) is too large",
+                    lease.renew_deadline_secs
+                ))
+            })?;
+        if lease.ttl_secs < min_ttl_secs {
             return Err(HasqliteError::Validation(format!(
                 "lease.ttl_secs ({}) must exceed lease.renew_deadline_secs ({}) by at least {MIN_LEASE_FENCING_MARGIN_SECS} seconds",
                 lease.ttl_secs, lease.renew_deadline_secs
@@ -419,6 +437,7 @@ impl ClusterConfig {
         Ok(())
     }
 
+    /// Validates the freshness ledger path and lag bound.
     fn validate_freshness(freshness: &FreshnessSection) -> Result<(), HasqliteError> {
         if is_empty_or_whitespace(&freshness.path) {
             return Err(HasqliteError::Validation(
@@ -433,6 +452,7 @@ impl ClusterConfig {
         Ok(())
     }
 
+    /// Validates promotion thresholds.
     fn validate_promotion_section(promotion: &PromotionSection) -> Result<(), HasqliteError> {
         if promotion.max_future_skew_secs > 300 {
             return Err(HasqliteError::Validation(
@@ -485,14 +505,17 @@ pub struct LeaseSection {
     pub retry_period_secs: u64,
 }
 
+/// Serde default for `lease.ttl_secs`.
 fn default_lease_ttl_secs() -> u64 {
     DEFAULT_LEASE_TTL_SECS
 }
 
+/// Serde default for `lease.renew_deadline_secs`.
 fn default_lease_renew_deadline_secs() -> u64 {
     DEFAULT_LEASE_RENEW_DEADLINE_SECS
 }
 
+/// Serde default for `lease.retry_period_secs`.
 fn default_lease_retry_period_secs() -> u64 {
     DEFAULT_LEASE_RETRY_PERIOD_SECS
 }
@@ -659,6 +682,7 @@ auth_token_file = "/run/secrets/hasqlite_token"
 http_bind = "127.0.0.1:8088"
 "#;
 
+    /// Valid clustered configuration using a Kubernetes lease, mutated by individual tests.
     fn valid_test_config() -> ClusterConfig {
         ClusterConfig {
             node: NodeSection {
@@ -705,6 +729,7 @@ http_bind = "127.0.0.1:8088"
         }
     }
 
+    /// Valid standalone configuration with the canonical file lease.
     fn valid_standalone_config() -> ClusterConfig {
         let mut config = valid_test_config();
         config.node.mode = NodeMode::Standalone;
@@ -816,6 +841,7 @@ http_bind = "0.0.0.0:8088"
         assert!(parsed.validate().is_ok());
     }
 
+    /// Applies `mutate` to a valid clustered config and asserts validation fails with `expected_substr`.
     fn assert_validation_err<F>(mutate: F, expected_substr: &str)
     where
         F: FnOnce(&mut ClusterConfig),
@@ -985,6 +1011,25 @@ http_bind = "0.0.0.0:8088"
         let mut config = valid_test_config();
         config.lease.ttl_secs = 8;
         config.lease.renew_deadline_secs = 6;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn lease_timing_rejects_unbounded_values() {
+        assert_validation_err(
+            |c| c.lease.ttl_secs = MAX_LEASE_TTL_SECS + 1,
+            "lease.ttl_secs must not exceed 3600 seconds",
+        );
+        assert_validation_err(
+            |c| c.lease.renew_deadline_secs = u64::MAX,
+            &format!("lease.renew_deadline_secs ({}) is too large", u64::MAX),
+        );
+        assert_validation_err(
+            |c| c.lease.renew_deadline_secs = u64::MAX - MIN_LEASE_FENCING_MARGIN_SECS,
+            "lease.ttl_secs (10) must exceed lease.renew_deadline_secs",
+        );
+        let mut config = valid_test_config();
+        config.lease.ttl_secs = MAX_LEASE_TTL_SECS;
         assert!(config.validate().is_ok());
     }
 

@@ -24,6 +24,7 @@ struct TestServer {
 }
 
 impl TestServer {
+    /// Starts an authenticated replication server on an ephemeral loopback port.
     async fn start() -> Self {
         let directory = tempfile::tempdir().expect("create test directory");
         let data_dir = directory.path().join("databases");
@@ -74,10 +75,12 @@ impl TestServer {
         }
     }
 
+    /// Returns the loopback `grpc://` endpoint of the server.
     fn endpoint(&self) -> String {
         format!("grpc://{}", self.address)
     }
 
+    /// Returns the path of `database` in the server's data directory.
     fn database_path(&self, database: &str) -> PathBuf {
         self.data_dir.join(database)
     }
@@ -91,6 +94,7 @@ impl Drop for TestServer {
     }
 }
 
+/// Creates a database at `path` with one table and one row.
 fn seed_database(path: &Path) {
     let connection = Connection::open(path, ffi::SQLITE_OPEN_READWRITE | ffi::SQLITE_OPEN_CREATE)
         .expect("open test database");
@@ -102,6 +106,7 @@ fn seed_database(path: &Path) {
         .expect("insert test row");
 }
 
+/// Sync section pointing at `endpoint` and authenticating with `token_file`.
 fn sync_config(endpoint: String, token_file: PathBuf) -> SyncSection {
     SyncSection {
         interval_secs: 1,

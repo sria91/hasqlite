@@ -65,6 +65,7 @@ pub enum ReplicationError {
     Operation(String),
 }
 
+/// Maps an adapter error into the hasqlite-owned replication error categories.
 fn map_replication_error(error: rsqlite_rsync::error::SyncError) -> ReplicationError {
     match error {
         rsqlite_rsync::error::SyncError::Network(message) => ReplicationError::Network(message),
@@ -78,6 +79,7 @@ fn map_replication_error(error: rsqlite_rsync::error::SyncError) -> ReplicationE
 /// `pull_replica_reports_rejected_token_as_auth_failure` integration test.
 const UNAUTHENTICATED_DESCRIPTION: &str = "does not have valid authentication credentials";
 
+/// Maps an adapter pull error, surfacing origin credential rejection as [`SyncError::AuthFailed`].
 fn map_pull_error(error: rsqlite_rsync::error::SyncError) -> SyncError {
     match error {
         rsqlite_rsync::error::SyncError::Network(message)
@@ -124,7 +126,10 @@ async fn fsync_replica(replica_path: &Path) -> Result<(), SyncError> {
             path.display()
         )))
     };
-    tokio::fs::File::open(replica_path)
+    // Windows `FlushFileBuffers` requires write access, so a read-only handle cannot be synced there.
+    tokio::fs::OpenOptions::new()
+        .write(true)
+        .open(replica_path)
         .await
         .map_err(|error| fsync_error(replica_path, error))?
         .sync_all()
@@ -146,6 +151,7 @@ async fn fsync_replica(replica_path: &Path) -> Result<(), SyncError> {
     Ok(())
 }
 
+/// Loads and trims the configured sync token from its environment variable or file, if one is configured.
 async fn load_sync_auth_token(sync: &SyncSection) -> Result<Option<String>, SyncError> {
     let token = match (
         sync.transport_auth_token_env.as_deref(),
@@ -188,6 +194,7 @@ async fn load_sync_auth_token(sync: &SyncSection) -> Result<Option<String>, Sync
 mod tests {
     use super::*;
 
+    /// Sync section with a remote origin and no credential source.
     fn sync_config() -> SyncSection {
         SyncSection {
             interval_secs: 1,

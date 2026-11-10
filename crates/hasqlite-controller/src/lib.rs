@@ -175,6 +175,7 @@ mod tests {
     const WRITER: &str = "node-1";
     const CANDIDATE: &str = "node-2";
 
+    /// Promotion policy with a 10s lag bound and 2s future-skew tolerance.
     fn policy() -> PromotionPolicy {
         PromotionPolicy {
             max_lag_secs: 10,
@@ -207,6 +208,7 @@ mod tests {
         }
     }
 
+    /// Validates `ledger` for `node-2` against `lease` with the default test policy.
     fn validate(
         ledger: &FreshnessLedger,
         lease: &LeaseRecord,
