@@ -21,7 +21,9 @@ protocol.
 4. **Candidates never compare wall clocks.** A candidate treats the lease as
    expired only when it is released (no holder) or its `version` has stayed
    unchanged for `lease.ttl_secs` measured on the candidate's local monotonic
-   clock. `renewed_at_secs` is informational.
+   clock. `renewed_at_secs` is informational. The only wall-clock comparison a
+   candidate makes is the future-skew bound on its ledger in rule 10, which can
+   deny promotion but never authorizes it.
 5. **Writers fence themselves.** A writer accepts a commit only before
    `send time of its last successful renewal + lease.renew_deadline_secs`, on its
    local monotonic clock. `enforce_write_fence` runs inside the write transaction
