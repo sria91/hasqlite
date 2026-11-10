@@ -1,9 +1,12 @@
 # hasqlite — Development & Test Plan
 
 High Availability SQLite in Rust. This document is the implementation handoff:
-architecture, phased delivery, crate layout, and a test matrix derived from
-production patterns already proven in
-[`rsqlite-rsync`](https://github.com/sria91/rsqlite-rsync).
+architecture, phased delivery, crate layout, and a test matrix informed by
+production patterns already demonstrated in
+[`rsqlite-rsync`](https://github.com/sria91/rsqlite-rsync). The current
+`hasqlite-sync` replication path depends on `rsqlite-rsync`; removing that
+dependency after a native implementation is ready is an explicit architectural
+goal, not a claim about the current build.
 
 ---
 
@@ -18,8 +21,8 @@ production patterns already proven in
 3. **Operator-grade** observability: audit log, readiness/liveness semantics,
    metrics, and Kubernetes-first deployment paths.
 4. **Application API**: SQL over gRPC on the writer; safe redirect on replicas;
-   Rust client with automatic `NOT_LEADER` failover (reuse
-   `rsqlite-rsync-client` / shared protobuf).
+   Rust client with automatic `NOT_LEADER` failover; the client and wire API
+   will ultimately be owned by hasqlite.
 5. **Library-first**: embed the HA controller in custom agents; ship a
    batteries-included `hasqlite` node binary.
 6. **First-class standalone single-node Docker support (fast-track)**: Out-of-the-box
@@ -32,8 +35,9 @@ production patterns already proven in
 - Multi-writer / distributed SQL consensus (Raft, Paxos, SQLite session
   extension).
 - Cross-region active/active.
-- Replacing rsqlite-rsync’s standalone sync CLI (keep compatibility; call sync
-  as a library). Note: running `hasqlite` *itself* as a standalone single-node database
+- Drop-in compatibility with the `rsqlite-rsync` standalone sync CLI. hasqlite
+  will provide its own commands and implementation. Note: running `hasqlite`
+  *itself* as a standalone single-node database
   service in Docker is explicitly a goal and fast-tracked (see §1.6 and §5 Phase 1b).
 - Built-in TLS termination on the gateway (document mesh/proxy patterns instead).
 
@@ -49,20 +53,20 @@ production patterns already proven in
 
 ---
 
-## 2. Learnings from rsqlite-rsync (carry forward)
+## 2. Prior art from rsqlite-rsync (carry forward concepts)
 
 ### Proven building blocks
 
 | Building block | Location in rsync | hasqlite action |
 |----------------|-------------------|-----------------|
-| Two-pass page hash sync (v2 BLAKE3) | `protocol`, `hash`, `transport` | Depend on `rsqlite-rsync` crate API (`sync_local`, gRPC transport) |
+| Two-pass page hash sync (v2 BLAKE3) | `protocol`, `hash`, `transport` | Use the current crate integration as a bridge; implement and test the required behavior natively before removing it |
 | Live origin, exclusive replica | `snapshot`, sync invariants | Document as hard cluster invariants in `safety-contract.md` |
 | Lease record + KV text formats | `ha.rs`, `kv_text` | Extract/shared types in `hasqlite-lease` |
 | Freshness ledger + promotion gates | `validate_promotion`, `enforce_write_fence` | Core of `hasqlite-controller` |
 | File + Kubernetes lease readers | `FileLeaseReader`, `KubectlLeaseReader` | Pluggable `LeaseSource` trait |
 | HA reconcile loop + audit | `HaController`, `HaRuntime` | Node supervisor in `hasqlite-node` |
-| SQL Gateway + Replication gRPC | `gateway`, `rsqlite-rsync-proto` | Embed in writer role; proto crate as dependency |
-| Client failover | `rsqlite-rsync-client` | First-class app integration story |
+| SQL Gateway + Replication gRPC | `gateway`, protobuf API | Implement in the hasqlite node and own the protocol definitions |
+| Client failover | Existing client API | Provide a native `hasqlite-client` with first-class failover |
 | K8s examples + runbooks | `docs/k3s-*`, `examples/k8s/` | Port to `deploy/k8s/` with hasqlite-specific naming |
 | Integration test patterns | `ha_mode`, `grpc_failover`, `live_writes` | Mirror suite under `hasqlite/tests/` |
 
@@ -75,7 +79,7 @@ production patterns already proven in
 3. **Readiness pitfalls** — `/ready` only passes on writer; document and encode
    StatefulSet rollout strategy in deploy templates (use `/healthz` for rollout).
 4. **Auth vs fencing** — keep bearer auth mandatory by default; fencing is
-   correctness, not authentication (same security model as rsync).
+   correctness, not authentication.
 
 ---
 
@@ -291,18 +295,18 @@ flowchart TB
 
 | Layer | Responsibility | Crate(s) |
 |-------|----------------|----------|
-| **Data plane** | SQLite files, WAL, gateway engine | `hasqlite-node` (+ rsync `db`/`gateway`) |
-| **Replication** | Incremental sync scheduler, catch-up on promotion | `hasqlite-sync` (wraps `rsqlite-rsync`) |
+| **Data plane** | SQLite files, WAL, gateway engine | `hasqlite-node` |
+| **Replication** | Incremental sync scheduler, catch-up on promotion | `hasqlite-sync` (currently integrates `rsqlite-rsync`; native backend is the target) |
 | **Control** | Reconcile loop, promotion/demotion, write fence | `hasqlite-controller` |
 | **Coordination** | Lease + freshness I/O | `hasqlite-lease` |
-| **Wire / API** | Protobuf (shared), HTTP probes | `rsqlite-rsync-proto` (dep), `hasqlite-probes` |
-| **Client** | App SDK | `rsqlite-rsync-client` (dep) or thin `hasqlite-client` re-export |
+| **Wire / API** | Protobuf API, HTTP probes | Hasqlite-owned protocol crate (target), `hasqlite-probes` |
+| **Client** | App SDK | Native `hasqlite-client` (target) |
 
 ### Node roles and state machine
 
 States: `Starting` → `Replica` | `Writer(g)` → `Demoting` → `Replica`.
 
-Events per tick (from rsync `ReconcileDecision` model):
+Events per tick (informed by the upstream `ReconcileDecision` model):
 
 1. Observe lease (holder, generation, TTL, renewal timestamp).
 2. Observe freshness (source node ID, source generation, sync timestamp, age).
@@ -429,7 +433,7 @@ hasqlite/
     hasqlite-core/           # shared types, config, errors
     hasqlite-lease/          # LeaseRecord, FreshnessLedger, sources
     hasqlite-controller/     # reconcile, plan, execute (pure logic)
-    hasqlite-sync/           # scheduler, hooks, rsync integration
+    hasqlite-sync/           # scheduler, hooks, transitional replication adapter
     hasqlite-probes/         # HTTP /ready, /live, /healthz
     hasqlite-node/           # runtime: tokio supervisor, gateway bind
   hasqlite/                  # binary CLI (package name hasqlite)
@@ -446,28 +450,45 @@ hasqlite/
   benches/
 ```
 
-### Dependency on rsqlite-rsync
+### Dependency-removal plan
 
-Use a **path dependency** during development in `crates/hasqlite-sync/Cargo.toml`:
+`hasqlite-sync` currently uses the pinned `rsqlite-rsync` v0.5.0 Git dependency
+for replication pulls; its integration test also uses the upstream server and
+protocol types. Keep this dependency only as a bridge while hasqlite builds its
+own implementation. Do not treat the current wrapper as the final architecture
+or expand the upstream dependency into control, gateway, or client crates.
 
-```toml
-rsqlite-rsync = { path = "../../../rsqlite-rsync", default-features = false }
-```
+Remove the dependency only after all of the following are true:
 
-Published versions should pin to crates.io releases once HA APIs are stabilized
-or split into `rsqlite-rsync-core`.
+1. A hasqlite-owned backend provides the required consistent snapshot, page
+   comparison/transfer, transport, authentication, and error behavior.
+2. `hasqlite-sync` and end-to-end tests exercise the native backend, including
+   live writes, authentication failures, convergence, and failure handling;
+   they no longer instantiate upstream server or protocol types.
+3. The hasqlite client and wire/API definitions needed by the product are
+   implemented and tested without upstream crates.
+4. `cargo tree --workspace` contains no `rsqlite-rsync` packages, the lockfile
+   no longer records its Git source, and a clean workspace build/test passes
+   without access to the sibling repository or upstream Git repository.
+
+Until that cutover, treat `rsqlite-rsync` API usage as an adapter boundary and
+keep it isolated to `hasqlite-sync`. Map backend failures into hasqlite-owned
+error types at that boundary; public `hasqlite-sync` errors must not expose
+upstream types. Test consumers against the owned error types, not the adapter's
+implementation errors.
 
 ### Extraction strategy (from monolith)
 
 | Phase | Action |
 |-------|--------|
-| E0 | hasqlite copies *interfaces*; calls rsync HA only via FFI to binary (avoid) |
-| E1 | Re-export rsync `ha` types through thin wrappers; controller tests duplicated |
-| E2 | Move `LeaseRecord`, promotion, reconcile **tests** here; impl stays in rsync |
-| E3 | Extract `hasqlite-lease` + `hasqlite-controller` to this repo; rsync depends back for `--ha` shim |
-| E4 | Single node binary; rsync remains sync-focused CLI |
+| E0 | Define hasqlite-owned interfaces and isolate current upstream calls in `hasqlite-sync` |
+| E1 | Implement and test lease, promotion, and reconcile behavior in this workspace |
+| E2 | Implement native replication, protocol, and client behavior; run parity and failure tests |
+| E3 | Switch production and integration tests to the native backend; remove the upstream dependency and lockfile entries |
+| E4 | Release hasqlite independently, with upstream references retained only as prior art |
 
-Target for v1.0: **E2** (wrapper + comprehensive tests); v1.2: **E3**.
+Dependency removal is a release-readiness goal and is gated by the criteria
+above; intermediate milestones may continue using the pinned adapter.
 
 ---
 
@@ -484,7 +505,8 @@ Target for v1.0: **E2** (wrapper + comprehensive tests); v1.2: **E3**.
 
 ### Phase 1 — Controller parity (weeks 2–4)
 
-Port **pure logic** from `rsqlite-rsync/src/ha.rs` into `hasqlite-controller`:
+Implement native equivalents of the required pure HA logic in
+`hasqlite-controller`, using the prior implementation as a behavioral reference:
 
 - `parse_lease_record`, `parse_freshness_ledger` (with non-empty source node attribution)
 - `validate_promotion`, `enforce_write_fence`
@@ -526,17 +548,19 @@ Deliverables:
 
 ### Phase 2 — Sync orchestration (weeks 4–6)
 
-`hasqlite-sync`:
+`hasqlite-sync` (currently backed by the transitional dependency; replace this
+implementation before the dependency-removal milestone):
 
 - Policies: `Periodic`, `OnLeaseLost`, `PreShutdown`, `PostPromoteCatchUp`
-- Wrap `rsqlite_rsync::sync_local` and gRPC pull/push
+- Replace the current upstream gRPC pull integration with native snapshot,
+  page-diff, and transfer operations and a hasqlite-owned pull/push API
 - Write freshness ledger on success (source node, generation, timestamp)
-- Backoff / retry configuration aligned with rsync batch semantics
+- Native backoff and retry configuration for sync batches
 
 Deliverables:
 
 - Integration tests: writer emits writes → replica converges within N syncs
-- `live_writes` parity test (fork pattern from rsync)
+- Native `live_writes` convergence test
 
 ### Phase 3 — HA cluster supervisor & local 3-node runtime (weeks 6–9)
 
@@ -579,7 +603,7 @@ Deliverables:
 | Area | Cases | Technique |
 |------|-------|-----------|
 | Lease parsing | empty, `none`, malformed, future renew | table-driven |
-| K8s lease JSON | holder, generation annotation, missing fields | fixtures from rsync tests |
+| K8s lease JSON | holder, generation annotation, missing fields | hasqlite-owned fixtures, informed by prior-art cases |
 | Promotion | stale freshness, wrong generation, clock skew | pure function asserts |
 | Write fence | non-writer, expired lease, generation mismatch | enum `PromotionViolation` |
 | Reconcile | steal lease, renew, partition (stale holder) | state machine scenarios |
@@ -596,8 +620,8 @@ Deliverables:
 
 ### 6.2 Integration tests (`tests/integration/`)
 
-| Test module | Purpose | rsync analogue |
-|-------------|---------|----------------|
+| Test module | Purpose | Prior-art analogue |
+|-------------|---------|-----------------|
 | `local_cluster.rs` | 3 nodes, file lease, promote/failover | `ha_mode.rs` |
 | `sync_convergence.rs` | post-promote parity | `local_sync.rs` |
 | `live_writes.rs` | writes during sync | `live_writes.rs` |
@@ -641,11 +665,12 @@ Assertions:
 
 | Bench | Measures | Tool |
 |-------|----------|------|
-| `sync_catchup` | bytes moved vs churn | criterion (delegate to rsync benches) |
+| `sync_catchup` | bytes moved vs churn | native Criterion benchmark |
 | `failover_rto` | promote → first successful write | custom harness |
 | `controller_tick` | reconcile latency | criterion |
 
-Re-use rsync env tuning: `RSQLITE_RSYNC_*` documented in hasqlite ops guide.
+Use hasqlite-owned sync settings, documented under the `HASQLITE_SYNC_*`
+environment variable prefix in the operations guide.
 
 ### 6.6 Security tests
 
@@ -817,7 +842,7 @@ Alerts (recommended):
 | Stale replica promoted | Freshness gate + default deny; manual recovery runbook |
 | Dual writer during partition | Lease TTL + demote on lease loss + gateway write fence |
 | Large catch-up after failover | PreStop sync + post-promote immediate sync; monitor lag |
-| API drift with rsync | Shared proto crate; contract tests in CI |
+| Upstream API changes during transition | Pin and isolate the adapter; remove the integration at native-backend cutover |
 | StatefulSet rollout stall | Document `/healthz` vs `/ready`; chart defaults |
 
 ---

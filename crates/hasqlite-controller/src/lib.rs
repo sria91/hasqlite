@@ -3,7 +3,7 @@
 use hasqlite_core::NodeId;
 use hasqlite_lease::{FreshnessLedger, LeaseRecord};
 
-/// Placeholder for the tick outcome type (will match rsqlite-rsync `HaController`).
+/// Placeholder for the hasqlite controller tick outcome.
 #[derive(Debug, Clone)]
 pub struct ControllerTick {
     /// Active writer lease status observed during this tick.

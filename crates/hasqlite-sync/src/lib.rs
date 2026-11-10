@@ -1,4 +1,8 @@
 //! Sync orchestration policies (Phase 2).
+//!
+//! Replication currently delegates to `rsqlite-rsync`; this integration is
+//! transitional and is replaced when the native backend meets the cutover
+//! criteria in `docs/PLAN.md`.
 
 use hasqlite_core::SyncSection;
 use std::path::Path;
@@ -56,7 +60,25 @@ pub enum SyncError {
     EmptyAuthToken,
     /// The underlying replication pull failed.
     #[error("replication pull failed: {0}")]
-    Replication(#[source] rsqlite_rsync::error::SyncError),
+    Replication(#[source] ReplicationError),
+}
+
+/// Hasqlite-owned error categories for replication backend failures.
+#[derive(thiserror::Error, Debug)]
+pub enum ReplicationError {
+    /// A replication network request failed.
+    #[error("replication network error: {0}")]
+    Network(String),
+    /// The replication backend failed for a non-network reason.
+    #[error("replication operation failed: {0}")]
+    Operation(String),
+}
+
+fn map_replication_error(error: rsqlite_rsync::error::SyncError) -> ReplicationError {
+    match error {
+        rsqlite_rsync::error::SyncError::Network(message) => ReplicationError::Network(message),
+        error => ReplicationError::Operation(error.to_string()),
+    }
 }
 
 /// Pulls a database replica from the configured origin.
@@ -77,7 +99,7 @@ pub async fn pull_replica(
 
     rsqlite_rsync::grpc_pull_sync(replica_path, endpoint, database, auth_token.as_deref())
         .await
-        .map_err(SyncError::Replication)
+        .map_err(|error| SyncError::Replication(map_replication_error(error)))
 }
 
 async fn load_sync_auth_token(sync: &SyncSection) -> Result<Option<String>, SyncError> {

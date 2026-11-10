@@ -4,10 +4,11 @@
 active–passive SQLite clusters: lease-based single-writer fencing, incremental
 page-level replication, and an optional SQL gateway for application traffic.
 
-This repository is a **focused HA product** built on learnings from
-[`rsqlite-rsync`](https://github.com/sria91/rsqlite-rsync): bandwidth-efficient rsync-style page sync,
-file/Kubernetes lease coordination, freshness-gated promotion, and gRPC SQL
-access with leader discovery.
+This repository is a **focused HA product** informed by
+[`rsqlite-rsync`](https://github.com/sria91/rsqlite-rsync). The current
+replication implementation uses `rsqlite-rsync` as a transitional dependency;
+the long-term goal is for hasqlite to implement and own replication, wire
+protocol, and client functionality without requiring that crate.
 
 ## Status
 
@@ -15,27 +16,27 @@ access with leader discovery.
 development and test strategy. Application code lands in phased milestones
 described there.
 
-## Relationship to rsqlite-rsync
+## Dependency transition
 
-| Concern | rsqlite-rsync (today) | hasqlite (target) |
-|--------|------------------------|-------------------|
-| Page sync protocol & transports | First-class | Reuse via path/git dependency |
-| HA control loop, promotion, fencing | Module in monolith | First-class crates + `hasqlite` binary |
-| SQL Gateway & client | Embedded in `--ha` | Node runtime concern; shared proto with rsync |
-| CLI sync tool | `rsqlite-rsync` binary | Optional thin wrapper or direct library calls |
-| Standalone single-node in Docker | Supported via `ClientBackend::Local` / compose | Fast-tracked deliverable (Phase 1b) with dedicated container image & config profile |
-| K8s manifests & runbooks | Examples in rsync repo | Opinionated, versioned under `deploy/` |
+| Concern | Current implementation | Long-term hasqlite goal |
+|--------|------------------------|-------------------------|
+| Page sync protocol & transports | `hasqlite-sync` uses `rsqlite-rsync` | Native hasqlite implementation |
+| HA control loop, promotion, fencing | First-class hasqlite crates | First-class hasqlite crates |
+| SQL Gateway & client | Being developed alongside replication | Hasqlite-owned API and client |
+| Sync CLI | None yet; transitional replication is a `hasqlite-sync` library integration | Native hasqlite CLI (planned) |
+| Standalone single-node in Docker | Fast-tracked deliverable (Phase 1b) | Dedicated container image & config profile |
+| K8s manifests & runbooks | Being developed in this repository | Opinionated, versioned under `deploy/` |
 
-Long term, durable HA types and orchestration logic should **live here**; sync
-and wire protocol remain shared with (or extracted from) rsqlite-rsync to avoid
-duplication.
+The dependency will remain until hasqlite's native replication path and tests
+cover the required behavior. The migration and dependency-removal criteria are
+tracked in [docs/PLAN.md](docs/PLAN.md).
 
 ## Quick links
 
 - [Comprehensive plan](docs/PLAN.md)
 - [Safety contract (draft)](docs/safety-contract.md)
-- [rsqlite-rsync HA guide](https://github.com/sria91/rsqlite-rsync/blob/master/docs/ha-guide.md)
+- [Prior-art HA guide](https://github.com/sria91/rsqlite-rsync/blob/master/docs/ha-guide.md)
 
 ## License
 
-MIT OR Apache-2.0 (aligned with rsqlite-rsync)
+MIT OR Apache-2.0

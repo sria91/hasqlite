@@ -1,9 +1,9 @@
-//! Lease records and freshness metadata (Phase 1: types; logic ports from rsqlite-rsync `ha`).
+//! Native lease records and freshness metadata, informed by prior HA designs.
 
 use hasqlite_core::NodeId;
 use serde::{Deserialize, Serialize};
 
-/// Authoritative writer lease (mirrors rsqlite-rsync `LeaseRecord`).
+/// Authoritative hasqlite writer lease.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LeaseRecord {
     /// Identifier of the current lease holder node, or `None` if unassigned.
