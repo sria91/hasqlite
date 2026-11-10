@@ -1,7 +1,8 @@
 # hasqlite Safety Contract (draft)
 
-This document is normative for implementation and tests. It codifies invariants
-already implicit in `rsqlite-rsync` HA mode.
+This document is normative for hasqlite implementation and tests. The
+invariants apply independently of any replication implementation or wire
+protocol.
 
 ## Ownership
 
@@ -15,7 +16,7 @@ already implicit in `rsqlite-rsync` HA mode.
 4. **Writer is sync origin**; replicas are **exclusive** targets (no concurrent
    writers to replica files).
 5. **Origin may be live** (reads/writes); sync produces a consistent snapshot as
-   of sync start (rsync snapshot semantics).
+   of sync start.
 6. **Freshness ledger** records last successful sync: `source_node_id`,
    `source_generation`, `synced_at_secs`.
    - **Replica binding**: Freshness must be bound to the replica that received

@@ -1,6 +1,6 @@
 [package]
 name = "hasqlite-sync"
-description = "Sync scheduling wrapping rsqlite-rsync"
+description = "Replication scheduling (currently backed by rsqlite-rsync)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,6 +8,8 @@ repository.workspace = true
 
 [dependencies]
 hasqlite-core = { path = "../hasqlite-core" }
+# Transitional implementation dependency; remove after the native backend and
+# dependency-free replication tests satisfy the cutover criteria in docs/PLAN.md.
 rsqlite-rsync = { git = "https://github.com/sria91/rsqlite-rsync", tag = "v0.5.0" }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs"] }

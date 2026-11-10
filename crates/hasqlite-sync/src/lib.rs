@@ -1,4 +1,8 @@
 //! Sync orchestration policies (Phase 2).
+//!
+//! Replication currently delegates to `rsqlite-rsync`; this integration is
+//! transitional and is replaced when the native backend meets the cutover
+//! criteria in `docs/PLAN.md`.
 
 use hasqlite_core::SyncSection;
 use std::path::Path;
