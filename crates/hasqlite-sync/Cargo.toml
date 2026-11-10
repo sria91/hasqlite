@@ -8,7 +8,7 @@ repository.workspace = true
 
 [dependencies]
 hasqlite-core = { path = "../hasqlite-core" }
-rsqlite-rsync = { git = "https://github.com/sria91/rsqlite-rsync", rev = "1ef8d2f26228c9c3410cf9f60679cfce4a485204" }
+rsqlite-rsync = { git = "https://github.com/sria91/rsqlite-rsync", tag = "v0.5.0" }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs"] }
 

@@ -706,7 +706,8 @@ max_future_skew_secs = 2
 
 [sync]
 interval_secs = 2
-origin_endpoint = "https://writer:50443" # remote origins require TLS; grpc:// is loopback-only
+origin_endpoint = "https://hasqlite-writer:50443" # remote origins require TLS; grpc:// is loopback-only
+# The TLS certificate must cover hasqlite-writer.
 transport_auth_token_env = "HASQLITE_GRPC_AUTH_TOKEN"
 # To use a file instead, comment out transport_auth_token_env above and uncomment this:
 # transport_auth_token_file = "/run/secrets/hasqlite_token"
