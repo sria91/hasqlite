@@ -62,7 +62,10 @@ pub enum LeaseError {
         observed: u64,
     },
     /// Action attempted by a node that does not hold the active lease.
-    #[error("unauthorized holder: expected {expected}, held by {actual:?}")]
+    #[error(
+        "unauthorized holder: expected {expected}, held by {}",
+        .actual.as_ref().map_or("nobody", NodeId::as_str)
+    )]
     UnauthorizedHolder {
         /// The node identity expected to hold the lease.
         expected: NodeId,
@@ -76,7 +79,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn freshness_ledger_requires_source_node() {
+    fn freshness_ledger_records_source_and_destination() {
         let ledger = FreshnessLedger {
             source_node_id: NodeId::from("node-1"),
             source_generation: 42,
@@ -128,5 +131,47 @@ mod tests {
             err.to_string(),
             "lease CAS conflict: expected generation 2, observed 3"
         );
+    }
+
+    #[test]
+    fn lease_expired_and_unauthorized_error_display() {
+        let expired = LeaseError::Expired {
+            renewed_at_secs: 100,
+            ttl_secs: 10,
+        };
+        assert_eq!(
+            expired.to_string(),
+            "lease expired: renewed at 100s with TTL 10s"
+        );
+
+        let unauthorized = LeaseError::UnauthorizedHolder {
+            expected: NodeId::from("node-1"),
+            actual: Some(NodeId::from("node-2")),
+        };
+        assert_eq!(
+            unauthorized.to_string(),
+            "unauthorized holder: expected node-1, held by node-2"
+        );
+
+        let unassigned = LeaseError::UnauthorizedHolder {
+            expected: NodeId::from("node-1"),
+            actual: None,
+        };
+        assert_eq!(
+            unassigned.to_string(),
+            "unauthorized holder: expected node-1, held by nobody"
+        );
+    }
+
+    #[test]
+    fn lease_expiry_does_not_overflow() {
+        let lease = LeaseRecord {
+            holder_node_id: Some(NodeId::from("node-1")),
+            generation: 1,
+            renewed_at_secs: u64::MAX,
+            ttl_secs: 10,
+        };
+        assert!(!lease.is_expired_at(u64::MAX - 1));
+        assert!(lease.is_expired_at(u64::MAX));
     }
 }

@@ -731,8 +731,11 @@ max_future_skew_secs = 2
 
 [sync]
 interval_secs = 2
-origin_endpoint = "https://hasqlite-writer:50443" # remote origins require TLS; grpc:// is loopback-only
+# Required in clustered mode on every node, including the current writer: any node can be demoted and
+# must then resync. Use a stable alias that always routes to the current writer, never a pod hostname.
+origin_endpoint = "https://hasqlite-writer:50443" # remote origins require TLS; grpc:// is limited to loopback IPs and `localhost`
 # The TLS certificate must cover hasqlite-writer.
+# A credential is required whenever origin_endpoint is set (exactly one of the two settings below).
 transport_auth_token_env = "HASQLITE_GRPC_AUTH_TOKEN"
 # To use a file instead, comment out transport_auth_token_env above and uncomment this:
 # transport_auth_token_file = "/run/secrets/hasqlite_token"
@@ -749,6 +752,15 @@ http_bind = "0.0.0.0:8088"
 ```
 
 CLI: `hasqlite run --config cluster.toml` plus env overrides.
+
+Validation (`ClusterConfig::from_toml`) fails closed:
+
+- Unknown keys or sections are rejected, so a misspelled setting cannot silently fall back to its default.
+- Clustered mode requires `[freshness]`, `[promotion]`, `[sync]`, and `sync.origin_endpoint`.
+- Plaintext `grpc://` origins are accepted only for literal loopback IPs and `localhost`; `*.localhost`
+  subdomains are rejected because some resolvers forward them upstream, which would expose the token.
+- `sync.origin_endpoint` requires a sync credential, and the gateway requires a credential unless
+  `allow_unauthenticated = true` is set on a loopback bind.
 
 ### Standalone single-node profile (Docker / edge)
 
