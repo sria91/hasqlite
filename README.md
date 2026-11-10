@@ -23,7 +23,7 @@ described there.
 | Page sync protocol & transports | `hasqlite-sync` uses `rsqlite-rsync` | Native hasqlite implementation |
 | HA control loop, promotion, fencing | First-class hasqlite crates | First-class hasqlite crates |
 | SQL Gateway & client | Being developed alongside replication | Hasqlite-owned API and client |
-| Sync CLI | Transitional library integration | Native hasqlite commands |
+| Sync CLI | None yet; transitional replication is a `hasqlite-sync` library integration | Native hasqlite CLI (planned) |
 | Standalone single-node in Docker | Fast-tracked deliverable (Phase 1b) | Dedicated container image & config profile |
 | K8s manifests & runbooks | Being developed in this repository | Opinionated, versioned under `deploy/` |
 

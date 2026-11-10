@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use hasqlite_core::SyncSection;
-use hasqlite_sync::{SyncError, pull_replica};
+use hasqlite_sync::{ReplicationError, SyncError, pull_replica};
 use libsqlite3_sys as ffi;
 use rsqlite_rsync::db::Connection;
 use rsqlite_rsync::gateway::{AuthConfig, DatabaseEngine, ReplicationServer};
@@ -149,11 +149,9 @@ async fn pull_replica_preserves_replication_error_type() {
     .expect_err("wrong token should fail authentication");
 
     assert!(matches!(
-        error,
-        SyncError::Replication(rsqlite_rsync::error::SyncError::Network(_))
+        &error,
+        SyncError::Replication(ReplicationError::Network(_))
     ));
-    assert!(
-        std::error::Error::source(&error).is_some(),
-        "retain the underlying replication error as a source"
-    );
+    let source = std::error::Error::source(&error).expect("retain the replication error as source");
+    assert!(source.is::<ReplicationError>());
 }

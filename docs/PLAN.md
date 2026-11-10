@@ -472,7 +472,10 @@ Remove the dependency only after all of the following are true:
    without access to the sibling repository or upstream Git repository.
 
 Until that cutover, treat `rsqlite-rsync` API usage as an adapter boundary and
-keep it isolated to `hasqlite-sync`.
+keep it isolated to `hasqlite-sync`. Map backend failures into hasqlite-owned
+error types at that boundary; public `hasqlite-sync` errors must not expose
+upstream types. Test consumers against the owned error types, not the adapter's
+implementation errors.
 
 ### Extraction strategy (from monolith)
 
