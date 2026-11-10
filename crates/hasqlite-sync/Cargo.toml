@@ -8,8 +8,11 @@ repository.workspace = true
 
 [dependencies]
 hasqlite-core = { path = "../hasqlite-core" }
+rsqlite-rsync = { git = "https://github.com/sria91/rsqlite-rsync", tag = "v0.5.0" }
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["fs"] }
 
-# In Phase 2, wire replication via git dependency or workspace patch override:
-# rsqlite-rsync = { git = "https://github.com/sria91/rsqlite-rsync", branch = "master" }
+[dev-dependencies]
+libsqlite3-sys = { version = "0.38", features = ["bundled"] }
+tempfile = "3"
+tonic = { version = "0.14", features = ["transport"] }

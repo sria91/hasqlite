@@ -108,6 +108,17 @@ mod tests {
     }
 
     #[test]
+    fn lease_record_is_held_by_unassigned() {
+        let lease = LeaseRecord {
+            holder_node_id: None,
+            generation: 1,
+            renewed_at_secs: 100,
+            ttl_secs: 10,
+        };
+        assert!(!lease.is_held_by(&NodeId::from("node-1")));
+    }
+
+    #[test]
     fn lease_error_display() {
         let err = LeaseError::CasConflict {
             expected: 2,

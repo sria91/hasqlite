@@ -70,6 +70,71 @@ pub enum NodeMode {
 /// Canonical file name for standalone advisory lease locks within the database volume.
 pub const STANDALONE_CANONICAL_LEASE_FILENAME: &str = ".hasqlite.lease";
 
+/// Returns true if a path is empty or contains only whitespace characters.
+fn is_empty_or_whitespace(path: &std::path::Path) -> bool {
+    path.as_os_str().is_empty() || path.to_str().map(|s| s.trim().is_empty()).unwrap_or(false)
+}
+
+fn is_valid_sync_origin_endpoint(endpoint: &str) -> bool {
+    let Some((scheme, authority)) = endpoint.split_once("://") else {
+        return false;
+    };
+    if !matches!(scheme, "grpc" | "https")
+        || authority.is_empty()
+        || authority.contains(['/', '?', '#', '@'])
+    {
+        return false;
+    }
+
+    let (host, port) = if let Some(bracketed_host) = authority.strip_prefix('[') {
+        let Some((host, suffix)) = bracketed_host.split_once(']') else {
+            return false;
+        };
+        let Some(port) = suffix.strip_prefix(':') else {
+            return false;
+        };
+        if host.parse::<std::net::Ipv6Addr>().is_err() {
+            return false;
+        }
+        (host, port)
+    } else {
+        let Some((host, port)) = authority.rsplit_once(':') else {
+            return false;
+        };
+        if host.is_empty() || host.contains(':') {
+            return false;
+        }
+        (host, port)
+    };
+
+    let host = host.strip_suffix('.').unwrap_or(host);
+    if host.is_empty() {
+        return false;
+    }
+
+    let ip = host.parse::<std::net::IpAddr>().ok();
+    let valid_hostname = host.len() <= 253
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        });
+    let valid_host = ip.is_some() || valid_hostname;
+    let loopback = ip.is_some_and(|ip| ip.is_loopback())
+        || host.eq_ignore_ascii_case("localhost")
+        || host.to_ascii_lowercase().ends_with(".localhost");
+
+    valid_host
+        && !port.is_empty()
+        && port.bytes().all(|byte| byte.is_ascii_digit())
+        && port.parse::<u16>().is_ok_and(|port| port != 0)
+        && (scheme == "https" || (scheme == "grpc" && loopback))
+}
+
 /// Supported coordination backend types for writer leases.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -105,6 +170,14 @@ pub struct ClusterConfig {
 }
 
 impl ClusterConfig {
+    /// Parses a `ClusterConfig` from a TOML string and runs semantic validation.
+    pub fn from_toml(toml_str: &str) -> Result<Self, HasqliteError> {
+        let config: Self =
+            toml::from_str(toml_str).map_err(|e| HasqliteError::Config(e.to_string()))?;
+        config.validate()?;
+        Ok(config)
+    }
+
     /// Returns the canonical standalone file lease path within the database data directory.
     pub fn canonical_standalone_lease_path(&self) -> PathBuf {
         self.data.dir.join(STANDALONE_CANONICAL_LEASE_FILENAME)
@@ -117,7 +190,7 @@ impl ClusterConfig {
                 "node.id must not be empty".to_string(),
             ));
         }
-        if self.data.dir.as_os_str().is_empty() {
+        if is_empty_or_whitespace(&self.data.dir) {
             return Err(HasqliteError::Validation(
                 "data.dir must not be empty".to_string(),
             ));
@@ -137,14 +210,14 @@ impl ClusterConfig {
                         "sync section is required in clustered mode".to_string(),
                     )
                 })?;
-                Self::validate_sync(sync)?;
+                sync.validate()?;
 
                 let promotion = self.promotion.as_ref().ok_or_else(|| {
                     HasqliteError::Validation(
                         "promotion section is required in clustered mode".to_string(),
                     )
                 })?;
-                Self::validate_promotion(promotion)?;
+                Self::validate_promotion_section(promotion)?;
             }
             NodeMode::Standalone => {
                 if self.lease.source != LeaseSourceType::File {
@@ -169,10 +242,10 @@ impl ClusterConfig {
                     Self::validate_freshness(freshness)?;
                 }
                 if let Some(ref sync) = self.sync {
-                    Self::validate_sync(sync)?;
+                    sync.validate()?;
                 }
                 if let Some(ref promotion) = self.promotion {
-                    Self::validate_promotion(promotion)?;
+                    Self::validate_promotion_section(promotion)?;
                 }
             }
         }
@@ -180,6 +253,21 @@ impl ClusterConfig {
         if self.gateway.auth_token_env.is_some() && self.gateway.auth_token_file.is_some() {
             return Err(HasqliteError::Validation(
                 "cannot specify both gateway.auth_token_env and gateway.auth_token_file (choose one credential source)".to_string(),
+            ));
+        }
+        if (self.gateway.auth_token_env.is_some() || self.gateway.auth_token_file.is_some())
+            && self.gateway.allow_unauthenticated
+        {
+            return Err(HasqliteError::Validation(
+                "cannot specify gateway credentials together with gateway.allow_unauthenticated = true".to_string(),
+            ));
+        }
+        if self.gateway.auth_token_env.is_none()
+            && self.gateway.auth_token_file.is_none()
+            && !self.gateway.allow_unauthenticated
+        {
+            return Err(HasqliteError::Validation(
+                "gateway requires authentication credentials (set gateway.auth_token_env or gateway.auth_token_file, or explicitly enable gateway.allow_unauthenticated = true)".to_string(),
             ));
         }
         if let Some(ref env) = self.gateway.auth_token_env
@@ -190,19 +278,28 @@ impl ClusterConfig {
             ));
         }
         if let Some(ref path) = self.gateway.auth_token_file
-            && (path.as_os_str().is_empty()
-                || path.to_str().map(|s| s.trim().is_empty()).unwrap_or(false))
+            && is_empty_or_whitespace(path)
         {
             return Err(HasqliteError::Validation(
                 "gateway.auth_token_file must not be empty when specified".to_string(),
             ));
         }
         Self::validate_lease(&self.lease)?;
-        if self.gateway.bind.parse::<std::net::SocketAddr>().is_err() {
-            return Err(HasqliteError::Validation(format!(
-                "gateway.bind '{}' is not a valid socket address (expected IP:PORT)",
-                self.gateway.bind
-            )));
+        let gateway_bind = self
+            .gateway
+            .bind
+            .parse::<std::net::SocketAddr>()
+            .map_err(|_| {
+                HasqliteError::Validation(format!(
+                    "gateway.bind '{}' is not a valid socket address (expected IP:PORT)",
+                    self.gateway.bind
+                ))
+            })?;
+        if self.gateway.allow_unauthenticated && !gateway_bind.ip().is_loopback() {
+            return Err(HasqliteError::Validation(
+                "gateway.allow_unauthenticated requires gateway.bind to use a loopback address"
+                    .to_string(),
+            ));
         }
         if self
             .probes
@@ -244,7 +341,7 @@ impl ClusterConfig {
                         "lease.source is 'file' but lease.file section is missing".to_string(),
                     )
                 })?;
-                if file.path.as_os_str().is_empty() {
+                if is_empty_or_whitespace(&file.path) {
                     return Err(HasqliteError::Validation(
                         "lease.file.path must not be empty".to_string(),
                     ));
@@ -255,7 +352,7 @@ impl ClusterConfig {
     }
 
     fn validate_freshness(freshness: &FreshnessSection) -> Result<(), HasqliteError> {
-        if freshness.path.as_os_str().is_empty() {
+        if is_empty_or_whitespace(&freshness.path) {
             return Err(HasqliteError::Validation(
                 "freshness.path must not be empty".to_string(),
             ));
@@ -268,30 +365,7 @@ impl ClusterConfig {
         Ok(())
     }
 
-    fn validate_sync(sync: &SyncSection) -> Result<(), HasqliteError> {
-        if sync.interval_secs == 0 {
-            return Err(HasqliteError::Validation(
-                "sync.interval_secs must be greater than 0".to_string(),
-            ));
-        }
-        if let Some(ref ep) = sync.origin_endpoint
-            && ep.trim().is_empty()
-        {
-            return Err(HasqliteError::Validation(
-                "sync.origin_endpoint must not be empty when specified".to_string(),
-            ));
-        }
-        if let Some(ref env) = sync.transport_auth_token_env
-            && env.trim().is_empty()
-        {
-            return Err(HasqliteError::Validation(
-                "sync.transport_auth_token_env must not be empty when specified".to_string(),
-            ));
-        }
-        Ok(())
-    }
-
-    fn validate_promotion(promotion: &PromotionSection) -> Result<(), HasqliteError> {
+    fn validate_promotion_section(promotion: &PromotionSection) -> Result<(), HasqliteError> {
         if promotion.max_future_skew_secs > 300 {
             return Err(HasqliteError::Validation(
                 "promotion.max_future_skew_secs must not exceed 300 seconds".to_string(),
@@ -370,12 +444,53 @@ pub struct PromotionSection {
 pub struct SyncSection {
     /// Interval in seconds between periodic background sync passes.
     pub interval_secs: u64,
-    /// Origin gRPC endpoint to pull replication pages from.
+    /// Origin endpoint to pull replication pages from (`https://host:port`, or `grpc://host:port` for loopback only).
     #[serde(default)]
     pub origin_endpoint: Option<String>,
-    /// Environment variable containing the replication authentication token.
+    /// Environment variable containing the replication authentication token (mutually exclusive with `transport_auth_token_file`).
     #[serde(default)]
     pub transport_auth_token_env: Option<String>,
+    /// File path containing the replication authentication token (mutually exclusive with `transport_auth_token_env`).
+    #[serde(default)]
+    pub transport_auth_token_file: Option<PathBuf>,
+}
+
+impl SyncSection {
+    /// Validates sync intervals, origin security, and credential source settings.
+    pub fn validate(&self) -> Result<(), HasqliteError> {
+        if self.interval_secs == 0 {
+            return Err(HasqliteError::Validation(
+                "sync.interval_secs must be greater than 0".to_string(),
+            ));
+        }
+        if let Some(ref endpoint) = self.origin_endpoint
+            && !is_valid_sync_origin_endpoint(endpoint)
+        {
+            return Err(HasqliteError::Validation(
+                "sync.origin_endpoint must use HTTPS for remote origins; grpc:// is limited to loopback addresses, with a valid host and non-zero port".to_string(),
+            ));
+        }
+        if self.transport_auth_token_env.is_some() && self.transport_auth_token_file.is_some() {
+            return Err(HasqliteError::Validation(
+                "cannot specify both sync.transport_auth_token_env and sync.transport_auth_token_file (choose one credential source)".to_string(),
+            ));
+        }
+        if let Some(ref env) = self.transport_auth_token_env
+            && env.trim().is_empty()
+        {
+            return Err(HasqliteError::Validation(
+                "sync.transport_auth_token_env must not be empty when specified".to_string(),
+            ));
+        }
+        if let Some(ref path) = self.transport_auth_token_file
+            && is_empty_or_whitespace(path)
+        {
+            return Err(HasqliteError::Validation(
+                "sync.transport_auth_token_file must not be empty when specified".to_string(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// SQL gateway listener and authentication configuration.
@@ -392,6 +507,9 @@ pub struct GatewaySection {
     /// Whether to permit read-only SQL queries on replicas.
     #[serde(default)]
     pub allow_replica_reads: bool,
+    /// Whether to permit unauthenticated gateway access (insecure; loopback binds only, disabled by default).
+    #[serde(default)]
+    pub allow_unauthenticated: bool,
 }
 
 /// Health and readiness HTTP probes section.
@@ -443,14 +561,16 @@ mod tests {
             }),
             sync: Some(SyncSection {
                 interval_secs: 2,
-                origin_endpoint: Some("grpc://writer:50051".to_string()),
+                origin_endpoint: Some("https://writer:50443".to_string()),
                 transport_auth_token_env: Some("HASQLITE_GRPC_AUTH_TOKEN".to_string()),
+                transport_auth_token_file: None,
             }),
             gateway: GatewaySection {
                 bind: "0.0.0.0:50051".to_string(),
                 auth_token_env: Some("HASQLITE_GRPC_AUTH_TOKEN".to_string()),
                 auth_token_file: None,
                 allow_replica_reads: false,
+                allow_unauthenticated: false,
             },
             probes: ProbesSection {
                 http_bind: "0.0.0.0:8088".to_string(),
@@ -502,6 +622,7 @@ interval_secs = 1
 
 [gateway]
 bind = "127.0.0.1:50051"
+allow_unauthenticated = true
 
 [probes]
 http_bind = "127.0.0.1:8088"
@@ -512,10 +633,20 @@ http_bind = "127.0.0.1:8088"
         assert_eq!(parsed.node.mode, NodeMode::Clustered);
         assert_eq!(parsed.lease.source, LeaseSourceType::File);
         assert!(!parsed.gateway.allow_replica_reads);
+        assert!(parsed.gateway.allow_unauthenticated);
         assert_eq!(parsed.gateway.auth_token_env, None);
         assert_eq!(parsed.gateway.auth_token_file, None);
         assert_eq!(parsed.sync.as_ref().unwrap().origin_endpoint, None);
+        assert_eq!(
+            parsed.sync.as_ref().unwrap().transport_auth_token_file,
+            None
+        );
         assert!(parsed.validate().is_ok());
+
+        let default_gw: GatewaySection =
+            toml::from_str("bind = \"127.0.0.1:50051\"").expect("default gateway section");
+        assert!(!default_gw.allow_unauthenticated);
+        assert!(!default_gw.allow_replica_reads);
 
         let serialized = toml::to_string(&parsed).expect("should serialize to toml");
         let reloaded: ClusterConfig =
@@ -558,245 +689,386 @@ http_bind = "0.0.0.0:8088"
             parsed.gateway.auth_token_file,
             Some(PathBuf::from("/run/secrets/hasqlite_token"))
         );
+        assert!(!parsed.gateway.allow_unauthenticated);
         assert!(parsed.validate().is_ok());
+    }
+
+    fn assert_validation_err<F>(mutate: F, expected_substr: &str)
+    where
+        F: FnOnce(&mut ClusterConfig),
+    {
+        let mut config = valid_test_config();
+        mutate(&mut config);
+        let err = config.validate().unwrap_err();
+        match err {
+            HasqliteError::Validation(msg) => {
+                assert!(
+                    msg.contains(expected_substr),
+                    "expected error containing '{expected_substr}', got '{msg}'"
+                );
+            }
+            other => panic!("expected Validation error, got '{other:?}'"),
+        }
     }
 
     #[test]
     fn clustered_mode_requires_freshness_sync_promotion() {
-        let mut config = valid_test_config();
-        config.freshness = None;
-        assert_eq!(
-            config.validate().unwrap_err(),
-            HasqliteError::Validation(
-                "freshness section is required in clustered mode".to_string()
-            )
+        assert_validation_err(
+            |c| c.freshness = None,
+            "freshness section is required in clustered mode",
         );
-
-        let mut config2 = valid_test_config();
-        config2.sync = None;
-        assert_eq!(
-            config2.validate().unwrap_err(),
-            HasqliteError::Validation("sync section is required in clustered mode".to_string())
+        assert_validation_err(
+            |c| c.sync = None,
+            "sync section is required in clustered mode",
         );
-
-        let mut config3 = valid_test_config();
-        config3.promotion = None;
-        assert_eq!(
-            config3.validate().unwrap_err(),
-            HasqliteError::Validation(
-                "promotion section is required in clustered mode".to_string()
-            )
+        assert_validation_err(
+            |c| c.promotion = None,
+            "promotion section is required in clustered mode",
         );
     }
 
     #[test]
     fn standalone_mode_rejects_kubernetes_lease() {
-        let mut config = valid_test_config();
-        config.node.mode = NodeMode::Standalone;
-        config.lease.source = LeaseSourceType::Kubernetes;
-        let err = config.validate().unwrap_err();
-        assert_eq!(
-            err,
-            HasqliteError::Validation(
-                "node.mode is 'standalone' but lease.source is not 'file' (standalone mode requires file-backed lease for flock mutual exclusion)".to_string()
-            )
+        assert_validation_err(
+            |c| {
+                c.node.mode = NodeMode::Standalone;
+                c.lease.source = LeaseSourceType::Kubernetes;
+            },
+            "node.mode is 'standalone' but lease.source is not 'file'",
         );
     }
 
     #[test]
     fn standalone_mode_rejects_non_canonical_lease_path() {
-        let mut config = valid_test_config();
-        config.node.mode = NodeMode::Standalone;
-        config.lease.source = LeaseSourceType::File;
-        config.lease.file = Some(FileLeaseSection {
-            path: PathBuf::from("/var/lib/hasqlite/other.lease"),
-        });
-        let err = config.validate().unwrap_err();
-        assert_eq!(
-            err,
-            HasqliteError::Validation(
-                "standalone mode requires canonical lease lock path '/var/lib/hasqlite/.hasqlite.lease', found '/var/lib/hasqlite/other.lease'".to_string()
-            )
+        assert_validation_err(
+            |c| {
+                c.node.mode = NodeMode::Standalone;
+                c.lease.source = LeaseSourceType::File;
+                c.lease.file = Some(FileLeaseSection {
+                    path: PathBuf::from("/var/lib/hasqlite/other.lease"),
+                });
+            },
+            "standalone mode requires canonical lease lock path",
         );
     }
 
     #[test]
     fn gateway_rejects_both_auth_token_env_and_file() {
-        let mut config = valid_test_config();
-        config.gateway.auth_token_env = Some("HASQLITE_AUTH_TOKEN".to_string());
-        config.gateway.auth_token_file = Some(PathBuf::from("/etc/hasqlite/token.txt"));
-        let err = config.validate().unwrap_err();
-        assert_eq!(
-            err,
-            HasqliteError::Validation(
-                "cannot specify both gateway.auth_token_env and gateway.auth_token_file (choose one credential source)".to_string()
-            )
+        assert_validation_err(
+            |c| {
+                c.gateway.auth_token_env = Some("HASQLITE_AUTH_TOKEN".to_string());
+                c.gateway.auth_token_file = Some(PathBuf::from("/etc/hasqlite/token.txt"));
+            },
+            "cannot specify both gateway.auth_token_env and gateway.auth_token_file",
         );
     }
 
     #[test]
-    fn validation_rejects_empty_node_id() {
+    fn gateway_rejects_credentials_with_allow_unauthenticated() {
+        assert_validation_err(
+            |c| {
+                c.gateway.auth_token_env = Some("HASQLITE_AUTH_TOKEN".to_string());
+                c.gateway.allow_unauthenticated = true;
+            },
+            "cannot specify gateway credentials together with gateway.allow_unauthenticated = true",
+        );
+        assert_validation_err(
+            |c| {
+                c.gateway.auth_token_env = None;
+                c.gateway.auth_token_file = Some(PathBuf::from("/etc/hasqlite/token.txt"));
+                c.gateway.allow_unauthenticated = true;
+            },
+            "cannot specify gateway credentials together with gateway.allow_unauthenticated = true",
+        );
+    }
+
+    #[test]
+    fn gateway_rejects_unauthenticated_without_flag() {
+        assert_validation_err(
+            |c| {
+                c.gateway.auth_token_env = None;
+                c.gateway.auth_token_file = None;
+                c.gateway.allow_unauthenticated = false;
+            },
+            "gateway requires authentication credentials",
+        );
+    }
+
+    #[test]
+    fn gateway_rejects_unauthenticated_public_bind() {
+        assert_validation_err(
+            |c| {
+                c.gateway.auth_token_env = None;
+                c.gateway.auth_token_file = None;
+                c.gateway.allow_unauthenticated = true;
+                c.gateway.bind = "0.0.0.0:50051".to_string();
+            },
+            "gateway.allow_unauthenticated requires gateway.bind to use a loopback address",
+        );
+    }
+
+    #[test]
+    fn gateway_allows_unauthenticated_loopback_bind() {
         let mut config = valid_test_config();
-        config.node.id = NodeId::from("   ");
-        let err = config.validate().unwrap_err();
-        assert_eq!(
-            err,
-            HasqliteError::Validation("node.id must not be empty".to_string())
+        config.gateway.auth_token_env = None;
+        config.gateway.auth_token_file = None;
+        config.gateway.allow_unauthenticated = true;
+        config.gateway.bind = "127.0.0.1:50051".to_string();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validation_rejects_empty_node_id() {
+        assert_validation_err(
+            |c| c.node.id = NodeId::from("   "),
+            "node.id must not be empty",
         );
     }
 
     #[test]
     fn validation_rejects_zero_sync_interval() {
-        let mut config = valid_test_config();
-        config.sync.as_mut().unwrap().interval_secs = 0;
-        let err = config.validate().unwrap_err();
-        assert_eq!(
-            err,
-            HasqliteError::Validation("sync.interval_secs must be greater than 0".to_string())
+        assert_validation_err(
+            |c| c.sync.as_mut().unwrap().interval_secs = 0,
+            "sync.interval_secs must be greater than 0",
         );
     }
 
     #[test]
     fn validation_rejects_zero_freshness_max_age() {
-        let mut config = valid_test_config();
-        config.freshness.as_mut().unwrap().max_age_secs = 0;
-        let err = config.validate().unwrap_err();
-        assert_eq!(
-            err,
-            HasqliteError::Validation("freshness.max_age_secs must be greater than 0".to_string())
+        assert_validation_err(
+            |c| c.freshness.as_mut().unwrap().max_age_secs = 0,
+            "freshness.max_age_secs must be greater than 0",
         );
     }
 
     #[test]
     fn validation_rejects_missing_kubernetes_section() {
-        let mut config = valid_test_config();
-        config.lease.source = LeaseSourceType::Kubernetes;
-        config.lease.kubernetes = None;
-        let err = config.validate().unwrap_err();
-        assert_eq!(
-            err,
-            HasqliteError::Validation(
-                "lease.source is 'kubernetes' but lease.kubernetes section is missing".to_string()
-            )
+        assert_validation_err(
+            |c| {
+                c.lease.source = LeaseSourceType::Kubernetes;
+                c.lease.kubernetes = None;
+            },
+            "lease.source is 'kubernetes' but lease.kubernetes section is missing",
         );
     }
 
     #[test]
     fn validation_rejects_missing_file_section() {
-        let mut config = valid_test_config();
-        config.lease.source = LeaseSourceType::File;
-        config.lease.file = None;
-        let err = config.validate().unwrap_err();
-        assert_eq!(
-            err,
-            HasqliteError::Validation(
-                "lease.source is 'file' but lease.file section is missing".to_string()
-            )
+        assert_validation_err(
+            |c| {
+                c.lease.source = LeaseSourceType::File;
+                c.lease.file = None;
+            },
+            "lease.source is 'file' but lease.file section is missing",
         );
     }
 
     #[test]
     fn validation_rejects_invalid_socket_address() {
-        let mut config = valid_test_config();
-        config.gateway.bind = "invalid-address".to_string();
-        let err = config.validate().unwrap_err();
-        assert!(matches!(err, HasqliteError::Validation(msg) if msg.contains("gateway.bind")));
-
-        let mut config2 = valid_test_config();
-        config2.probes.http_bind = "999.999.999.999:80".to_string();
-        let err2 = config2.validate().unwrap_err();
-        assert!(matches!(err2, HasqliteError::Validation(msg) if msg.contains("probes.http_bind")));
+        assert_validation_err(
+            |c| c.gateway.bind = "invalid-address".to_string(),
+            "gateway.bind 'invalid-address' is not a valid socket address",
+        );
+        assert_validation_err(
+            |c| c.probes.http_bind = "999.999.999.999:80".to_string(),
+            "probes.http_bind '999.999.999.999:80' is not a valid socket address",
+        );
     }
 
     #[test]
-    fn validation_rejects_empty_paths() {
-        let mut config = valid_test_config();
-        config.data.dir = PathBuf::from("");
-        let err = config.validate().unwrap_err();
-        assert_eq!(
-            err,
-            HasqliteError::Validation("data.dir must not be empty".to_string())
-        );
-
-        let mut config2 = valid_test_config();
-        config2.freshness.as_mut().unwrap().path = PathBuf::from("");
-        let err2 = config2.validate().unwrap_err();
-        assert_eq!(
-            err2,
-            HasqliteError::Validation("freshness.path must not be empty".to_string())
-        );
+    fn validation_rejects_empty_and_whitespace_paths() {
+        for invalid_path in ["", "   ", " \t "] {
+            assert_validation_err(
+                |c| c.data.dir = PathBuf::from(invalid_path),
+                "data.dir must not be empty",
+            );
+            assert_validation_err(
+                |c| c.freshness.as_mut().unwrap().path = PathBuf::from(invalid_path),
+                "freshness.path must not be empty",
+            );
+            assert_validation_err(
+                |c| {
+                    c.lease.source = LeaseSourceType::File;
+                    c.lease.kubernetes = None;
+                    c.lease.file = Some(FileLeaseSection {
+                        path: PathBuf::from(invalid_path),
+                    });
+                },
+                "lease.file.path must not be empty",
+            );
+        }
     }
 
     #[test]
     fn validation_rejects_excessive_clock_skew() {
-        let mut config = valid_test_config();
-        config.promotion.as_mut().unwrap().max_future_skew_secs = 301;
-        let err = config.validate().unwrap_err();
-        assert_eq!(
-            err,
-            HasqliteError::Validation(
-                "promotion.max_future_skew_secs must not exceed 300 seconds".to_string()
-            )
+        assert_validation_err(
+            |c| c.promotion.as_mut().unwrap().max_future_skew_secs = 301,
+            "promotion.max_future_skew_secs must not exceed 300 seconds",
         );
     }
 
     #[test]
     fn validation_rejects_empty_strings_in_optional_fields() {
-        let mut config = valid_test_config();
-        config.sync.as_mut().unwrap().origin_endpoint = Some("   ".to_string());
-        let err = config.validate().unwrap_err();
-        assert_eq!(
+        assert_validation_err(
+            |c| c.sync.as_mut().unwrap().origin_endpoint = Some("   ".to_string()),
+            "sync.origin_endpoint must use HTTPS for remote origins",
+        );
+        assert_validation_err(
+            |c| {
+                c.sync.as_mut().unwrap().origin_endpoint =
+                    Some("grpc://writer endpoint:50051".to_string())
+            },
+            "sync.origin_endpoint must use HTTPS for remote origins",
+        );
+        assert_validation_err(
+            |c| c.sync.as_mut().unwrap().transport_auth_token_env = Some("".to_string()),
+            "sync.transport_auth_token_env must not be empty",
+        );
+        assert_validation_err(
+            |c| c.gateway.auth_token_env = Some("   ".to_string()),
+            "gateway.auth_token_env must not be empty",
+        );
+        assert_validation_err(
+            |c| {
+                c.gateway.auth_token_env = None;
+                c.gateway.auth_token_file = Some(PathBuf::from("   "));
+            },
+            "gateway.auth_token_file must not be empty",
+        );
+        assert_validation_err(
+            |c| c.lease.kubernetes.as_mut().unwrap().lease_name = "   ".to_string(),
+            "lease.kubernetes.lease_name must not be empty",
+        );
+        assert_validation_err(
+            |c| c.lease.kubernetes.as_mut().unwrap().namespace = "".to_string(),
+            "lease.kubernetes.namespace must not be empty",
+        );
+    }
+
+    #[test]
+    fn sync_accepts_supported_origin_endpoint_formats() {
+        for endpoint in [
+            "https://writer:50443",
+            "https://writer.example.com.:50443",
+            "grpc://127.0.0.1:50051",
+            "grpc://127.0.0.2:50051",
+            "grpc://localhost:50051",
+            "grpc://localhost.:50051",
+            "grpc://writer.localhost:50051",
+            "grpc://[::1]:50051",
+        ] {
+            let mut config = valid_test_config();
+            config.sync.as_mut().unwrap().origin_endpoint = Some(endpoint.to_string());
+            assert!(
+                config.validate().is_ok(),
+                "expected endpoint '{endpoint}' to be valid"
+            );
+        }
+    }
+
+    #[test]
+    fn sync_rejects_malformed_origin_endpoints() {
+        for endpoint in [
+            "",
+            "http://writer:50051",
+            "grpc://writer:50051",
+            "grpc://writer.example.com.:50051",
+            "grpc://",
+            "grpc://writer",
+            "grpc://writer:abc",
+            "https://writer:+443",
+            "grpc://writer:0",
+            "grpc://writer:65536",
+            "grpc://bad_host:50051",
+            "grpc://user@writer:50051",
+            "grpc://writer:50051/path",
+            "grpc://[not-ipv6]:50051",
+        ] {
+            assert_validation_err(
+                |config| config.sync.as_mut().unwrap().origin_endpoint = Some(endpoint.to_string()),
+                "sync.origin_endpoint must use HTTPS for remote origins",
+            );
+        }
+    }
+
+    #[test]
+    fn sync_rejects_both_auth_token_env_and_file() {
+        assert_validation_err(
+            |c| {
+                c.sync.as_mut().unwrap().transport_auth_token_env = Some("ENV_TOKEN".to_string());
+                c.sync.as_mut().unwrap().transport_auth_token_file =
+                    Some(PathBuf::from("/etc/token"));
+            },
+            "cannot specify both sync.transport_auth_token_env and sync.transport_auth_token_file",
+        );
+    }
+
+    #[test]
+    fn sync_rejects_whitespace_auth_token_file() {
+        assert_validation_err(
+            |c| {
+                c.sync.as_mut().unwrap().transport_auth_token_env = None;
+                c.sync.as_mut().unwrap().transport_auth_token_file = Some(PathBuf::from("   "));
+            },
+            "sync.transport_auth_token_file must not be empty when specified",
+        );
+    }
+
+    #[test]
+    fn from_toml_parses_and_validates() {
+        let toml_str = r#"
+[node]
+id = "node-alpha"
+
+[data]
+dir = "/tmp/data"
+
+[lease]
+source = "file"
+
+[lease.file]
+path = "/tmp/lease.txt"
+
+[freshness]
+path = "/tmp/freshness.txt"
+max_age_secs = 5
+
+[promotion]
+min_source_generation = 1
+max_future_skew_secs = 3
+
+[sync]
+interval_secs = 1
+
+[gateway]
+bind = "127.0.0.1:50051"
+allow_unauthenticated = true
+
+[probes]
+http_bind = "127.0.0.1:8088"
+"#;
+        let config = ClusterConfig::from_toml(toml_str).expect("should parse valid toml");
+        assert_eq!(config.node.id.as_str(), "node-alpha");
+
+        let invalid_toml = "invalid toml syntax [[";
+        let err = ClusterConfig::from_toml(invalid_toml).unwrap_err();
+        assert!(matches!(err, HasqliteError::Config(_)));
+
+        let semantically_invalid_toml = toml_str.replace("interval_secs = 1", "interval_secs = 0");
+        let err = ClusterConfig::from_toml(&semantically_invalid_toml).unwrap_err();
+        assert!(matches!(
             err,
-            HasqliteError::Validation(
-                "sync.origin_endpoint must not be empty when specified".to_string()
-            )
-        );
+            HasqliteError::Validation(message)
+                if message == "sync.interval_secs must be greater than 0"
+        ));
+    }
 
-        let mut config2 = valid_test_config();
-        config2.sync.as_mut().unwrap().transport_auth_token_env = Some("".to_string());
-        let err2 = config2.validate().unwrap_err();
+    #[test]
+    fn canonical_standalone_lease_path_matches_expected() {
+        let config = valid_test_config();
         assert_eq!(
-            err2,
-            HasqliteError::Validation(
-                "sync.transport_auth_token_env must not be empty when specified".to_string()
-            )
-        );
-
-        let mut config3 = valid_test_config();
-        config3.gateway.auth_token_env = Some("   ".to_string());
-        let err3 = config3.validate().unwrap_err();
-        assert_eq!(
-            err3,
-            HasqliteError::Validation(
-                "gateway.auth_token_env must not be empty when specified".to_string()
-            )
-        );
-
-        let mut config4 = valid_test_config();
-        config4.gateway.auth_token_env = None;
-        config4.gateway.auth_token_file = Some(PathBuf::from("   "));
-        let err4 = config4.validate().unwrap_err();
-        assert_eq!(
-            err4,
-            HasqliteError::Validation(
-                "gateway.auth_token_file must not be empty when specified".to_string()
-            )
-        );
-
-        let mut config5 = valid_test_config();
-        config5.lease.kubernetes.as_mut().unwrap().lease_name = "   ".to_string();
-        let err5 = config5.validate().unwrap_err();
-        assert_eq!(
-            err5,
-            HasqliteError::Validation("lease.kubernetes.lease_name must not be empty".to_string())
-        );
-
-        let mut config6 = valid_test_config();
-        config6.lease.kubernetes.as_mut().unwrap().namespace = "".to_string();
-        let err6 = config6.validate().unwrap_err();
-        assert_eq!(
-            err6,
-            HasqliteError::Validation("lease.kubernetes.namespace must not be empty".to_string())
+            config.canonical_standalone_lease_path(),
+            PathBuf::from("/var/lib/hasqlite/.hasqlite.lease")
         );
     }
 
