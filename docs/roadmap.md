@@ -146,6 +146,10 @@ Deliverables:
 
 - Metrics (Prometheus): sync lag, lease holder, promotion denials, origin WAL size
 - Soak test harness (24h, scheduled failovers)
+- Resource-footprint benchmarks for standalone and clustered scenarios; establish
+  documented CPU, memory, network, and disk-I/O budgets from reproducible
+  baselines, and meet them before claiming low resource consumption or releasing
+  v1 (see [§6.5](testing.md#65-performance--benchmarks))
 - CHANGELOG, version 0.1.0, README quickstart
 
 ---

@@ -114,8 +114,64 @@ Assertions:
 | `failover_rto` | promote → first successful write | custom harness |
 | `controller_tick` | reconcile latency | criterion |
 
+#### Resource-footprint benchmark process
+
+"Very low resource consumption" is a goal, not a verified property or an
+absolute guarantee. Benchmark hasqlite before making that claim or setting
+release budgets. The benchmark report MUST separate hasqlite's own overhead
+from the resources required by SQLite, the workload, and the deployment
+environment.
+
+1. **Define representative scenarios.** Measure at least:
+   - standalone idle after startup and warm-up, with no clients;
+   - standalone read-heavy and write-heavy service at documented concurrency
+     and offered load;
+   - clustered steady state with an idle replica and with active replication;
+   - replica catch-up under controlled write churn.
+   Record startup separately from steady state. Include representative database
+   sizes and document the chosen sizes and workload mix; do not generalize
+   beyond the measured range.
+2. **Choose comparable baselines.** For standalone SQL workloads, run the same
+   SQLite version, database, schema, SQL statements, durability settings,
+   concurrency, and host against SQLite without the hasqlite process/gateway.
+   This estimates incremental service overhead; it is not a comparison of
+   equivalent HA guarantees. For clustered scenarios, report absolute use and
+   compare only with a clearly described equivalent setup.
+3. **Measure all resource dimensions.** Record process and container CPU
+   consumption (including idle CPU and CPU-seconds per completed operation),
+   steady-state and peak resident memory, disk read/write bytes and I/O
+   operations, and network bytes. Report throughput and p50/p95/p99 latency
+   alongside resource measurements so apparent efficiency cannot hide
+   degraded service. Track database, WAL, and sync-related disk use separately
+   where applicable.
+4. **Make runs reproducible.** Use optimized builds and fixed, documented
+   inputs. Hold hardware, OS/kernel, CPU and memory limits, storage, config,
+   SQLite settings, dataset, and load generator constant between hasqlite and
+   baseline runs. Warm up before sampling, run long enough to reach steady
+   state, and repeat each scenario enough to report run-to-run variation and
+   a representative median and tail. Record the exact commit, toolchain,
+   dependency lockfile, commands, environment, and raw results with each
+   report. If the environment is noisy or results are not repeatable, report
+   that limitation and rerun on a stable runner.
+5. **Set and enforce budgets.** Use the baseline results and intended
+   deployment profiles to propose numeric per-scenario CPU, memory, network,
+   and disk-I/O budgets, covering both idle overhead and the declared target
+   load. Document the rationale, measurement window, and acceptable regression
+   tolerance; do not invent thresholds after seeing a failing run. Ratify and
+   record the budgets before treating resource efficiency as achieved. Until
+   then, report the goal and measurements as unverified, not as a pass.
+6. **Gate changes and release.** Keep a benchmark baseline and run comparable
+   measurements on a stable CI runner (nightly and before release); use PR
+   benchmark checks to catch material regressions once repeatability and
+   tolerances are established. When a budget is exceeded, profile the relevant
+   path, make a targeted optimization, and rerun both benchmarks and the
+   correctness tests. The v1 release criterion is that every documented
+   resource budget passes on its specified scenario and environment.
+
 Use hasqlite-owned sync settings, documented under the `HASQLITE_SYNC_*`
-environment variable prefix in the operations guide.
+environment variable prefix in the operations guide. Record those settings in
+benchmark reports because sync interval and batching affect both resource use
+and replication behavior.
 
 ### 6.6 Security tests
 
