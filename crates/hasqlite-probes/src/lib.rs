@@ -1,4 +1,5 @@
 //! Probe endpoints: `/live`, `/healthz`, `/ready` (Phase 3).
+#![forbid(unsafe_code)]
 
 /// Liveness probe endpoint path for basic process liveness checks.
 pub const PATH_LIVE: &str = "/live";

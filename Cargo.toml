@@ -6,12 +6,17 @@ members = [
     "crates/hasqlite-controller",
     "crates/hasqlite-sync",
     "crates/hasqlite-probes",
+    "crates/hasqlite-proto",
+    "crates/hasqlite-gateway",
+    "crates/hasqlite-client",
     "crates/hasqlite-node",
     "hasqlite",
 ]
 
 [workspace.package]
 edition = "2024"
+# Minimum toolchain: edition 2024 plus let-chains (stabilised in 1.88).
+rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/sria91/hasqlite"
 version = "0.0.0"

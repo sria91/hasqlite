@@ -39,7 +39,7 @@
 flowchart TB
   subgraph apps ["Applications & Traffic Routing"]
     APP["Client Application (Rust SDK / gRPC)"]
-    ROUTER["Orchestrator / Ingress (Routes via /ready)"]
+    ROUTER["Orchestrator / Ingress (Kubernetes: writer pod label; Compose: HAProxy /ready check)"]
   end
 
   subgraph cluster ["hasqlite Cluster"]
@@ -54,7 +54,7 @@ flowchart TB
 
   APP -->|"Read / Write SQL (gRPC)"| WRITER
   APP -.->|"NOT_LEADER redirect hint"| REPLICAS
-  ROUTER -->|"Route write traffic (/ready=200)"| WRITER
+  ROUTER -->|"Route write traffic (hasqlite.io/role=writer label; HAProxy uses /ready=200)"| WRITER
   ROUTER -.->|"Health & liveness probes (/healthz, /live)"| REPLICAS
 
   WRITER -->|"Conditional lease renewal (CAS, generation g)"| LEASE
@@ -109,8 +109,8 @@ flowchart TB
   APP -.->|"Optional stale read (if allow_replica_reads=true)"| R1_GW
   R1_GW -.->|"Automatic client failover to new writer"| APP
 
-  ROUTER -->|"Route write traffic (/ready=200)"| W_PROBE
-  ROUTER -.->|"Write traffic blocked (/ready=503)"| R1_PROBE
+  ROUTER -->|"Route write traffic (writer pod label; HAProxy health-checks /ready=200)"| W_PROBE
+  ROUTER -.->|"Not routed for writes (no writer label; /ready=503)"| R1_PROBE
   ROUTER -.->|"Pod lifecycle & rolling update (/healthz, /live)"| R1_PROBE
   ROUTER -.->|"Pod lifecycle & rolling update (/healthz, /live)"| R2_PROBE
 
@@ -283,17 +283,19 @@ States: `Starting` → `Replica` | `Writer(g)` → `Demoting` → `Replica`.
 
 Events per tick (informed by the upstream `ReconcileDecision` model):
 
-1. Observe lease (holder, generation, version, activated writer epoch). Candidates
-   feed the version into a `LeaseObservation`, which measures expiry with the
-   local monotonic clock; they never compare the holder's `renewed_at_secs` with
-   their own wall clock.
+1. Observe lease (holder, generation, version, activated writer epoch, holder's
+   `ttl_secs`). Candidates feed the hasqlite-owned version token (not the backend's
+   native revision, see contract rule 2) into a `LeaseObservation`, which measures
+   expiry with the local monotonic clock against the effective TTL
+   `max(local ttl_secs, observed ttl_secs)` (rule 4); they never compare the
+   holder's `renewed_at_secs` with their own wall clock.
 2. Observe freshness ledger (source node ID, source generation, origin-stamped
    snapshot start, destination node ID).
 3. Evaluate:
    - If writer: renew (step 4). Commits are allowed only before the renewal
      deadline (see *Lease timing and write fencing*).
    - If replica and the lease is released, or its version has been unchanged for
-     `lease.ttl_secs` on the local monotonic clock: run `validate_promotion`
+     the effective TTL on the local monotonic clock: run `validate_promotion`
      against the observed lease. The ledger must be bound to this node, come from
      the lease's activated writer epoch (same node and generation), lag that
      writer's last renewal by at most `freshness.max_lag_secs`, and not be stamped
@@ -313,19 +315,12 @@ Events per tick (informed by the upstream `ReconcileDecision` model):
    - From the moment it decides to campaign until it promotes or stays a
      replica, the candidate pauses scheduled sync, so its validated ledger cannot
      change.
-4. Lease writes are compare-and-swap operations on the lease version (Kubernetes
-   `resourceVersion`, or a write counter in the file lease record):
-   - **Acquire** (candidate): succeeds only if the version is unchanged since
-     the observation. The store sets `holder = self` and
-     `generation = observed + 1`; the caller never supplies the generation. The
-     activated writer epoch is left unchanged.
-   - **Activate** (new holder, before opening a writable handle): a CAS that
-     records the writer epoch `(self, generation, now)`.
-   - **Renew** (writer): succeeds only if the version is unchanged since the
-     writer's last successful lease write, `holder == self`, and the generation
-     is unchanged. It also refreshes the writer epoch's renewal time.
-   - **Release** (planned switchover): same conditions as renew; clears the
-     holder, keeps the generation, refreshes the writer epoch's renewal time.
+4. Lease writes are the compare-and-swap operations *acquire*, *activate*, *renew*
+   and *release* defined normatively in [safety contract rule 6](safety-contract.md#lease-timing-and-write-fencing)
+   (this document does not restate them). Each write bumps the hasqlite-owned
+   version token and uses the backend's native revision as the CAS precondition.
+   Every timestamp the writer stamps comes from its `WriterClock` (rule 4).
+   Operational consequences:
    - A lost acquire means `StayReplica`. A conflict on activate, renew or
      release means immediate `Demote`; a writer never overwrites a newer holder.
    - No second freshness check after a won CAS: validation inputs are frozen
@@ -338,9 +333,9 @@ Events per tick (informed by the upstream `ReconcileDecision` model):
      manual promotion runbook).
 5. Decide: `KeepWriter`, `Promote`, `Demote`, `StayReplica`, `NoOp`.
 6. Execute actions:
-   - On `Promote` (strictly gated by acquire and activate success): optional
-     catch-up from a peer whose ledger has the same writer epoch and a newer
-     snapshot, then open writable handle, activate generation write fence, update
+   - On `Promote` (strictly gated by acquire and activate success): open the
+     writable handle on the validated snapshot (no catch-up in v1, contract rule
+     13), activate generation write fence, update
      role file to `writer:<gen>`, label the pod, append audit, update probes
      (`/ready`). The sync engine refuses to run once the role is `Writer`.
    - On `Demote`: `sqlite3_interrupt` in-flight statements, close writable
@@ -352,9 +347,9 @@ Events per tick (informed by the upstream `ReconcileDecision` model):
 
 | Setting | Default | Meaning |
 |---------|---------|---------|
-| `lease.ttl_secs` | 10 | Candidates treat the lease as expired after its version is unchanged this long (local monotonic clock) |
+| `lease.ttl_secs` | 10 | Candidates treat the lease as expired after its version is unchanged for `max(this, holder's recorded ttl_secs)` (local monotonic clock) |
 | `lease.renew_deadline_secs` | 6 | The writer stops accepting commits this long after *sending* its last successful renewal |
-| `lease.retry_period_secs` | 2 | Interval between renewal and acquisition attempts |
+| `lease.retry_period_secs` | 2 | Interval between renewal and acquisition attempts; at most half the renewal deadline so one failed attempt does not demote |
 
 A candidate can only see a renewal after the writer sent it, so the writer's
 deadline always falls before any candidate's TTL can elapse.
@@ -424,16 +419,18 @@ flowchart TB
   directly from `Starting → Writer(g)`, bypassing the intermediate `Replica` state. Standalone configurations strictly require
   `lease.source = "file"`; Kubernetes lease backends are rejected because they do not provide single-node host filesystem mutual exclusion.
 - **Generation continuity & authoritative source of truth**: The lease record (`LeaseRecord` stored in
-  `${data.dir}/.hasqlite.lease.record`) is the authoritative source of truth for writer identity and generation
-  (per `docs/safety-contract.md` rule 2).
-  - **First boot**: On a fresh volume with no prior lease file or database state, initial generation is explicitly `1`.
-  - **Volume reuse**: When bootstrapping on an existing volume, the node reads the prior lease generation `g_lease`
-    and the generation recorded in hasqlite's metadata file `${data.dir}/.hasqlite.meta` (`g_meta`), setting
-    `g_prior = max(g_lease, g_meta)`. hasqlite never stores its generation in `PRAGMA user_version`, which
-    application migration tools own.
-  - **Monotonic lease acquisition**: Standalone bootstrap writes an updated `LeaseRecord` with `generation = g_prior + 1`
-    (or `1` if `g_prior == 0`) and an activated writer epoch for itself while holding the lock, guaranteeing generation
-    monotonicity.
+  `${data.dir}/.hasqlite.lease.record`) is the *only* source of truth for writer identity and generation
+  (per `docs/safety-contract.md` rule 2). hasqlite never stores its generation in `PRAGMA user_version`, which
+  application migration tools own, and keeps no secondary metadata file.
+  - **First boot**: On a fresh volume with neither a lease record nor database files, the initial generation is `1`.
+  - **Volume reuse**: When bootstrapping on an existing volume, the node reads the prior generation `g_prior` from the
+    lease record and writes `generation = g_prior + 1`.
+  - **Fail closed on lost history**: If database files exist but the lease record is missing or unparseable, the node
+    refuses to start, because bootstrapping at generation 1 would silently reset the generation history
+    (contract rule 3, [§10.6](operations.md#106-unresolved-guarantees-and-recovery-policy)). The operator supplies
+    the generation explicitly (`hasqlite genesis --generation <g>`), which is audited.
+  - **Monotonic lease acquisition**: Standalone bootstrap writes the updated `LeaseRecord` and an activated writer
+    epoch for itself while holding the lock, guaranteeing generation monotonicity.
     When migrating the volume into an HA cluster, a fenced migration procedure seeds the new authoritative Kubernetes
     lease (e.g. lease metadata annotation/counter) with `g_prior` from the standalone file lease before any cluster CAS
     acquisition begins. This preserves the generation invariant in the safety contract (rule 3) so switching coordination
@@ -448,9 +445,18 @@ flowchart TB
   - The lock file `.hasqlite.lease` is **never replaced, renamed or deleted**. An atomic write-temp-then-rename would
     leave the holder locking an unlinked inode while a second container locks the new one. The record lives in a
     separate file, `.hasqlite.lease.record`, written by temp file + rename + directory fsync while the lock is held.
-  - The lock is taken with `flock(LOCK_EX | LOCK_NB)` (or open-file-description locks) on a descriptor held for the
-    process lifetime. Process-associated `fcntl` locks are never used, because closing *any* descriptor on the file
-    releases them. `flock` and `fcntl` locks do not exclude each other, so the two are never mixed.
+  - The lock is taken with `flock(LOCK_EX | LOCK_NB)` (or open-file-description locks). Process-associated `fcntl`
+    locks are never used, because closing *any* descriptor on the file releases them. `flock` and `fcntl` locks do
+    not exclude each other, so the two are never mixed.
+  - **Two lock disciplines, one file.** `FileLeaseSource` has two modes that must never be mixed on one volume:
+    - *Standalone (mutex mode)*: the descriptor is held for the process lifetime, so a second container on the
+      same volume fails fast with `EWOULDBLOCK`. The record is rewritten under that lock.
+    - *Clustered local file lease (CAS mode, single host, test and Compose harnesses only)*: every node takes the
+      lock only for the duration of one read-compare-write of the record (`flock(LOCK_EX)` blocking with a bounded
+      wait), then releases it; the record's write counter is the hasqlite version token and the CAS precondition at
+      once. Holding the lock across the whole process lifetime here would prevent peers from ever acquiring.
+    The mode is selected by `node.mode`; a mutex-mode holder makes CAS-mode peers fail with `EWOULDBLOCK` rather
+    than wait, which surfaces the misconfiguration immediately.
   - The pre-flight check calls `statfs` on `data.dir` and refuses NFS, CIFS/SMB and FUSE filesystems, where neither
     advisory locks nor SQLite locking are reliable across hosts. Standalone mode therefore requires a local filesystem.
 - **Zero-sync overhead**: Peer replication loops are dormant; write fence is active locally for writer generation `g`.
@@ -469,10 +475,10 @@ flowchart TB
 
   The binary runs as PID 1 in the container, where the kernel installs no default `SIGTERM`/`SIGINT` handling, so the
   node installs explicit handlers (`tokio::signal`) rather than relying on an init shim.
-- **Docker container runtime**: Designed to run inside standard Docker containers with a persistent
-  volume mount at `/var/lib/hasqlite`, running under a configurable non-root user and group (defaulting to `hasqlite:hasqlite` with UID/GID `1000:1000` via build arguments `USER`/`GROUP`/`UID`/`GID`), using numeric `USER ${UID}:${GID}` (disallowing root `UID=0`) for compatibility with Kubernetes `runAsNonRoot: true` and OCI security policies, exposing:
-  - gRPC SQL Gateway (`0.0.0.0:50051` in container, mapped to host loopback `127.0.0.1:50051:50051` via Docker) for read/write queries.
-  - HTTP Probes (`:8088` `/ready`, `/live`, `/healthz`), also published on host loopback (`127.0.0.1:8088:8088`).
+- **Docker container runtime**: Designed to run inside standard Docker containers with a persistent volume mount at
+  `/var/lib/hasqlite` under a configurable non-root numeric `USER`, exposing the gRPC SQL gateway (`:50051`) and HTTP
+  probes (`:8088`), both published on host loopback only. Image build arguments, UID/GID and host-volume permission
+  guidance live in one place: [configuration.md](configuration.md#standalone-docker-invocation).
 - **Seamless cluster upgrade path**: Upgrading from a standalone deployment to an HA cluster requires cleanly stopping
   and fencing the standalone writer before creating or acquiring writer authority under the new coordination backend
   (e.g., Kubernetes Lease API). Because the standalone file lock and Kubernetes Lease API are independent coordination
@@ -496,23 +502,27 @@ hasqlite/
     hasqlite-controller/     # reconcile, plan, execute (pure logic)
     hasqlite-sync/           # scheduler, hooks, transitional replication adapter
     hasqlite-probes/         # HTTP /ready, /live, /healthz
-    hasqlite-proto/          # wire API: SQL gateway + replication services (Phase 1a)
-    hasqlite-gateway/        # hardened SQL engine: classification, authorizer, limits (Phase 1b)
-    hasqlite-client/         # Rust client with NOT_LEADER failover
+    hasqlite-proto/          # wire API: SQL gateway + replication services (Phase 1a; placeholder crate today)
+    hasqlite-gateway/        # hardened SQL engine: classification, authorizer, limits (Phase 1b; placeholder crate today)
+    hasqlite-client/         # Rust client with NOT_LEADER failover (placeholder crate today)
     hasqlite-node/           # runtime: tokio supervisor, gateway bind
   hasqlite/                  # binary CLI (package name hasqlite)
-  deploy/
+  deploy/                    # (planned, Phase 1b/4)
     docker/                  # Multi-stage Dockerfile, docker-compose.standalone.yml
     k8s/                     # StatefulSet, RBAC, lease, sync contract
   docs/
-    PLAN.md                  # this file
+    PLAN.md                  # entry point: goals, glossary, milestones; sections are numbered globally across docs/
     safety-contract.md
-    runbooks/
-  tests/
+    runbooks/                # (planned, Phase 4)
+  tests/                     # (planned)
+    sim/                     # deterministic simulation (Phase 1)
     integration/             # multi-process, filesystem lease
     chaos/                   # fault injection (feature-gated)
-  benches/
+  benches/                   # (planned, Phase 5)
 ```
+
+All planned crates are registered in the workspace from day one (as doc-only placeholders) so the lint,
+docstring, test and coverage gates apply to their first line of real code.
 
 ### Dependency-removal plan
 

@@ -1,4 +1,5 @@
 //! Entry point for the hasqlite node daemon CLI.
+#![forbid(unsafe_code)]
 
 use tracing_subscriber::EnvFilter;
 

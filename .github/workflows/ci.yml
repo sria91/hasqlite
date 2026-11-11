@@ -45,8 +45,26 @@ jobs:
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-llvm-cov
-      # Promotion and fencing logic must stay at or above the PLAN §6.1 coverage target in each crate.
+      # Promotion and fencing logic must stay at or above the testing.md §6.1 coverage target in each crate.
       - name: controller coverage
         run: cargo llvm-cov --locked -p hasqlite-controller --fail-under-lines 95
       - name: lease coverage
         run: cargo llvm-cov --locked -p hasqlite-lease --fail-under-lines 95
+      # The crash-safe ledger publication path (safety contract rule 9) lives here.
+      - name: sync coverage
+        run: cargo llvm-cov --locked -p hasqlite-sync --fail-under-lines 90
+
+  audit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      checks: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      # The workspace carries a Git dependency (rsqlite-rsync); keep its transitive advisories visible.
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

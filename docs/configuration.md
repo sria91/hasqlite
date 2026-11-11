@@ -44,12 +44,15 @@ retry_period_secs = 2    # renewal / acquisition attempt interval
 
 # If lease.source = "kubernetes":
 [lease.kubernetes]
-lease_name = "hasqlite-writer"
+lease_name = "hasqlite-writer" # DNS-1123 subdomain
 namespace = "default"
+# Liveness is measured on the hasqlite-owned renewal counter stored in the Lease annotation
+# hasqlite.io/version; resourceVersion is only the CAS precondition, so unrelated label or
+# annotation writes to the Lease object cannot postpone failover.
 
 [freshness]
 path = "/var/lib/hasqlite/.hasqlite.freshness" # on the PVC, same filesystem as the database
-max_lag_secs = 8 # max lag of the last snapshot behind the writer's last lease renewal (both on the writer's clock)
+max_lag_secs = 8 # max lag of the last snapshot behind the writer's last lease renewal (both on the writer's clock); > interval_secs + retry_period_secs
 
 [promotion]
 max_future_skew_secs = 2
@@ -86,11 +89,20 @@ CLI: `hasqlite run --config cluster.toml` plus env overrides.
 Validation (`ClusterConfig::from_toml`) fails closed:
 
 - Unknown keys or sections are rejected, so a misspelled setting cannot silently fall back to its default.
-- Clustered mode requires `[freshness]`, `[promotion]`, `[sync]`, and `sync.origin_endpoint`, and
-  `freshness.max_lag_secs` must exceed `sync.interval_secs` (otherwise steady-state lag would deny every promotion).
-- Lease timing: `retry_period_secs > 0`, `retry_period_secs < renew_deadline_secs`,
-  `ttl_secs ≥ renew_deadline_secs + 2` (the fencing margin, [§3](architecture.md#3-architecture), computed with checked arithmetic), and
-  `ttl_secs ≤ 3600`, which also bounds the writer's renewal deadline.
+- Clustered mode requires `[freshness]`, `[promotion]`, `[sync]`, and `sync.origin_endpoint`.
+- Identifiers: `node.id` is 1–253 ASCII letters, digits, `.`, `_` or `-` (it is embedded in lease records,
+  ledgers, audit lines and metric labels, so separators and control characters are rejected);
+  `lease.kubernetes.lease_name` and `namespace` are DNS-1123 subdomains.
+- Lease timing: `retry_period_secs > 0`, `2 × retry_period_secs ≤ renew_deadline_secs` (one failed renewal
+  attempt must not demote the writer), `ttl_secs ≥ renew_deadline_secs + 2` (the fencing margin,
+  [§3](architecture.md#3-architecture), computed with checked arithmetic), and `ttl_secs ≤ 3600`, which also
+  bounds the writer's renewal deadline. At runtime a candidate waits the *effective* TTL,
+  `max(its ttl_secs, the holder's recorded ttl_secs)`, so lease timing can be changed in a rolling fashion.
+- `freshness.max_lag_secs > sync.interval_secs + lease.retry_period_secs`: between two snapshot starts the
+  writer renews every retry period, so steady-state lag reaches about that sum plus the sync duration. Allow
+  for the sync duration of your database size on top of the validated minimum.
+- Standalone mode rejects `sync.origin_endpoint` (a standalone node never pulls from a peer); `[sync]`,
+  `[freshness]` and `[promotion]` are otherwise optional there.
 - Plaintext `grpc://` origins are accepted only for literal loopback IPs and `localhost`; `*.localhost`
   subdomains are rejected because some resolvers forward them upstream, which would expose the token.
 - `sync.origin_endpoint` requires a sync credential, and the gateway requires a credential unless

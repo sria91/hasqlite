@@ -1,19 +1,14 @@
-//! Controller reconcile and promotion gates — implementation lands in Phase 1.
+//! Controller reconcile and promotion gates — the reconcile loop lands in Phase 1.
+#![forbid(unsafe_code)]
 
 use hasqlite_core::{FreshnessSection, NodeId, PromotionSection};
 use hasqlite_lease::{FreshnessLedger, LeaseRecord};
 
-/// Placeholder for the hasqlite controller tick outcome.
-#[non_exhaustive]
-#[derive(Debug, Clone)]
-pub struct ControllerTick {
-    /// Active writer lease status observed during this tick.
-    pub lease: LeaseRecord,
-    /// Freshness ledger record observed on the local node, if any.
-    pub freshness: Option<FreshnessLedger>,
-}
-
-/// Promotion validation errors reflecting §7 of the Safety Contract.
+/// Promotion validation errors reflecting rule 10 of the safety contract.
+///
+/// Checks run in the order the variants are listed here (ledger shape, then writer epoch, then time
+/// bounds), and the first failure is reported. The order is part of the contract for the
+/// `hasqlite_promotion_denied_total` metric, which is labelled by variant.
 #[derive(thiserror::Error, Debug, PartialEq, Eq)]
 pub enum PromotionError {
     /// No freshness ledger was found for the candidate replica.
@@ -79,7 +74,7 @@ pub enum PromotionError {
     },
 }
 
-/// Thresholds a freshness ledger must satisfy before its replica may be promoted (§7).
+/// Thresholds a freshness ledger must satisfy before its replica may be promoted (safety contract rule 10).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PromotionPolicy {
     /// Maximum allowed lag of the snapshot behind the writer's last lease renewal, in seconds.
@@ -99,7 +94,7 @@ impl PromotionPolicy {
     }
 }
 
-/// Validates whether a replica meets all freshness and fencing criteria to promote to writer (§7).
+/// Validates whether a replica meets all freshness and fencing criteria to promote to writer (rule 10).
 ///
 /// `observed_lease` is the lease the candidate is about to replace. The ledger must come from that lease's
 /// last activated writer, and lag is measured against that writer's last renewal; both timestamps are
@@ -375,6 +370,48 @@ mod tests {
             validate(&ledger, &lease(), 1_005).unwrap_err(),
             PromotionError::InvalidSourceNode
         );
+    }
+
+    #[test]
+    fn validate_promotion_reports_errors_in_documented_precedence() {
+        // Missing ledger wins over everything, including a lease without an activated writer.
+        let mut no_writer = lease();
+        no_writer.writer = None;
+        assert_eq!(
+            validate_promotion(None, &NodeId::from(CANDIDATE), &no_writer, 1_000, policy())
+                .unwrap_err(),
+            PromotionError::NoFreshnessRecord
+        );
+        // Ledger-shape checks (self-sourced, binding) precede the writer-epoch check.
+        let mut self_sourced = ledger(999);
+        self_sourced.source_node_id = NodeId::from(CANDIDATE);
+        assert_eq!(
+            validate(&self_sourced, &no_writer, 1_000).unwrap_err(),
+            PromotionError::SelfSourcedLedger {
+                node_id: NodeId::from(CANDIDATE)
+            }
+        );
+        let mut unbound = ledger(999);
+        unbound.destination_node_id = NodeId::from("node-3");
+        assert!(matches!(
+            validate(&unbound, &no_writer, 1_000).unwrap_err(),
+            PromotionError::ReplicaMismatch { .. }
+        ));
+        // Writer-epoch checks precede the time-bound checks: a wrong generation is reported even when
+        // the snapshot is also both future-skewed and stale.
+        let mut wrong_generation = ledger(5_000);
+        wrong_generation.source_generation = 4;
+        assert!(matches!(
+            validate(&wrong_generation, &lease(), 1_000).unwrap_err(),
+            PromotionError::GenerationMismatch { .. }
+        ));
+        // Future skew is reported before staleness.
+        let mut skewed_lease = lease();
+        skewed_lease.writer.as_mut().unwrap().renewed_at_secs = 2_000;
+        assert!(matches!(
+            validate(&ledger(1_010), &skewed_lease, 1_000).unwrap_err(),
+            PromotionError::ClockSkewExceeded { .. }
+        ));
     }
 
     #[test]

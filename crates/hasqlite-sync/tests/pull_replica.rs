@@ -181,6 +181,36 @@ async fn pull_replica_reports_rejected_token_as_auth_failure() {
         matches!(error, SyncError::AuthFailed { .. }),
         "expected AuthFailed, got {error:?}"
     );
+    // The rejected credential must not leak through the error chain (`AuthFailed` docs promise this).
+    let mut rendered = error.to_string();
+    let mut source = std::error::Error::source(&error);
+    while let Some(inner) = source {
+        rendered.push_str(&inner.to_string());
+        source = inner.source();
+    }
+    assert!(
+        !rendered.contains("wrong-token") && !format!("{error:?}").contains("wrong-token"),
+        "error output leaked the token: {rendered}"
+    );
+    setup.server.stop().await;
+}
+
+#[tokio::test]
+async fn pull_replica_with_rejected_token_leaves_existing_replica_untouched() {
+    let setup = PullTestSetup::start().await;
+    fs::write(&setup.token_file, "wrong-token").expect("write token file");
+    let previous_contents = b"previous replica contents";
+    fs::write(&setup.replica_path, previous_contents).expect("seed stale replica");
+
+    pull_replica(&setup.sync_config(), &setup.replica_path, DATABASE)
+        .await
+        .expect_err("wrong token should fail authentication");
+
+    assert_eq!(
+        fs::read(&setup.replica_path).expect("read replica"),
+        previous_contents,
+        "a rejected pull must not modify the replica file"
+    );
     setup.server.stop().await;
 }
 
