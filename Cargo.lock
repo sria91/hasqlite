@@ -718,8 +718,6 @@ name = "hasqlite-probes"
 version = "0.0.0"
 dependencies = [
  "hasqlite-core",
- "tokio",
- "tracing",
 ]
 
 [[package]]

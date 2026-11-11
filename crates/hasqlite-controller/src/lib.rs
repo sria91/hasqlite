@@ -4,6 +4,7 @@ use hasqlite_core::{FreshnessSection, NodeId, PromotionSection};
 use hasqlite_lease::{FreshnessLedger, LeaseRecord};
 
 /// Placeholder for the hasqlite controller tick outcome.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct ControllerTick {
     /// Active writer lease status observed during this tick.
@@ -174,6 +175,8 @@ mod tests {
 
     const WRITER: &str = "node-1";
     const CANDIDATE: &str = "node-2";
+    const WRITER_GENERATION: u64 = 5;
+    const WRITER_RENEWED_AT: u64 = 1_000;
 
     /// Promotion policy with a 10s lag bound and 2s future-skew tolerance.
     fn policy() -> PromotionPolicy {
@@ -183,26 +186,26 @@ mod tests {
         }
     }
 
-    /// Expired lease whose last activated writer is `node-1` at generation 5, last renewed at 1_000.
+    /// Expired lease whose last activated writer is `node-1` at generation `WRITER_GENERATION`, last renewed at `WRITER_RENEWED_AT`.
     fn lease() -> LeaseRecord {
         LeaseRecord {
             holder_node_id: Some(NodeId::from(WRITER)),
-            generation: 5,
-            renewed_at_secs: 1_000,
+            generation: WRITER_GENERATION,
+            renewed_at_secs: WRITER_RENEWED_AT,
             ttl_secs: 10,
             writer: Some(WriterEpoch {
                 node_id: NodeId::from(WRITER),
-                generation: 5,
-                renewed_at_secs: 1_000,
+                generation: WRITER_GENERATION,
+                renewed_at_secs: WRITER_RENEWED_AT,
             }),
         }
     }
 
-    /// Ledger for a snapshot of `node-1` generation 5 delivered to `node-2`.
+    /// Ledger for a snapshot of `node-1` generation `WRITER_GENERATION` delivered to `node-2`.
     fn ledger(synced_at_secs: u64) -> FreshnessLedger {
         FreshnessLedger {
             source_node_id: NodeId::from(WRITER),
-            source_generation: 5,
+            source_generation: WRITER_GENERATION,
             synced_at_secs,
             destination_node_id: NodeId::from(CANDIDATE),
         }
@@ -294,7 +297,7 @@ mod tests {
             validate(&ledger, &lease(), 1_020).unwrap_err(),
             PromotionError::GenerationMismatch {
                 ledger_generation: 4,
-                writer_generation: 5
+                writer_generation: WRITER_GENERATION
             }
         );
     }

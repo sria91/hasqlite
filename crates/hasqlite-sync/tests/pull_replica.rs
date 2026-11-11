@@ -116,72 +116,81 @@ fn sync_config(endpoint: String, token_file: PathBuf) -> SyncSection {
     }
 }
 
+/// Logical database name used across pull-replica integration tests.
+const DATABASE: &str = "source.db";
+
+/// Common scaffolding for `pull_replica` integration tests: a running server with a seeded
+/// database, a temporary directory, and an empty token file and replica path inside it.
+struct PullTestSetup {
+    server: TestServer,
+    _directory: tempfile::TempDir,
+    /// Path where the token should be written before each pull attempt.
+    pub token_file: PathBuf,
+    /// Destination path for the pulled replica.
+    pub replica_path: PathBuf,
+}
+
+impl PullTestSetup {
+    async fn start() -> Self {
+        let server = TestServer::start().await;
+        seed_database(&server.database_path(DATABASE));
+        let directory = tempfile::tempdir().expect("create replica directory");
+        let token_file = directory.path().join("sync-token");
+        let replica_path = directory.path().join("replica.db");
+        Self {
+            server,
+            _directory: directory,
+            token_file,
+            replica_path,
+        }
+    }
+
+    /// Returns a `SyncSection` pointing at the test server using `self.token_file`.
+    fn sync_config(&self) -> SyncSection {
+        sync_config(self.server.endpoint(), self.token_file.clone())
+    }
+}
+
 #[tokio::test]
 async fn pull_replica_loads_file_token_and_copies_database() {
-    let server = TestServer::start().await;
-    let database = "source.db";
-    seed_database(&server.database_path(database));
+    let setup = PullTestSetup::start().await;
+    fs::write(&setup.token_file, format!("{TEST_TOKEN}\n")).expect("write token file");
 
-    let directory = tempfile::tempdir().expect("create replica directory");
-    let token_file = directory.path().join("sync-token");
-    fs::write(&token_file, format!("{TEST_TOKEN}\n")).expect("write token file");
-    let replica_path = directory.path().join("replica.db");
-
-    pull_replica(
-        &sync_config(server.endpoint(), token_file),
-        &replica_path,
-        database,
-    )
-    .await
-    .expect("pull replica with configured token");
+    pull_replica(&setup.sync_config(), &setup.replica_path, DATABASE)
+        .await
+        .expect("pull replica with configured token");
 
     assert_eq!(
-        fs::read(&replica_path).expect("read replica"),
-        fs::read(server.database_path(database)).expect("read source database"),
+        fs::read(&setup.replica_path).expect("read replica"),
+        fs::read(setup.server.database_path(DATABASE)).expect("read source database"),
         "replica database should match the authenticated source"
     );
-    server.stop().await;
+    setup.server.stop().await;
 }
 
 #[tokio::test]
 async fn pull_replica_reports_rejected_token_as_auth_failure() {
-    let server = TestServer::start().await;
-    let database = "source.db";
-    seed_database(&server.database_path(database));
+    let setup = PullTestSetup::start().await;
+    fs::write(&setup.token_file, "wrong-token").expect("write token file");
 
-    let directory = tempfile::tempdir().expect("create replica directory");
-    let token_file = directory.path().join("wrong-token");
-    fs::write(&token_file, "wrong-token").expect("write token file");
-    let replica_path = directory.path().join("replica.db");
-
-    let error = pull_replica(
-        &sync_config(server.endpoint(), token_file),
-        &replica_path,
-        database,
-    )
-    .await
-    .expect_err("wrong token should fail authentication");
+    let error = pull_replica(&setup.sync_config(), &setup.replica_path, DATABASE)
+        .await
+        .expect_err("wrong token should fail authentication");
 
     assert!(
         matches!(error, SyncError::AuthFailed { .. }),
         "expected AuthFailed, got {error:?}"
     );
-    server.stop().await;
+    setup.server.stop().await;
 }
 
 #[tokio::test]
 async fn pull_replica_uses_rotated_token_file_without_restart() {
-    let server = TestServer::start().await;
-    let database = "source.db";
-    seed_database(&server.database_path(database));
+    let setup = PullTestSetup::start().await;
+    fs::write(&setup.token_file, "stale-token").expect("write stale token");
+    let sync = setup.sync_config();
 
-    let directory = tempfile::tempdir().expect("create replica directory");
-    let token_file = directory.path().join("sync-token");
-    fs::write(&token_file, "stale-token").expect("write stale token");
-    let replica_path = directory.path().join("replica.db");
-    let sync = sync_config(server.endpoint(), token_file.clone());
-
-    let error = pull_replica(&sync, &replica_path, database)
+    let error = pull_replica(&sync, &setup.replica_path, DATABASE)
         .await
         .expect_err("stale token should fail authentication");
     assert!(
@@ -189,15 +198,15 @@ async fn pull_replica_uses_rotated_token_file_without_restart() {
         "expected AuthFailed, got {error:?}"
     );
 
-    fs::write(&token_file, TEST_TOKEN).expect("rotate token");
-    pull_replica(&sync, &replica_path, database)
+    fs::write(&setup.token_file, TEST_TOKEN).expect("rotate token");
+    pull_replica(&sync, &setup.replica_path, DATABASE)
         .await
         .expect("pull replica with rotated token");
     assert_eq!(
-        fs::read(&replica_path).expect("read replica"),
-        fs::read(server.database_path(database)).expect("read source database"),
+        fs::read(&setup.replica_path).expect("read replica"),
+        fs::read(setup.server.database_path(DATABASE)).expect("read source database"),
     );
-    server.stop().await;
+    setup.server.stop().await;
 }
 
 #[tokio::test]

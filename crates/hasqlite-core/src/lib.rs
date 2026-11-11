@@ -118,6 +118,15 @@ fn validate_credential_source(
     Ok(())
 }
 
+/// Parses `value` as a [`std::net::SocketAddr`] and returns a user-facing validation error on failure.
+fn parse_socket_addr(field: &str, value: &str) -> Result<std::net::SocketAddr, HasqliteError> {
+    value.parse::<std::net::SocketAddr>().map_err(|e| {
+        HasqliteError::Validation(format!(
+            "{field} '{value}' is not a valid socket address (expected IP:PORT): {e}"
+        ))
+    })
+}
+
 /// Returns true if `endpoint` is `https://host:port`, or `grpc://host:port` with a loopback host.
 fn is_valid_sync_origin_endpoint(endpoint: &str) -> bool {
     let Some((scheme, authority)) = endpoint.split_once("://") else {
@@ -167,7 +176,12 @@ fn is_valid_sync_origin_endpoint(endpoint: &str) -> bool {
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
         });
-    let valid_host = ip.is_some() || valid_hostname;
+    // Reject addresses that look like IPv4 literals (all dot-separated labels are purely
+    // numeric) but failed to parse as a valid IP, e.g. `grpc://999.999.999.999:50051`.
+    let looks_like_ip_literal = host
+        .split('.')
+        .all(|label| !label.is_empty() && label.bytes().all(|b| b.is_ascii_digit()));
+    let valid_host = ip.is_some() || (valid_hostname && !looks_like_ip_literal);
     // `*.localhost` subdomains are excluded: some resolvers forward them upstream, which would send the token in cleartext.
     let loopback = ip.is_some_and(|ip| ip.is_loopback()) || host.eq_ignore_ascii_case("localhost");
 
@@ -339,33 +353,14 @@ impl ClusterConfig {
                 "gateway requires authentication credentials (set gateway.auth_token_env or gateway.auth_token_file, or explicitly enable gateway.allow_unauthenticated = true)".to_string(),
             ));
         }
-        let gateway_bind = self
-            .gateway
-            .bind
-            .parse::<std::net::SocketAddr>()
-            .map_err(|_| {
-                HasqliteError::Validation(format!(
-                    "gateway.bind '{}' is not a valid socket address (expected IP:PORT)",
-                    self.gateway.bind
-                ))
-            })?;
+        let gateway_bind = parse_socket_addr("gateway.bind", &self.gateway.bind)?;
         if self.gateway.allow_unauthenticated && !gateway_bind.ip().is_loopback() {
             return Err(HasqliteError::Validation(
                 "gateway.allow_unauthenticated requires gateway.bind to use a loopback address"
                     .to_string(),
             ));
         }
-        if self
-            .probes
-            .http_bind
-            .parse::<std::net::SocketAddr>()
-            .is_err()
-        {
-            return Err(HasqliteError::Validation(format!(
-                "probes.http_bind '{}' is not a valid socket address (expected IP:PORT)",
-                self.probes.http_bind
-            )));
-        }
+        parse_socket_addr("probes.http_bind", &self.probes.http_bind)?;
         Ok(())
     }
 
@@ -374,6 +369,11 @@ impl ClusterConfig {
         if lease.retry_period_secs == 0 {
             return Err(HasqliteError::Validation(
                 "lease.retry_period_secs must be greater than 0".to_string(),
+            ));
+        }
+        if lease.renew_deadline_secs == 0 {
+            return Err(HasqliteError::Validation(
+                "lease.renew_deadline_secs must be greater than 0".to_string(),
             ));
         }
         if lease.retry_period_secs >= lease.renew_deadline_secs {
@@ -935,7 +935,7 @@ http_bind = "0.0.0.0:8088"
     }
 
     #[test]
-    fn gateway_rejects_credentials_with_allow_unauthenticated() {
+    fn gateway_rejects_auth_token_env_with_allow_unauthenticated() {
         assert_validation_err(
             |c| {
                 c.gateway.auth_token_env = Some("HASQLITE_AUTH_TOKEN".to_string());
@@ -943,6 +943,10 @@ http_bind = "0.0.0.0:8088"
             },
             "cannot specify gateway credentials together with gateway.allow_unauthenticated = true",
         );
+    }
+
+    #[test]
+    fn gateway_rejects_auth_token_file_with_allow_unauthenticated() {
         assert_validation_err(
             |c| {
                 c.gateway.auth_token_env = None;
@@ -1042,6 +1046,14 @@ http_bind = "0.0.0.0:8088"
         assert_validation_err(
             |c| c.lease.retry_period_secs = c.lease.renew_deadline_secs,
             "lease.retry_period_secs (6) must be less than lease.renew_deadline_secs (6)",
+        );
+    }
+
+    #[test]
+    fn lease_timing_rejects_zero_renew_deadline() {
+        assert_validation_err(
+            |c| c.lease.renew_deadline_secs = 0,
+            "lease.renew_deadline_secs must be greater than 0",
         );
     }
 
@@ -1231,6 +1243,7 @@ http_bind = "0.0.0.0:8088"
             "grpc://user@writer:50051",
             "grpc://writer:50051/path",
             "grpc://[not-ipv6]:50051",
+            "grpc://999.999.999.999:50051",
         ] {
             assert_validation_err(
                 |config| config.sync.as_mut().unwrap().origin_endpoint = Some(endpoint.to_string()),

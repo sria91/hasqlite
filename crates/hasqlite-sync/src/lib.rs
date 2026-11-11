@@ -32,10 +32,16 @@ pub enum SyncError {
     /// Sync configuration is invalid or does not specify an origin endpoint.
     #[error("invalid sync configuration: {0}")]
     InvalidConfiguration(String),
-    /// The configured authentication environment variable is unavailable.
-    #[error("sync authentication environment variable '{name}' is unavailable")]
-    AuthTokenEnvironmentVariable {
-        /// Environment variable name configured for the sync token.
+    /// The configured authentication environment variable is not set.
+    #[error("sync authentication environment variable '{name}' is not set")]
+    AuthTokenEnvNotSet {
+        /// Environment variable name that was not found in the process environment.
+        name: String,
+    },
+    /// The configured authentication environment variable contains non-UTF-8 data.
+    #[error("sync authentication environment variable '{name}' contains invalid Unicode")]
+    AuthTokenEnvNotUnicode {
+        /// Environment variable name whose value could not be decoded.
         name: String,
     },
     /// Reading the configured token file failed.
@@ -157,13 +163,14 @@ async fn load_sync_auth_token(sync: &SyncSection) -> Result<Option<String>, Sync
         sync.transport_auth_token_env.as_deref(),
         sync.transport_auth_token_file.as_deref(),
     ) {
-        (Some(name), None) => {
-            Some(
-                std::env::var(name).map_err(|_| SyncError::AuthTokenEnvironmentVariable {
-                    name: name.to_string(),
-                })?,
-            )
-        }
+        (Some(name), None) => Some(std::env::var(name).map_err(|e| match e {
+            std::env::VarError::NotPresent => SyncError::AuthTokenEnvNotSet {
+                name: name.to_string(),
+            },
+            std::env::VarError::NotUnicode(_) => SyncError::AuthTokenEnvNotUnicode {
+                name: name.to_string(),
+            },
+        })?),
         (None, Some(path)) => Some(tokio::fs::read_to_string(path).await.map_err(|error| {
             SyncError::AuthTokenFile {
                 path: path.display().to_string(),
@@ -250,7 +257,7 @@ mod tests {
     }
 
     // Each env-var test uses its own variable name so parallel tests never observe each other's mutations.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn sync_auth_token_is_loaded_from_env() {
         const NAME: &str = "HASQLITE_TEST_SYNC_TOKEN_LOADED";
         // SAFETY: nothing in this test binary reads the environment through non-Rust code (e.g. libc
@@ -276,11 +283,11 @@ mod tests {
 
         assert!(matches!(
             load_sync_auth_token(&sync).await.unwrap_err(),
-            SyncError::AuthTokenEnvironmentVariable { name } if name == NAME
+            SyncError::AuthTokenEnvNotSet { name } if name == NAME
         ));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn sync_auth_token_env_rejects_blank_value() {
         const NAME: &str = "HASQLITE_TEST_SYNC_TOKEN_BLANK";
         // SAFETY: see `sync_auth_token_is_loaded_from_env`.
