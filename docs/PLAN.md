@@ -8,6 +8,33 @@ production patterns already demonstrated in
 dependency after a native implementation is ready is an explicit architectural
 goal, not a claim about the current build.
 
+This plan uses the following conventions throughout:
+
+- Normative requirements are written in uppercase: MUST, MUST NOT, SHOULD, MAY.
+- Operational targets (RTO, RPO, p95, and time-based thresholds) are explicit
+  delivery goals, not claims that the system is already implemented or verified.
+- Unresolved guarantees are called out in §10.6 and are treated as product risk,
+  not as a hidden assumption.
+- The design is intentionally safety-first: when correctness and availability
+  conflict, the system chooses fail-closed behavior and operator recovery over
+  automatic retry or silent data merge.
+
+### Glossary
+
+- `generation`: the monotonic leader epoch tracked by the lease and used for
+  fencing. It increases only when a candidate wins an acquire CAS.
+- `writer epoch`: the pair of node identity and generation that was activated as
+  the current writer; promotion gates validate that the freshest ledger matches
+  this epoch.
+- `lease version`: the compare-and-swap token in the lease store (e.g., a
+  Kubernetes `resourceVersion` or a file-record counter); a write succeeds only
+  when the observed version matches the current version.
+- `freshness ledger`: the replica-side record of the last successful sync from a
+  source writer, including origin node, generation, and snapshot metadata.
+- `outcome unknown`: a write whose client request may have reached the writer but
+  whose final status cannot be definitively known; retries are forbidden unless a
+  prior rejection proves the statement never executed.
+
 ---
 
 ## 1. Goals and future goals
@@ -50,8 +77,24 @@ goal, not a claim about the current build.
 | Steady-state sync interval | Configurable 1–5s default |
 | Promotion block on stale replica | 100% when lag behind the activated writer's last renewal > `freshness.max_lag_secs`, or the ledger is not from that writer epoch |
 | Failover under synthetic load | RTO p95 < 15s on 3-node k3s (node-local disk) with default lease timing (TTL 10s, renew deadline 6s, retry 2s) |
-| Data after planned switchover | Page-hash match vs writer at switchover |
-| Data after unplanned failover | New writer holds a prefix of acknowledged writes; loss window ≤ `max_lag_secs` + `renew_deadline_secs` |
+| Data after planned switchover | Page-hash match vs writer at switchover, provided the final sync completed successfully; a timed-out final sync does not establish a lossless handover (see §10.4, §10.6) |
+| Data after unplanned failover | New writer holds a prefix of acknowledged writes; loss window ≤ `max_lag_secs` + `renew_deadline_secs`, assuming no commit stalls inside `COMMIT` beyond the fencing margin (see §10.2) |
+
+### Product posture and unresolved guarantees
+
+This is intentionally a safety-first system. In a cluster with a stale replica,
+missing coordination, or a partially applied sync, the default decision is to
+refuse promotion and require operator intervention rather than silently merge or
+retry in a way that could duplicate a request. That trade-off is deliberate and
+is documented in §10.2–§10.6.
+
+The plan therefore distinguishes between:
+
+- hard correctness requirements that MUST be enforced in the implementation,
+- target operational windows (failover, lag, and sync intervals), and
+- unresolved guarantees that remain intentionally out of scope for v1.
+
+The factors above are not a caveat to be hidden; they are the product contract.
 
 ---
 
@@ -276,19 +319,47 @@ flowchart TB
   P2_MAIN -->|"Observe lease & atomic CAS acquire (gen g+1)"| K8S_LEASE
 ```
 
-> **Container & Sidecar Model in hasqlite**:
+> **Operational model and security defaults**:
 >
-> - **Consolidated Primary Container (`hasqlite-node`)**:
->   Unlike legacy setups that split the synchronization sidecar, lease updater daemon, and HA runtime into separate processes, `hasqlite` consolidates all node responsibilities into a single node agent container running as non-root numeric `USER 1000:1000`. The container hosts the gRPC SQL Gateway, HA Controller reconcile loop, page sync worker, and HTTP health probes.
+> - **Single node agent, no lease-sidecar split**:
+>   `hasqlite-node` owns the lease client, controller loop, sync worker, SQL gateway,
+>   and probe server in the same process. A separate lease-holding sidecar is out
+>   of scope for v1 because it would allow a healthy sidecar to outlive a wedged
+>   writer process and hide the real failure mode. This keeps the lease holder and
+>   the current writer process aligned, which is required for safe failover.
 >
-> - **TLS Termination Reverse Proxy Sidecar (Required for Remote Sync)**:
->   The `hasqlite` gRPC Gateway does not provide built-in TLS termination. Remote replication origins must use `https://` and a TLS endpoint (for example, a TLS sidecar on `:50443`); plaintext `grpc://` origins are accepted only for loopback connections. Replicas mount the replication credential Secret (separate from the SQL gateway token) so the sync worker can authenticate its pull requests. The sidecar forwards decrypted requests to `127.0.0.1:50051`, so a loopback gateway bind is *not* local-only here; this is why `gateway.allow_unauthenticated` is rejected in clustered mode. Internal certificates (for example for `hasqlite-writer`) come from a private CA, which requires `sync.tls_ca_file` (native transport, §5 Track N): the transitional adapter trusts only public WebPKI roots.
+> - **Remote traffic is protected by TLS before it reaches the gateway**:
+>   The gRPC SQL gateway does not provide built-in TLS termination. Remote
+>   replication and gateway traffic MUST use a TLS-terminating sidecar or ingress
+>   (for example, on `:50443`). Plaintext `grpc://` endpoints are allowed only for
+>   loopback or local-only standalone deployments; `gateway.allow_unauthenticated`
+>   is rejected in clustered mode because the sidecar forwards remote traffic to a
+>   loopback listener. Internal certificates come from a private CA and therefore
+>   require `sync.tls_ca_file` in the native transport path; the adapter remains
+>   public-WebPKI only until the native backend is deployed.
 >
-> - **No lease updater sidecar in v1**:
->   `hasqlite-node` talks to the Kubernetes Lease API (`coordination.k8s.io/v1`) in-process. A separate lease-holding sidecar would make the lease holder a different process from the writer: a wedged node agent behind a healthy sidecar would never fail over, and an agent reading a bridged lease file would act on a stale view. Environments that forbid Lease API access are out of scope for v1.
+> - **Auth is not a replacement for fencing**:
+>   Auth tokens protect the boundary, but the correctness model still depends on
+>   lease generation, freshness validation, and the write fence before `COMMIT`.
+>   SQL and replication credentials remain separate; the replication bearer token
+>   is never accepted by the SQL gateway and vice versa.
 >
-> - **Lifecycle Hooks & Probe Separation**:
->   Replica `preStop` hooks attempt a final catch-up sync. The writer's `preStop` hook performs a planned switchover (stop writes, wait a bounded time for replicas to finish a snapshot taken after that point, release the lease), then checkpoints the WAL. `terminationGracePeriodSeconds` must cover drain + final sync + checkpoint. Kubernetes `readinessProbe` queries `/healthz` for pod health; `livenessProbe` queries `/live`, which reports only that the controller loop is running and never touches SQLite or the lease store, so a long checkpoint cannot trigger a restart. A standard Service is not writer-aware, so the node labels its own pod `hasqlite.io/role=writer` on activation and removes the label on demotion; the `hasqlite-writer` Service selects that label. Label updates lag the lease, so routing is best-effort and safety still comes from write fencing and origin identity checks. The optional replica read Service selects replica pods independently. A PodDisruptionBudget with `maxUnavailable: 1` and a rollout that updates replicas first and the writer last (StatefulSet `partition`) keep each rollout to one planned switchover.
+> - **Readiness and liveness are different guards**:
+>   `readinessProbe` checks `/healthz` and reports service readiness. `livenessProbe`
+>   checks `/live` and reports only that the controller loop is alive; it must not
+>   access SQLite or the lease store. Replica `preStop` hooks attempt a final
+>   catch-up sync. The writer `preStop` hook performs a planned switchover,
+>   drains writes, waits for a bounded final sync, releases the lease, and then
+>   checkpoints. `terminationGracePeriodSeconds` MUST cover drain, final sync, and
+>   checkpoint. A PodDisruptionBudget (`maxUnavailable: 1`) and a replica-first
+>   rollout keep each planned switchover to one writer transition.
+>
+> - **Routing is best-effort, safety is enforced by fencing**:
+>   A standard Service is not writer-aware, so the node labels its own pod
+>   `hasqlite.io/role=writer` on activation and removes it on demotion. The
+>   writer Service selects that label, but the label can lag the lease. Routing
+>   therefore helps traffic flow; the correctness guard remains the lease and the
+>   pre-commit write fence.
 
 ### Layers
 
@@ -779,7 +850,7 @@ Seeds are logged for replay. 1,000 seeds per PR, 100,000 nightly.
 | `client_failover.rs` | retry only after a definite `NOT_LEADER`; writer killed after `COMMIT` but before the response surfaces an "outcome unknown" error and no duplicate row | `grpc_failover.rs` |
 | `grpc_replication.rs` | native replication transport, origin identity stamping, demoted origin refuses to serve | `grpc_replication.rs` |
 | `shutdown_sync.rs` | replica preStop catch-up | new |
-| `planned_switchover.rs` | writer preStop releases the lease; a replica promotes without waiting a TTL; page hashes match; when the final sync times out, the handover follows the §9.6 timeout policy (once defined) and is never reported as lossless | new |
+| `planned_switchover.rs` | writer preStop releases the lease; a replica promotes without waiting a TTL; page hashes match; when the final sync times out, the handover follows the §10.6 timeout policy (once defined) and is never reported as lossless | new |
 | `file_lease_lock.rs` | holder rewrites the record 100 times while a second process gets `EWOULDBLOCK` each time; reopening and closing the lock path inside the holder does not release it; NFS/FUSE `data.dir` refused | new (Phase 1) |
 | `gateway_hardening.rs` | §6.6 payload suite on writer and replica | new (Phase 1b) |
 | `token_rotation.rs` | rotated token file takes effect on the next pull without restart | `hasqlite-sync/tests/pull_replica.rs` |
@@ -805,10 +876,10 @@ in container-less environments.
 | Crash during page apply | `kill -9` replica at a random page in the fine pass | ledger stays invalidated; promotion denied until a full sync and `PRAGMA integrity_check` pass |
 | Disk full | ENOSPC during page apply or ledger publish | ledger stays invalidated; no promotion from that node |
 | Stalled replica session | replica stops reading mid-stream for 10× interval | origin aborts the session; WAL can be checkpointed |
-| Crash mid-write | SIGKILL writer | new writer after failover; its data is a prefix of acknowledged writes; loss ≤ `max_lag_secs` + `renew_deadline_secs` |
+| Crash mid-write | SIGKILL writer | new writer after failover; its data is a prefix of acknowledged writes; loss ≤ `max_lag_secs` + `renew_deadline_secs` (assumes no commit stalls inside `COMMIT` beyond the fencing margin; see §10.2) |
 | Aborted promotion | kill the CAS winner between acquire and activate | another replica promotes against the previous writer epoch |
 | Writer dies before first sync | kill a newly activated writer before any replica completes a sync from it | automatic promotion denied (wrong writer epoch); alert fires; manual promotion runbook required |
-| Writer clock ahead | libfaketime: writer +`max_future_skew_secs` + 1s, then kill writer | promotion denied on future skew; future-skew alert (§8) fires before the writer is killed |
+| Writer clock ahead | libfaketime: writer +`max_future_skew_secs` + 1s; wait for a replica to publish a post-adjustment ledger and for the future-skew alert (§8) to fire; then kill writer | promotion denied on future skew while the skew condition persists; if the snapshot ages within the limit before a promotion attempt, denial no longer applies on this basis |
 | Full-cluster cold restart | stop all nodes for > TTL, restart with coordination available and at least one eligible replica | an eligible replica promotes automatically after observing expiry; acquisition delay favors but does not guarantee the freshest replica |
 | Mixed-version rolling upgrade | version N writer with N-1 replicas, and the reverse | replication and failover keep working |
 | Dual lease claim | corrupt lease file | single winner via generation rules |
@@ -830,7 +901,7 @@ Assertions:
 
 - No two pods' audit logs record commits in overlapping intervals (the lease API always shows one holder, so checking it proves nothing)
 - History checker (§6.3) passes after every failover
-- Page hashes match after planned switchovers; after crash failovers, the prefix property holds
+- Page hashes match after planned switchovers where the final sync completed successfully; after crash failovers, the prefix property holds. A timed-out final sync is never reported as lossless (see §10.4, §10.6).
 - A rolling update causes at most one failover and loses no acknowledged write
 
 ### 6.5 Performance & benchmarks
@@ -877,7 +948,28 @@ jobs:
 
 ---
 
-## 7. Configuration contract (v1)
+## 7. Security defaults and deployment posture
+
+The default deployment posture is intentionally conservative:
+
+- Plaintext SQL and replication traffic is permitted only on loopback or behind a
+  trusted TLS-terminating proxy. The gateway MUST NOT be publicly exposed without
+  a front-end sidecar or ingress that terminates TLS.
+- Clustered mode MUST reject `allow_unauthenticated` even when the bind address is
+  loopback, because the sidecar or proxy is still part of the remote path.
+- Secret material MUST be read from files or mounted secrets rather than process
+  environment variables whenever possible. Environment variables are acceptable
+  only when the deployment model specifically requires them; they are never the
+  preferred credential source in Kubernetes or Docker-based production use.
+- The SQL token and replication token are separate credentials with separate
+  scopes; they are never interchangeable.
+
+This section is normative for v1 and is intentionally stricter than a permissive
+local-dev default.
+
+---
+
+## 8. Configuration contract (v1)
 
 Unified config file (TOML/YAML) replacing long flag lists:
 
@@ -1023,7 +1115,7 @@ docker run -d \
 
 ---
 
-## 8. Observability
+## 9. Observability
 
 | Signal | Format |
 |--------|--------|
@@ -1042,31 +1134,31 @@ Alerts (recommended):
 
 ---
 
-## 9. Risks and mitigations
+## 10. Risks and mitigations
 
 This section distinguishes architectural limitations, expected failure behavior,
 and unresolved guarantees. Mitigations and test assertions elsewhere in this
 plan are delivery requirements, not evidence that they are already implemented
 or verified. The [safety contract](safety-contract.md) remains normative.
 
-### 9.1 Risk summary
+### 10.1 Risk summary
 
-This is a quick-reference overview; §9.2–§9.5 expand the failure conditions and
-constraints, and §9.6 identifies unresolved guarantees and recovery policy.
+This is a quick-reference overview; §10.2–§10.5 expand the failure conditions and
+constraints, and §10.6 identifies unresolved guarantees and recovery policy.
 
 | Risk | Mitigation |
 |------|------------|
-| Stale replica promoted | Lag gate against the writer epoch's last renewal + writer-epoch match + default deny; manual recovery runbook (§9.3) |
-| Dual writer during partition | Candidates expire leases on local monotonic time; writer stops commits at its renewal deadline; renewals are CAS; gateway write fence before `COMMIT` (§9.2, §9.3) |
-| Writer stalled inside a commit longer than the fencing margin | Residual risk (no storage-level fence): margin ≥ 2s enforced, pause-injection chaos tests, audit log lets operators detect overlap (§9.2, §9.6) |
-| Torn replica promoted after crash during sync | Ledger invalidated before apply, published only after fsync (Phase 2); atomic apply in Track N (§9.2) |
-| Writer dies before any replica syncs from it | Fail closed; manual promotion runbook; alert on lag (§9.3) |
-| Lost or duplicated client writes on failover | Client retries only definite `NOT_LEADER`; "outcome unknown" surfaced; optional idempotency key, whose failover-safe deduplication semantics are unresolved (§9.2, §9.6) |
-| Large catch-up after failover | PreStop sync + pre-activation catch-up from a fresher peer; monitor lag (§9.3) |
-| Upstream API changes during transition | Pin the adapter by commit, build with `--locked`, isolate it; remove the integration at native-backend cutover (§9.5) |
-| StatefulSet rollout stall or repeated failovers | Document `/healthz` vs `/ready`; writer-last rollout with planned switchover; PodDisruptionBudget (§9.5) |
+| Stale replica promoted | Lag gate against the writer epoch's last renewal + writer-epoch match + default deny; manual recovery runbook (§10.3) |
+| Dual writer during partition | Candidates expire leases on local monotonic time; writer stops commits at its renewal deadline; renewals are CAS; gateway write fence before `COMMIT` (§10.2, §10.3) |
+| Writer stalled inside a commit longer than the fencing margin | Residual risk (no storage-level fence): margin ≥ 2s enforced, pause-injection chaos tests, audit log lets operators detect overlap (§10.2, §10.6) |
+| Torn replica promoted after crash during sync | Ledger invalidated before apply, published only after fsync (Phase 2); atomic apply in Track N (§10.2) |
+| Writer dies before any replica syncs from it | Fail closed; manual promotion runbook; alert on lag (§10.3) |
+| Lost or duplicated client writes on failover | Client retries only definite `NOT_LEADER`; "outcome unknown" surfaced; optional idempotency key, whose failover-safe deduplication semantics are unresolved (§10.2, §10.6) |
+| Large catch-up after failover | PreStop sync + pre-activation catch-up from a fresher peer; monitor lag (§10.3) |
+| Upstream API changes during transition | Pin the adapter by commit, build with `--locked`, isolate it; remove the integration at native-backend cutover (§10.5) |
+| StatefulSet rollout stall or repeated failovers | Document `/healthz` vs `/ready`; writer-last rollout with planned switchover; PodDisruptionBudget (§10.5) |
 
-### 9.2 Data safety and durability limitations
+### 10.2 Data safety and durability limitations
 
 | Condition | Consequence and requirement |
 |-----------|-----------------------------|
@@ -1084,24 +1176,24 @@ sync settings, and storage behave correctly; that does not make external,
 in-place replica page replacement transactional. Nor does local crash recovery
 restore writes absent from the promoted replica.
 
-### 9.3 Availability and promotion failure modes
+### 10.3 Availability and promotion failure modes
 
 | Condition | Consequence and requirement |
 |-----------|-----------------------------|
 | Writer loses access to coordination | It stops committing at its renewal deadline and demotes, even if its database and client network remain healthy. |
 | Lease store is unreachable from all nodes | The writer demotes; no replacement can acquire authority until the store returns. A local expiry timer alone never authorizes promotion. |
 | Writer is partitioned from replicas but can renew | Writes continue while replica lag grows. If the writer later fails, all replicas may be too stale to promote. |
-| All replicas exceed the freshness limit | Automatic promotion is denied; availability is sacrificed to limit data loss. While the activated writer is still serving, catch-up sync from it restores eligibility. Once it has failed, no node can serve a valid snapshot (origins must be the current activated writer, and a former writer's ledger is self-sourced), so manual recovery is required. |
+| All replicas exceed the freshness limit | Automatic promotion is denied; availability is sacrificed to limit data loss. While the activated writer is still serving, catch-up sync from it restores eligibility. Once it has failed, no replica's ledger matches the current writer epoch (the freshness ledger records the last successful sync's source, but that source is no longer the activated writer), so automatic promotion is blocked and manual recovery is required. |
 | Activated writer dies before any replica syncs from it | Replicas have the wrong writer epoch and automatic failover is blocked. An acquired but never-activated generation does not have this effect. |
 | Ledger is missing, invalid, bound to another destination, self-sourced, or from the wrong writer epoch | Promotion fails closed; apparent file recency is insufficient. |
-| Snapshot timestamp exceeds the allowed future skew | Promotion is denied. Lease expiry uses monotonic time, but the promotion future-timestamp check compares the writer-stamped snapshot time with the candidate's local wall time (safety contract rule 10). A writer whose clock runs more than `max_future_skew_secs` ahead of every replica therefore makes all replicas unpromotable without any failure being visible until failover; alert on `hasqlite_snapshot_future_skew_seconds` (§8). |
+| Snapshot timestamp exceeds the allowed future skew | Promotion is denied while the snapshot's timestamp still exceeds the skew limit at promotion time. Lease expiry uses monotonic time, but the promotion future-timestamp check compares the writer-stamped snapshot time with the candidate's local wall time (safety contract rule 10). If the snapshot ages until its timestamp is within the skew limit, promotion is no longer denied on this basis alone; denial therefore applies only as long as the skew condition persists. A writer whose clock runs more than `max_future_skew_secs` ahead of every replica keeps all replicas unpromotable for as long as it continues stamping snapshots beyond the limit; alert on `hasqlite_snapshot_future_skew_seconds` (§8). |
 | Acquisition or activation CAS loses a race | The candidate remains a replica. Acquisition without activation never permits writable SQL handles. |
 | Candidate crashes between acquisition and activation | The previous writer epoch remains valid for eligible peers, but another acquisition may have to wait for the abandoned holder's TTL. |
 | Writer crashes without releasing the lease | Each candidate waits for an unchanged lease version for a full locally measured TTL before campaigning; failover is not instantaneous. |
 | Slow storage, coordination, or catch-up | Recovery can exceed the p95 RTO target of 15 seconds. That target applies to the specified test environment, not every deployment. |
 | Lag-proportional acquisition delay | It favors the freshest eligible replica but does not guarantee that replica wins the CAS race. |
 
-### 9.4 Replication and request-serving limits
+### 10.4 Replication and request-serving limits
 
 | Condition | Consequence and requirement |
 |-----------|-----------------------------|
@@ -1112,9 +1204,9 @@ restore writes absent from the promoted replica.
 | Sync transport, credential, or TLS failure | Retry and alert; snapshots stop advancing and affected replicas can become unpromotable. |
 | Stalled snapshot session | Its read transaction can block WAL checkpoint progress and grow the origin WAL. Track N must enforce a snapshot deadline and stop replication sessions before the shutdown checkpoint. |
 | Switchover write-service gap | Requests can be rejected while the old writer stops and a successor activates. The plan does not provide a durable SQL request queue. |
-| Final-sync or drain timeout during planned switchover | A timeout does not establish a lossless handover. The intended successor must durably contain every final committed write to meet the planned-switchover target; see unresolved policy in §9.6. |
+| Final-sync or drain timeout during planned switchover | A timeout does not establish a lossless handover. The intended successor must durably contain every final committed write to meet the planned-switchover target; see unresolved policy in §10.6. |
 
-### 9.5 Deployment, access, and compatibility constraints
+### 10.5 Deployment, access, and compatibility constraints
 
 | Condition | Consequence and requirement |
 |-----------|-----------------------------|
@@ -1135,7 +1227,7 @@ restore writes absent from the promoted replica.
 | Transitional upstream dependency | Keep the adapter pinned and isolated until native cutover. Native replication, runtime integration, deployment tooling, and tests are milestone deliverables, not guarantees supplied by this document alone. |
 | Upstream CLI compatibility | Drop-in compatibility with the `rsqlite-rsync` standalone sync CLI is not a v1 goal. |
 
-### 9.6 Unresolved guarantees and recovery policy
+### 10.6 Unresolved guarantees and recovery policy
 
 The following are gaps to resolve explicitly, not additional guarantees:
 
@@ -1168,7 +1260,7 @@ The following are gaps to resolve explicitly, not additional guarantees:
 
 ---
 
-## 10. Milestone checklist (summary)
+## 11. Milestone checklist (summary)
 
 | Milestone | Deliverable | Tests |
 |-----------|-------------|-------|
@@ -1183,7 +1275,7 @@ The following are gaps to resolve explicitly, not additional guarantees:
 
 ---
 
-## 11. References
+## 12. References
 
 - [rsqlite-rsync README](https://github.com/sria91/rsqlite-rsync/blob/master/README.md)
 - [rsqlite-rsync HA guide](https://github.com/sria91/rsqlite-rsync/blob/master/docs/ha-guide.md)
