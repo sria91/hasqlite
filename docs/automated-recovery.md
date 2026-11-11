@@ -180,37 +180,45 @@ In post-v1, an automated **Emergency Promotion Protocol** can be enabled:
    - The candidate evaluates its potential worst-case data loss window against the activated writer's
      last renewal plus the writer's renewal deadline:
      $$\text{potential\_loss\_window} = (\text{writer.renewed\_at\_secs} + \text{lease.renew\_deadline\_secs}) - \text{candidate.synced\_at\_secs}$$
-   - Assuming non-decreasing writer clocks and that no commit stalled beyond the fencing margin (Rule 5),
-     this accounts for all commits potentially accepted prior to writer demotion.
+   - **Time Basis & Bounded Rate Error**: Timestamps must use a basis with bounded rate error
+     (rollback-safe writer time basis and NTP-synchronized clocks with maximum bounded drift). If the
+     writer's renewal clock freezes, the candidate incorporates its own locally observed monotonic
+     elapsed time since the writer's last observed version change to prevent understating elapsed time.
    - If $\text{potential\_loss\_window} > \text{recovery.max\_emergency\_lag\_secs}$, the candidate **rejects acquisition** and aborts promotion, strictly enforcing the configured emergency data loss bound.
    - If $\text{potential\_loss\_window} \le \text{recovery.max\_emergency\_lag\_secs}$, the candidate issues an `acquire` CAS writing metadata annotation `emergency_promotion = true`.
    - It records an explicit audit entry: `EMERGENCY_PROMOTION_ACCEPTED: potential_loss_window=<secs>, max_emergency_lag=<config_max>`.
 4. **Activation**: The candidate activates and resumes write service.
 
 ### 3.2 Dead-Epoch Roll-Forward Protocol
-When a newly promoted node activates as writer at generation $g$ but crashes before any
+When a newly promoted node activates as writer at generation $g_{\text{dead}}$ but crashes before any
 replica completes a sync:
-- The lease records writer epoch `(node_dead, g, t_renew)`.
-- All surviving replicas hold ledgers from generation $g-1$.
-- Standard promotion is blocked because `source_generation (g-1) != writer.generation (g)`.
+- The lease records writer epoch `(node_dead, g_dead, t_renew)`.
+- Surviving replicas hold ledgers from the prior activated writer epoch $g_{\text{prior}}$
+  (which may be $\le g_{\text{dead}} - 1$ if prior acquisition attempts occurred).
+- Standard promotion is blocked because `source_generation != writer.generation`.
 
 #### Automated Roll-Forward & Loss Policy:
 1. **Dead Generation Detection**:
    - Lease version remains unchanged for `recovery.dead_epoch_timeout_secs` (default: $2 \times \text{TTL}$).
    - The last recorded writer renewal timestamp `writer.renewed_at_secs` is stagnant.
-2. **Quorum Attestation & Loss Acknowledgment**:
-   - Candidates exchange signed attestations: `Attestation { peer: id, max_observed_generation: g-1 }`.
-   - If a quorum of replicas confirms zero snapshots received from generation $g$, generation $g$
-     is certified as an **Orphaned Dead Epoch**.
-   - *Bounded Loss Policy*: Attestations that replicas received no snapshots do not prove that generation $g$
-     accepted zero client writes. Dead-epoch roll-forward is an explicit, policy-driven recovery transition
-     that forfeits un-replicated writes in generation $g$ in exchange for restoring cluster availability,
+2. **Quorum Attestation & Loss Limit Gate**:
+   - Candidates exchange signed attestations: `Attestation { peer: id, max_observed_generation: g_prior }`.
+   - **Loss Limit Enforcement**: Dead-epoch roll-forward is permitted only if the dead generation's active
+     duration does not exceed an enforceable limit:
+     $$\text{dead\_epoch\_duration} = \text{writer.renewed\_at\_secs} - \text{writer.activated\_at\_secs}$$
+     If $\text{dead\_epoch\_duration} > \text{recovery.max\_dead\_epoch\_duration\_secs}$, or if elapsed active
+     time cannot be bounded, automated roll-forward is blocked and operator approval is required.
+   - **Partition Risk**: Attestations do not prove that an unreachable partition lacks a completed snapshot
+     at generation $g_{\text{dead}}$; roll-forward explicitly gates this loss under the recovery policy,
      emitting an `ORPHANED_EPOCH_DISCARDED` audit log entry.
-3. **Superseding Acquisition**:
+3. **Superseding Acquisition and Activation**:
    - Authorized under the post-v1 dead-epoch exception to [safety contract](safety-contract.md) Rule 10,
-     the candidate executes a CAS targeting generation $g+1$, asserting source epoch $g-1$.
-   - The lease store grants generation $g+1$ and updates `writer = (candidate_id, g+1, now)`.
-   - Write traffic resumes without manual runbook execution.
+     the candidate executes an `acquire` CAS targeting the next generation derived by the lease store
+     ($g_{\text{new}} = g_{\text{observed}} + 1$).
+   - Following Rule 6, acquisition grants $g_{\text{new}}$ but leaves `writer` **unchanged**.
+   - Before opening writable SQL handles, the candidate executes the standard activation CAS (Rule 10),
+     updating `writer = (candidate_id, g_new, now)`. If the candidate crashes prior to activation,
+     the previous writer epoch remains intact for other eligible peers.
 
 ### 3.3 Clock Skew Auto-Backoff
 If a writer's clock is running fast and stamps snapshot timestamps ahead of a candidate's
@@ -241,11 +249,17 @@ these files.
    - **Authorizer Enforcement**: The SQL gateway authorizer validates non-null primary key constraints
      for both new and existing tables, rejecting `CREATE TABLE` statements or schemas with nullable
      primary-key columns whenever divergence tracking is enabled so changes are never omitted.
-2. **Session Attachment**:
-   ```c
-   sqlite3session_create(db, "main", &session);
-   sqlite3session_attach(session, NULL); // attach all valid tables
-   ```
+2. **Per-Transaction Session Lifecycle**:
+   SQLite sessions accumulate changes across operations. To prevent earlier transactions from being
+   re-archived or combined across transaction boundaries:
+   - A dedicated session is created at transaction start:
+     ```c
+     sqlite3session_create(db, "main", &session);
+     sqlite3session_attach(session, NULL); // attach all valid tables
+     ```
+   - On commit, the changeset is extracted via `sqlite3session_changeset()` and archived.
+   - The session is explicitly destroyed via `sqlite3session_delete(session)` on **both** commit
+     and rollback paths, guaranteeing every transaction begins with an empty session.
 3. **Crash-Safe Changeset Archival**:
    To prevent an unrecoverable gap between a SQLite transaction commit and durable changelog storage:
    - **Atomic In-Transaction Capture**: Changesets are serialized and recorded in an internal append-only
@@ -262,11 +276,19 @@ these files.
 
 ### 4.2 Automated Divergence Reconciler
 When a former writer re-attaches as a replica:
-1. **Detection**: The supervisor identifies `/var/lib/hasqlite/*.diverged-g<gen>`.
-2. **Diff Extraction**: The reconciler invokes SQLite's `sqlite3session_diff()` API to compute the
-   changeset diff comparing the diverged database state against the common snapshot ancestor.
+1. **Detection & Ancestor Preservation**:
+   - The supervisor identifies `/var/lib/hasqlite/*.diverged-g<gen>`.
+   - To ensure the common ancestor snapshot is not mutated by subsequent replica writes or writer promotions,
+     the last verified snapshot from the shared epoch is persisted as an immutable ancestor file:
+     `/var/lib/hasqlite/*.ancestor-g<gen>.db` and retained until divergence export is finished.
+2. **Schema Audit & Diff Extraction**:
+   - `sqlite3session_diff()` requires identical schemas on compared tables. The reconciler first queries
+     `sqlite_master` on both databases to detect schema modifications (tables added, dropped, or altered).
+   - For compatible tables, `sqlite3session_diff()` computes row-level changesets against the ancestor file.
+   - For tables created on the diverged branch, rows are exported via table dumps directly into the DLQ
+     outside `sqlite3session_diff()` to ensure no committed rows are stranded.
 3. **Dead-Letter Queue (DLQ) Export**:
-   - Orphaned rows are exported to a structured audit file:
+   - Orphaned rows and schema DDL are exported to a structured audit file:
      `/var/lib/hasqlite/diverged/diverged-g<gen>-export.jsonl`.
    - An alert is emitted: `hasqlite_diverged_commits_exported_total`.
 4. **Automated Replay (Configurable)**:
