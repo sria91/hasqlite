@@ -55,6 +55,14 @@ the system prefers fail-closed behavior and operator recovery.
    capability to run a single `hasqlite` node in a standalone Docker container
    (file-based lease or auto-granted genesis lease, zero peer dependencies, gRPC SQL gateway,
    HTTP probes) for local development, edge, and single-host production before multi-node failover.
+7. **Low resource footprint**: Minimize hasqlite's incremental CPU, memory,
+   network, and disk-I/O overhead, including when idle. "Very low" is a
+   performance goal to define and measure, not a claim about the current
+   implementation. Background work SHOULD avoid busy polling and unbounded
+   buffering; standalone mode MUST NOT run peer-replication work. Establish
+   workload-specific budgets against reproducible baselines before declaring
+   this goal met; see
+   [§6.5](testing.md#65-performance--benchmarks).
 
 ### Future goals (non-goals for v1)
 
@@ -77,6 +85,7 @@ the system prefers fail-closed behavior and operator recovery.
 | Failover under synthetic load | RTO p95 < 15s on 3-node k3s (node-local disk) with default lease timing (TTL 10s, renew deadline 6s, retry 2s) |
 | Data after planned switchover | Page-hash match vs writer at switchover, provided the promoted replica durably holds the final snapshot before claiming a match; a timed-out final sync does not establish a lossless handover (see [§10.4](operations.md#104-replication-and-request-serving-limits), [§10.6](operations.md#106-unresolved-guarantees-and-recovery-policy)) |
 | Data after unplanned failover | New writer holds a prefix of acknowledged writes; loss window ≤ `max_lag_secs` + `renew_deadline_secs`, assuming no commit stalls inside `COMMIT` beyond the fencing margin (see [§10.2](operations.md#102-data-safety-and-durability-limitations)) |
+| Resource footprint | Workload-specific CPU, memory, network, and disk-I/O budgets are documented and pass the reproducible benchmark process in [§6.5](testing.md#65-performance--benchmarks). Numeric budgets are TBD until measured against declared baselines; no "very low resource consumption" claim is made before they are set and met. |
 
 ### Product posture and unresolved guarantees
 
@@ -107,7 +116,7 @@ The factors above are not a caveat to be hidden; they are the product contract.
 | M2 | Sync worker | integration convergence + crash-during-apply |
 | M3 | HA cluster runtime | 3-node local HA + chaos suite |
 | M4 | K8s deploy (requires Track N TLS) | manifest + k3d smoke + rolling update |
-| M5 | 0.1.0 release (requires Track N cutover) | soak + security suite |
+| M5 | 0.1.0 release (requires Track N cutover) | soak + security suite + resource benchmark budgets met |
 
 ---
 

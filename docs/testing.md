@@ -112,10 +112,113 @@ Assertions:
 |-------|----------|------|
 | `sync_catchup` | bytes moved vs churn | native Criterion benchmark |
 | `failover_rto` | promote → first successful write | custom harness |
-| `controller_tick` | reconcile latency | criterion |
+| `controller_tick` | reconcile latency | Criterion |
 
-Use hasqlite-owned sync settings, documented under the `HASQLITE_SYNC_*`
-environment variable prefix in the operations guide.
+#### Resource-footprint benchmark process
+
+"Very low resource consumption" is a goal, not a verified property or an
+absolute guarantee. Benchmark hasqlite before making that claim or setting
+release budgets. The benchmark report MUST separate hasqlite's own overhead
+from the resources required by SQLite, the workload, and the deployment
+environment.
+
+1. **Define representative scenarios.** Measure at least:
+   - standalone idle after startup and warm-up, with no clients;
+   - standalone read-heavy and write-heavy service at documented concurrency
+     and offered load;
+   - clustered steady state with an idle replica and with active replication;
+   - replica catch-up under controlled write churn.
+   Record startup separately from steady state. Include representative database
+   sizes and document the chosen sizes and workload mix; do not generalize
+   beyond the measured range.
+2. **Choose comparable baselines.** For standalone SQL workloads, run the same
+   SQLite version, database, schema, SQL statements, durability settings,
+   concurrency, and host against SQLite without the hasqlite process/gateway.
+   This estimates incremental service overhead; it is not a comparison of
+   equivalent HA guarantees. For clustered scenarios, report absolute use and
+   compare only with a clearly described equivalent setup.
+3. **Measure all resource dimensions.** Record process and container CPU
+   consumption (including idle CPU as CPU time per wall-clock interval),
+   steady-state and peak resident memory, disk read/write bytes and I/O
+   operations, and network bytes. For active workloads, report CPU-seconds,
+   disk-I/O, and network bytes per successfully completed operation as well as
+   absolute totals. Do not compute per-operation values for idle runs; report
+   zero-client resource use over the sampling interval instead. Report attempted,
+   successful, and failed operations separately. For active scenarios, report
+   throughput and p50/p95/p99 latency when there are successful operations.
+   Represent latency percentiles as `null` with reason `not_applicable` for
+   idle scenarios; do not substitute zero. If an active scenario expected to
+   complete work has zero successful operations, mark it invalid and fail the
+   gate rather than reporting per-operation metrics or percentiles. Track
+   database, WAL, and sync-related disk use separately where applicable.
+4. **Make runs reproducible.** Use optimized builds and fixed, documented
+   inputs. Hold hardware, OS/kernel, CPU and memory limits, storage, config,
+   SQLite settings, dataset, and load generator constant between hasqlite and
+   baseline runs. Warm up before sampling, run long enough to reach steady
+   state, and run each scenario at least five times to report run-to-run
+   variation, the median, and tail behavior. Record the exact commit, toolchain,
+   dependency lockfile, sanitized commands, runner image and instance class,
+   allowlisted non-secret configuration, and raw metric measurements with each
+   report. Use synthetic data
+   only; never benchmark with production databases or include database contents
+   in reports or artifacts. Do not dump the process environment. Redact tokens,
+   credentials, authorization headers, credential-bearing URLs, private
+   endpoints, and local paths from commands, configuration, logs, and reports
+   before storing or publishing them. If the environment is noisy or results
+   are not repeatable, report that limitation and rerun on the designated
+   stable runner.
+5. **Set and enforce budgets.** Use the baseline results and intended
+   deployment profiles to propose numeric per-scenario CPU, memory, network,
+   and disk-I/O budgets, covering both idle overhead and the declared target
+   load. Document the rationale, measurement window, and acceptable regression
+   tolerance and comparison direction for each gated metric; do not invent
+   thresholds after seeing a failing run. Resource-consumption metrics use an
+   upper bound: higher CPU, memory, network, or disk I/O is a regression.
+   Service-quality metrics use their appropriate direction: lower throughput
+   and higher latency or failure rate are regressions; higher throughput and
+   lower latency or failure rate are improvements, not regressions. For
+   metrics without an absolute budget, compare against the baseline only using
+   this declared direction and its pre-approved tolerance. Ratify and record
+   the budgets and directions before treating resource efficiency as achieved.
+   Until then, benchmark results are report-only and the resource goal remains
+   unverified, not a pass.
+6. **Gate changes and release.** Keep a benchmark baseline and run comparable
+   measurements on the designated stable CI runner nightly, on pull requests,
+   and before release. The implementation deliverables are a harness and
+   scenario definitions under `benches/resource_footprint/`, an invocable
+   `scripts/bench-resource-footprint.sh` runner, a checked-in,
+   machine-readable baseline and ratified budgets under
+   `docs/benchmarks/resource-footprint/`, and a
+   `.github/workflows/resource-benchmarks.yml` workflow. Before budgets are
+   ratified and the runner is shown to be repeatable, the job MUST be report-only
+   and MUST NOT label the resource goal as passed. Once enabled as a gate, each
+   scenario MUST run the configured repetitions and validate required
+   measurements according to its declared scenario type. Idle scenarios MUST
+   provide all resource measurements and operation counts, with throughput and
+   latency percentiles marked `null`/`not_applicable`; those fields are excluded
+   from metric comparisons. Active scenarios MUST provide successful-operation
+   counts, throughput, latency percentiles, and resource measurements. An active
+   scenario with zero successful operations MUST fail as invalid. The gate
+   compares available, applicable median measurements against the absolute
+   budgets that exist for those metrics and against the recorded baseline using
+   each metric's declared regression direction and pre-approved tolerance.
+   Missing required measurements, an invalid scenario, or a budget or regression
+   breach MUST fail the gate; baseline changes require review and recorded
+   benchmark evidence. Store only sanitized summaries and
+   machine-readable baselines in the repository. Keep raw CI reports as
+   access-controlled, time-limited artifacts with retention configured in the
+   workflow; CI artifacts MUST contain only sanitized reports and metric
+   measurements, never datasets, database files, secrets, or unsanitized
+   environment/configuration dumps. When a budget is exceeded, profile the
+   relevant path, make a targeted optimization, and rerun both benchmarks and
+   correctness tests. The v1 release criterion is that every documented
+   resource budget passes on its specified scenario and environment.
+
+Use hasqlite-owned sync settings documented in the
+[configuration guide](configuration.md#8-configuration-contract-v1). Benchmark
+reports MUST include the effective, sanitized sync settings, including
+`sync.interval_secs` and any applicable batching settings. These settings
+affect both resource use and replication behavior.
 
 ### 6.6 Security tests
 
