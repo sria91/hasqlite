@@ -1,6 +1,6 @@
 # hasqlite — Operations and Risks
 
-## 9. Observability
+## 9. Observability (planned)
 
 | Signal | Format |
 |--------|--------|
@@ -47,7 +47,7 @@ constraints, and [§10.6](#106-unresolved-guarantees-and-recovery-policy) identi
 
 | Condition | Consequence and requirement |
 |-----------|-----------------------------|
-| Asynchronous replication | An unplanned failover can lose acknowledged writes. The target loss window is at most `freshness.max_lag_secs + lease.renew_deadline_secs` (14 seconds with the example configuration), not zero RPO. This is a time-window target, not a bound on the number of lost transactions, and it assumes no commit stalls beyond the fencing margin (next rows). |
+| Asynchronous replication | An unplanned failover can lose acknowledged writes. The target loss window is at most `freshness.max_lag_secs + lease.renew_deadline_secs` (14 seconds with the example configuration), not zero RPO. This is a time-window target, not a bound on the number of lost transactions; it assumes the writer's wall clock accurately measures elapsed time and no commit stalls beyond the fencing margin (next rows). |
 | No storage-level generation fence | Each node writes its own disk; a generation counter does not physically reject an old writer's disk writes. Split-brain prevention depends on cooperative self-fencing and the timing assumption below. |
 | Writer stalls inside `COMMIT` beyond the fencing margin | A commit can finish after a peer promotes. The default margin is 4 seconds and the minimum is 2 seconds. The `enforce_write_fence` check before `COMMIT` and `sqlite3_interrupt` at the deadline do not eliminate this residual risk. |
 | Replica crashes during in-place page application | The replica can contain a partially applied snapshot. Invalidate and fsync the ledger before application; deny promotion until a full sync and `PRAGMA integrity_check` pass. Track N provides atomic/locked application. |
@@ -68,7 +68,7 @@ restore writes absent from the promoted replica.
 | Writer loses access to coordination | It stops committing at its renewal deadline and demotes, even if its database and client network remain healthy. |
 | Lease store is unreachable from all nodes | The writer demotes; no replacement can acquire authority until the store returns. A local expiry timer alone never authorizes promotion. |
 | Writer is partitioned from replicas but can renew | Writes continue while replica lag grows. If the writer later fails, all replicas may be too stale to promote. |
-| All replicas exceed the freshness limit | Automatic promotion is denied; availability is sacrificed to limit data loss. While the activated writer is still serving, catch-up sync from it restores eligibility. Once it has failed, no replica's ledger matches the current writer epoch (the freshness ledger records the last successful sync's source, but that source is no longer the activated writer), so automatic promotion is blocked and manual recovery is required. |
+| All replicas exceed the freshness limit | Automatic promotion is denied; availability is sacrificed to limit data loss. While the activated writer is still serving, catch-up sync from it restores eligibility. Once it has failed, the failed writer remains the last activated writer in the observed lease, so a stale ledger may still match its epoch, and `validate_promotion` rejects promotion because lag exceeds the limit; automatic promotion is blocked and manual recovery is required. |
 | Activated writer dies before any replica syncs from it | Replicas have the wrong writer epoch and automatic failover is blocked. An acquired but never-activated generation does not have this effect. |
 | Ledger is missing, invalid, bound to another destination, self-sourced, or from the wrong writer epoch | Promotion fails closed; apparent file recency is insufficient. |
 | Snapshot timestamp exceeds the allowed future skew | Promotion is denied while the snapshot's timestamp still exceeds the skew limit at promotion time. Lease expiry uses monotonic time, but the promotion future-timestamp check compares the writer-stamped snapshot time with the candidate's local wall time (safety contract rule 10). If the snapshot ages until its timestamp is within the skew limit, promotion is no longer denied on this basis alone; denial therefore applies only as long as the skew condition persists. A writer whose clock runs more than `max_future_skew_secs` ahead of every replica keeps all replicas unpromotable for as long as it continues stamping snapshots beyond the limit; alert on `hasqlite_snapshot_future_skew_seconds` ([§8](configuration.md#8-configuration-contract-v1)). |

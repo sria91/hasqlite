@@ -21,7 +21,7 @@
 
 - Generation never decreases on valid transitions; acquire always yields `observed + 1`; renew, activate and release never change it
 - A ledger from any generation other than the writer epoch's is rejected
-- Promotion outcome depends only on lag behind the writer's last renewal, never on detection delay
+- The lag calculation is independent of detection delay; promotion outcome depends on lag and writer-epoch match, while future skew can also affect promotion
 
 **Coverage target:** ≥95% line coverage on `hasqlite-controller` and `hasqlite-lease`, enforced by the CI `coverage` job
 (`cargo llvm-cov --fail-under-lines 95`).
@@ -78,7 +78,7 @@ in container-less environments.
 | Crash during page apply | `kill -9` replica at a random page in the fine pass | ledger stays invalidated; promotion denied until a full sync and `PRAGMA integrity_check` pass |
 | Disk full | ENOSPC during page apply or ledger publish | ledger stays invalidated; no promotion from that node |
 | Stalled replica session | replica stops reading mid-stream for 10× interval | origin aborts the session; WAL can be checkpointed |
-| Crash mid-write | SIGKILL writer | new writer after failover; its data is a prefix of acknowledged writes; loss ≤ `max_lag_secs` + `renew_deadline_secs` (assumes no commit stalls inside `COMMIT` beyond the fencing margin; see [§10.2](operations.md#102-data-safety-and-durability-limitations)) |
+| Crash mid-write | SIGKILL writer | new writer after failover; its data contains a prefix of acknowledged writes and may include committed writes whose client outcome was unknown; loss ≤ `max_lag_secs` + `renew_deadline_secs` (assumes no commit stalls inside `COMMIT` beyond the fencing margin; see [§10.2](operations.md#102-data-safety-and-durability-limitations)) |
 | Aborted promotion | kill the CAS winner between acquire and activate | another replica promotes against the previous writer epoch |
 | Writer dies before first sync | kill a newly activated writer before any replica completes a sync from it | automatic promotion denied (wrong writer epoch); alert fires; manual promotion runbook required |
 | Writer clock ahead | libfaketime: writer +`max_future_skew_secs` + 1s; wait for a replica to publish a post-adjustment ledger and for the future-skew alert ([§8](configuration.md#8-configuration-contract-v1)) to fire; then kill writer | promotion denied on future skew while the skew condition persists; if the snapshot ages within the limit before a promotion attempt, denial no longer applies on this basis |
@@ -137,7 +137,8 @@ jobs:
   integration:
     - cargo test --workspace --locked
   coverage:
-    - cargo llvm-cov --locked -p hasqlite-controller -p hasqlite-lease --fail-under-lines 95
+    - cargo llvm-cov --locked -p hasqlite-controller --fail-under-lines 95
+    - cargo llvm-cov --locked -p hasqlite-lease --fail-under-lines 95
   simulation:
     - cargo test --locked --test sim   # 1,000 seeds per PR, 100,000 nightly
   lint:

@@ -88,7 +88,7 @@ Deliverables:
 depend on it:
 
 - Policies: `Periodic`, `OnLeaseChange`, `PreShutdown`, `PostPromoteCatchUp`
-  - `PostPromoteCatchUp` runs only before the writable handle opens, and only from a peer whose ledger has the same writer epoch and a newer snapshot. The sync engine refuses to run while the node's role is `Writer`.
+  - `PostPromoteCatchUp` runs only before the writable handle opens. Under Phase 1a's writer-origin requirement (safety contract rules 7–8), catch-up can only pull from an accessible writer origin; peer-to-peer catch-up from a fresher replica after writer failure is deferred until a safe peer-transfer protocol and replica-serving safety requirements are defined. The sync engine refuses to run while the node's role is `Writer`.
 - Crash-safe ledger publication (safety contract rule 9). The adapter writes pages into the replica file in place, so an interrupted pull leaves a torn file:
   1. Invalidate the ledger and fsync it before the first page is written.
   2. Pull; `pull_replica` fsyncs the replica file and its directory on success.

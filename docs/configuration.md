@@ -71,7 +71,7 @@ transport_auth_token_file = "/run/secrets/hasqlite_replication_token"
 # auth_token_file = "/run/secrets/hasqlite_replication_token"
 
 [gateway]
-bind = "0.0.0.0:50051" # Direct listener without sidecar; use "127.0.0.1:50051" when co-located with TLS sidecar (:50443)
+bind = "127.0.0.1:50051" # Loopback bind when co-located with TLS sidecar (:50443); a direct listener must be protected by a TLS ingress and restricted to the trusted proxy
 auth_token_file = "/run/secrets/hasqlite_token"
 # auth_token_env = "HASQLITE_GRPC_AUTH_TOKEN"
 # allow_unauthenticated is rejected in clustered mode
@@ -96,7 +96,7 @@ Validation (`ClusterConfig::from_toml`) fails closed:
 - `sync.origin_endpoint` requires a sync credential, and the gateway requires a credential unless
   `allow_unauthenticated = true` is set on a loopback bind in standalone mode. Clustered mode rejects
   `allow_unauthenticated`: the TLS sidecar forwards remote traffic to the loopback listener, which also serves replication.
-- Phase 1a adds: the replication credential must differ from the gateway credential (distinct env var names / files).
+- Phase 1a adds: the replication credential must differ from the gateway credential; startup must compare the resolved replication and gateway token values and reject a match (distinct environment variable names or file paths alone do not satisfy the separation requirement).
 
 ### Standalone single-node profile (Docker / edge)
 

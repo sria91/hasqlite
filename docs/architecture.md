@@ -257,11 +257,14 @@ flowchart TB
 >   rollout keep each planned switchover to one writer transition.
 >
 > - **Routing is best-effort, safety is enforced by fencing**:
->   A standard Service is not writer-aware, so the node labels its own pod
->   `hasqlite.io/role=writer` on activation and removes it on demotion. The
->   writer Service selects that label, but the label can lag the lease. Routing
->   therefore helps traffic flow; the correctness guard remains the lease and the
->   pre-commit write fence.
+>   A standard Service is not writer-aware, so the node reconciles the
+>   `hasqlite.io/role=writer` pod label on startup against its current role
+>   (removing it when starting as a replica and ensuring it is present when
+>   starting as writer), applies it on activation, and removes it on demotion.
+>   Failed label updates are retried with backoff so stale labels cannot persist
+>   unnoticed. The writer Service selects that label, but the label can lag the
+>   lease. Routing therefore helps traffic flow; the correctness guard remains
+>   the lease and the pre-commit write fence.
 
 ### Layers
 
@@ -302,7 +305,11 @@ Events per tick (informed by the upstream `ReconcileDecision` model):
    - Freshest replica first: an eligible candidate waits
      `retry_period_secs × lag_secs / max_lag_secs` before its acquisition attempt
      and aborts if the lease version changes meanwhile, so the least-lagged
-     replica normally wins the race.
+     replica normally wins the race. Because lag uses saturating subtraction
+     (`writer.renewed_at_secs.saturating_sub(synced_at_secs)`), multiple snapshots
+     taken at or after the writer's last renewal evaluate to zero lag and zero delay;
+     among such candidates, an older snapshot may win the race without a freshness
+     preference.
    - From the moment it decides to campaign until it promotes or stays a
      replica, the candidate pauses scheduled sync, so its validated ledger cannot
      change.

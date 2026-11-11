@@ -74,7 +74,7 @@ the system prefers fail-closed behavior and operator recovery.
 | Steady-state sync interval | Configurable 1–5s default |
 | Promotion block on stale replica | 100% when lag behind the activated writer's last renewal > `freshness.max_lag_secs`, or the ledger is not from that writer epoch |
 | Failover under synthetic load | RTO p95 < 15s on 3-node k3s (node-local disk) with default lease timing (TTL 10s, renew deadline 6s, retry 2s) |
-| Data after planned switchover | Page-hash match vs writer at switchover, provided the final sync completed successfully; a timed-out final sync does not establish a lossless handover (see [§10.4](operations.md#104-replication-and-request-serving-limits), [§10.6](operations.md#106-unresolved-guarantees-and-recovery-policy)) |
+| Data after planned switchover | Page-hash match vs writer at switchover, provided the promoted replica durably holds the final snapshot before claiming a match; a timed-out final sync does not establish a lossless handover (see [§10.4](operations.md#104-replication-and-request-serving-limits), [§10.6](operations.md#106-unresolved-guarantees-and-recovery-policy)) |
 | Data after unplanned failover | New writer holds a prefix of acknowledged writes; loss window ≤ `max_lag_secs` + `renew_deadline_secs`, assuming no commit stalls inside `COMMIT` beyond the fencing margin (see [§10.2](operations.md#102-data-safety-and-durability-limitations)) |
 
 ### Product posture and unresolved guarantees
