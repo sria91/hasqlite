@@ -214,10 +214,11 @@ environment.
    correctness tests. The v1 release criterion is that every documented
    resource budget passes on its specified scenario and environment.
 
-Use hasqlite-owned sync settings, documented under the `HASQLITE_SYNC_*`
-environment variable prefix in the operations guide. Record those settings in
-benchmark reports because sync interval and batching affect both resource use
-and replication behavior.
+Use hasqlite-owned sync settings documented in the
+[configuration guide](configuration.md#8-configuration-contract-v1). Benchmark
+reports MUST include the effective, sanitized sync settings, including
+`sync.interval_secs` and any applicable batching settings. These settings
+affect both resource use and replication behavior.
 
 ### 6.6 Security tests
 
