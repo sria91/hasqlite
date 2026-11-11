@@ -84,6 +84,11 @@ protocol.
       (`writer.renewed_at_secs − synced_at_secs`) is at most
       `freshness.max_lag_secs`; both timestamps come from the writer's clock.
       `synced_at_secs` is at most `max_future_skew_secs` ahead of local time.
+      *(Post-v1 emergency exception)*: When automated emergency promotion is
+      configured, a candidate meeting peer quorum may promote with lag exceeding
+      `freshness.max_lag_secs`, provided its lag does not exceed
+      `recovery.max_emergency_lag_secs`, and the acquisition records the emergency
+      annotation and audit log entry.
     - It then wins the acquisition CAS (rule 6). Scheduled sync is paused while
       it campaigns, so the validated inputs cannot change and no second
       freshness check is needed.

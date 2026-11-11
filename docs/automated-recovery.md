@@ -65,23 +65,36 @@ or disk write failure occurs mid-sync.
    temporary shadow file on the same filesystem: `<database-path>.staging`.
 2. **Integrity Verification**: Prior to publication, the sync engine runs:
    ```sql
-   PRAGMA quick_check;
+   PRAGMA integrity_check;
    ```
    and validates that page BLAKE3 hashes match origin-stamped checksums.
 3. **Atomic Replace**:
-   - On Linux: `renameat2(AT_FDCWD, staging_path, AT_FDCWD, live_path, RENAME_EXCHANGE)`.
-   - On macOS/BSD or legacy filesystems: write to temp file, rename over existing, followed
-     by a parent directory `fsync`.
-4. **Ledger Publication**: The freshness ledger is updated using temp file + rename + directory
-   `fsync` only after the database file is cleanly swapped.
+   To prevent existing connections from accessing stale inodes while new connections access
+   the replacement database, and to safely handle WAL/journal sidecars:
+   - Acquire an internal controller replacement lock that blocks new read handle checkouts
+     and pauses candidate promotion campaigning.
+   - Quiesce open SQLite reader connections by draining or closing active handles.
+   - Clean up any inactive WAL or shared-memory sidecars (`-wal`, `-shm`, `-journal`) on the live path.
+   - Execute the atomic replacement:
+     - On Linux: `renameat2(AT_FDCWD, staging_path, AT_FDCWD, live_path, RENAME_EXCHANGE)`.
+     - On macOS/BSD or legacy filesystems: atomic replace via temp-file + rename.
+   - Fsync the replacement database file and fsync the containing database directory.
+   - Reopen reader connections against the new database file.
+   - Release the controller replacement lock to resume promotion evaluations.
+4. **Ledger Publication**: Only after the replacement database file and containing directory
+   have been fsynced, publish the updated freshness ledger using the crash-safe sequence
+   (write to temp file, `fsync`, rename to `.hasqlite.freshness`, and `fsync` the parent directory).
 
 ### 2.2 Auto-Quarantine and Automated Re-Seed
 If a replica detects database corruption (`SQLITE_CORRUPT`, bad checksums, or storage I/O errors):
-1. **Immediate Quarantine**: The node isolates the suspect database:
+1. **Ledger Invalidation (Immediate)**: The node first unlinks `.hasqlite.freshness` and
+   fsyncs its parent directory. If a crash or power failure occurs immediately afterward,
+   the node reboots strictly unpromotable, preventing a damaged or empty database from promoting.
+2. **Database Quarantine**: Move the suspect database file and any remaining sidecars to quarantine:
    ```
    mv /var/lib/hasqlite/data.db /var/lib/hasqlite/quarantine/<timestamp>_data.db
    ```
-2. **Ledger Invalidation**: The local `.hasqlite.freshness` ledger is unlinked and fsynced.
+   and fsync the directory.
 3. **Self-Demotion**: The node transitions to `Role::DegradedReplica` and sets `/ready` to 503.
 4. **Automated Seed Clone**: The sync worker issues a streaming full-snapshot pull from
    the active writer or a designated healthy peer. Once complete and verified with
@@ -104,12 +117,23 @@ before the client receives the acknowledgment:
 2. **Atomic Execution**: On mutating gRPC requests carrying an `idempotency_key`, the SQL
    gateway writes the response payload into `_hasqlite_idempotency` within the **exact same**
    SQLite transaction as the user's SQL statement.
-3. **Zero-Loss Deduplication across Failovers**: Because SQLite page replication syncs the
-   entire database state, the idempotency table is transferred to all standby replicas.
-   When the client retries the request against a newly promoted writer:
-   - The new writer checks `_hasqlite_idempotency`.
-   - It finds the recorded response payload.
-   - It returns the original result without re-executing the mutating query.
+3. **Deduplication across Replicated Commits (Bounded Guarantees)**: Because SQLite page
+   replication syncs the entire database state, the idempotency table is transferred to all
+   standby replicas as part of ordinary snapshots.
+   - **Guaranteed Scope**: Deduplication is guaranteed for all commits that were durably
+     replicated to the promoted replica prior to writer failure.
+   - **Asynchronous Replication Boundary**: Commits accepted by the former writer within the
+     unreplicated lag window are not present on the promoted replica. When a client retries
+     such a transaction, no record exists in `_hasqlite_idempotency` on the new writer, so the
+     statement will execute as a new transaction. True zero-loss deduplication across any crash
+     requires a synchronous replication barrier (e.g. semi-synchronous commit ack) where the
+     writer does not acknowledge the client until at least one replica persists the idempotency record.
+   - **Retry Verification Steps**: When a client retries a request against a newly promoted writer:
+     1. The writer queries `_hasqlite_idempotency` for `(client_id, idempotency_key)`.
+     2. If found, it compares the stored `statement_fingerprint` with the incoming request's fingerprint.
+     3. If the fingerprints match, it returns the cached `response_payload` without re-executing the SQL.
+     4. If the fingerprints differ, it rejects the request with an `IDEMPOTENCY_KEY_COLLISION` error.
+     5. If not found, it executes the statement normally in a new transaction.
 4. **Retention Window**: A background pruner purges idempotency entries older than
    `idempotency.retention_period_secs` (default: 24 hours).
 
@@ -142,11 +166,14 @@ In post-v1, an automated **Emergency Promotion Protocol** can be enabled:
 2. **Peer Consensus Ping**:
    - The candidate queries all known cluster peers over gRPC: `rpc GetFreshnessState(Empty) returns (FreshnessLedger)`.
    - A candidate proceeds **only if**:
-     a. It receives responses from a quorum ($\lfloor N/2 \rfloor + 1$) of configured nodes, AND
-     b. Its own `synced_at_secs` is $\ge$ all reachable peers (freshest surviving replica).
-3. **Emergency CAS Acquisition**:
-   - The candidate issues an `acquire` CAS writing metadata annotation `emergency_promotion = true`.
-   - It records an explicit audit entry: `EMERGENCY_PROMOTION_ACCEPTED: lag=<actual_lag_secs>, max_lag=<config_max>`.
+     a. Counting the candidate's own local state as one vote, a quorum ($\lfloor N/2 \rfloor + 1$ of total cluster nodes, e.g. candidate + 1 reachable peer in a 3-node cluster) participates in the freshness comparison, AND
+     b. Its own `synced_at_secs` is $\ge$ all reachable peers participating in the comparison (freshest surviving replica).
+3. **Emergency CAS Acquisition & Bounded Lag Gate**:
+   - The candidate evaluates its actual lag against the activated writer's last renewal:
+     $$\text{lag} = \text{writer.renewed\_at\_secs} - \text{candidate.synced\_at\_secs}$$
+   - If $\text{lag} > \text{recovery.max\_emergency\_lag\_secs}$, the candidate **rejects acquisition** and aborts promotion, strictly enforcing the maximum configured emergency data loss bound.
+   - If $\text{lag} \le \text{recovery.max\_emergency\_lag\_secs}$, the candidate issues an `acquire` CAS writing metadata annotation `emergency_promotion = true`.
+   - It records an explicit audit entry: `EMERGENCY_PROMOTION_ACCEPTED: lag=<actual_lag_secs>, max_emergency_lag=<config_max>`.
 4. **Activation**: The candidate activates and resumes write service.
 
 ### 3.2 Dead-Epoch Roll-Forward Protocol
@@ -189,19 +216,36 @@ Rule 15 preserves its database as `*.diverged-g<gen>`. Post-v1 automates data re
 these files.
 
 ### 4.1 SQLite Changeset Stream
-1. **Session Tracking**: The writer initializes a SQLite session hook on all user tables:
+1. **Schema Validation & Primary Key Requirements**:
+   The SQLite session extension (`sqlite3session`) requires every tracked table to have an
+   explicit primary key; tables without primary keys (or rows with NULL primary-key columns)
+   cannot be captured by the session module.
+   - **Pre-requisite Validation**: Replicated schemas require explicit, non-null primary keys on
+     all user tables (standard primary key or `WITHOUT ROWID`).
+   - **Authorizer Enforcement**: The SQL gateway authorizer rejects `CREATE TABLE` statements that
+     omit an explicit primary key whenever divergence tracking is enabled.
+2. **Session Attachment**:
    ```c
    sqlite3session_create(db, "main", &session);
-   sqlite3session_attach(session, NULL); // attach all tables
+   sqlite3session_attach(session, NULL); // attach all valid tables
    ```
-2. **Changeset Archival**: At transaction commit, changesets are serialized into an append-only
-   local changelog: `/var/lib/hasqlite/changesets/gen-<g>-<tx_id>.bin`.
+3. **Crash-Safe Changeset Archival**:
+   To prevent an unrecoverable gap between a SQLite transaction commit and durable changelog storage:
+   - **Atomic In-Transaction Capture**: Changesets are serialized and recorded in an internal append-only
+     table (`_hasqlite_changesets`) within the **same SQLite transaction** before `COMMIT`. This guarantees
+     that transaction commit and changeset persistence are mutually atomic and crash-safe.
+   - **Sidecar Commit Hook Protocol**: If external files are used (`changesets/gen-<g>-<tx_id>.bin`),
+     the writer registers a `sqlite3_commit_hook`. The hook writes and fsyncs the changeset before the commit
+     can succeed; any I/O failure aborts the SQLite commit.
+   - **Recovery Fallback on Log Gap**: If on restart a sequence gap is detected in the changeset archive
+     (e.g. transaction count exceeds durable changesets), divergence recovery marks the archive incomplete
+     and falls back to full table diffing against the ancestor snapshot.
 
 ### 4.2 Automated Divergence Reconciler
 When a former writer re-attaches as a replica:
 1. **Detection**: The supervisor identifies `/var/lib/hasqlite/*.diverged-g<gen>`.
-2. **Diff Extraction**: The reconciler invokes `sqlite3changeset_diff()` comparing the diverged
-   state against the common snapshot ancestor.
+2. **Diff Extraction**: The reconciler invokes SQLite's `sqlite3session_diff()` API to compute the
+   changeset diff comparing the diverged database state against the common snapshot ancestor.
 3. **Dead-Letter Queue (DLQ) Export**:
    - Orphaned rows are exported to a structured audit file:
      `/var/lib/hasqlite/diverged/diverged-g<gen>-export.jsonl`.
