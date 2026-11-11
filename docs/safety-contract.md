@@ -84,6 +84,24 @@ protocol.
       (`writer.renewed_at_secs − synced_at_secs`) is at most
       `freshness.max_lag_secs`; both timestamps come from the writer's clock.
       `synced_at_secs` is at most `max_future_skew_secs` ahead of local time.
+      *(Post-v1 exceptions)*:
+      - **Emergency promotion**: When automated emergency promotion is configured,
+        a candidate may promote with lag exceeding `freshness.max_lag_secs` only
+        after `recovery.emergency_promotion_timeout_secs` has elapsed on its clock,
+        provided the candidate proves freshness among a participating quorum, its
+        potential loss window `(writer.renewed_at_secs + lease.renew_deadline_secs) − synced_at_secs`
+        does not exceed `recovery.max_emergency_lag_secs`, and the acquisition records
+        the emergency annotation and audit log entry.
+      - **Dead-epoch roll-forward**: When `recovery.auto_dead_epoch_recovery` is
+        configured and surviving replicas certify via quorum attestation that the
+        activated writer generation $g_{\text{dead}}$ has been abandoned for
+        `recovery.dead_epoch_timeout_secs`, candidates whose ledgers match the prior
+        activated epoch $g_{\text{prior}}$ may campaign to acquire the next generation
+        derived from the observed lease version ($g_{\text{new}} = g_{\text{observed}} + 1$).
+        Attestations do not prove that an unreachable partition lacks a completed snapshot
+        at generation $g_{\text{dead}}$; the transition explicitly gates this potential
+        loss under the configured active duration limit (`recovery.max_dead_epoch_duration_secs`)
+        and audit requirements before clearing the abandoned writer epoch.
     - It then wins the acquisition CAS (rule 6). Scheduled sync is paused while
       it campaigns, so the validated inputs cannot change and no second
       freshness check is needed.
