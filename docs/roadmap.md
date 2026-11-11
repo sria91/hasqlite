@@ -149,3 +149,27 @@ Deliverables:
 - CHANGELOG, version 0.1.0, README quickstart
 
 ---
+
+### Post-v1 — Automated Failure Recovery & Self-Healing
+
+Post-v1 development transitions hasqlite from its v1 fail-closed stance (requiring operator runbooks on abnormal states) to configurable, automated self-healing while maintaining the core safety contract. Detailed architecture, state machines, and protocols are specified in [automated-recovery.md](automated-recovery.md):
+
+#### Tier 1 — Node-Local Self-Healing & Request Idempotency
+- **Staged Atomic Snapshots**: Apply incoming page syncs into a staging file (`.db.staging`), verify `PRAGMA integrity_check` and checksums, then atomically replace active database files (`renameat2` / directory fsync) to prevent torn replica states.
+- **Auto-Quarantine & Re-seed**: When a replica encounters corrupted pages or invalid ledger state on boot/sync, automatically isolate the damaged database to `quarantine/<timestamp>.db`, invalidate freshness, and initiate a full re-clone from the active writer or a healthy peer.
+- **In-DB Replicated Idempotency**: Maintain a dedicated internal table (`_hasqlite_idempotency`) committed transactionally with client writes. Because SQLite pages replicate to standby nodes, clients retrying after an "outcome unknown" failover obtain cached execution results from the newly promoted writer without duplicate statement execution.
+
+#### Tier 2 — Cluster Consensus & Emergency Promotion
+- **Emergency Escalation Timers for Stale Replicas**: If an activated writer dies and all surviving replicas exceed `freshness.max_lag_secs`, enter an emergency election window after `emergency_promotion_timeout_secs` (e.g. $3 \times \text{TTL}$), automatically electing the freshest replica and recording an explicit bounded-loss audit event.
+- **Peer Quorum Verification**: Candidates ping reachable peers via gRPC to compare `synced_at_secs` and verify quorum before initiating emergency promotion.
+- **Dead-Epoch Roll-Forward**: If an activated writer dies before any replica syncs from it (leaving all replicas on epoch $g-1$ while the lease shows epoch $g$), allow surviving nodes via quorum attestation to invalidate the dead epoch and campaign to advance from $g-1$ directly to $g+1$.
+- **Clock Skew Auto-Backoff**: Replicas delayed by future-skewed snapshot start timestamps automatically schedule controller re-evaluations as the local monotonic/wall clock catches up, avoiding permanent failover blocks.
+
+#### Tier 3 — Divergent Data Capture & Automated Reconciliation
+- **Session Changeset Capture**: Integrate the SQLite Session extension (`sqlite3session`) on the writer path to track committed row changesets in an append-only WAL.
+- **Automated Divergence Reconciler**: When a demoted writer rejoins as a replica, inspect `*.diverged-g<gen>` against the common ancestor, export divergent transactions to a Dead-Letter Queue (DLQ), and optionally replay idempotent writes against the new writer.
+
+#### Tier 4 — Switchover Fallback Policies
+- **Deterministic Switchover Policy**: Formalize switchover timeout handling with a configurable policy: abort handover if time expires while old writer remains healthy, or force promotion of the freshest replica with bounded-loss acknowledgment when shutdown deadlines are hard.
+
+---

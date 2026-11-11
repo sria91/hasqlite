@@ -9,6 +9,7 @@ implementation guidance is organized by topic:
 - [Security defaults and configuration contract](configuration.md)
 - [Observability, risks, and operational limits](operations.md)
 - [Safety contract](safety-contract.md) — authoritative safety invariants
+- [Automated recovery & self-healing architecture](automated-recovery.md) (post-v1)
 
 The documents share these conventions: normative requirements use uppercase
 MUST, MUST NOT, SHOULD, and MAY; operational targets are goals, not claims of
@@ -57,8 +58,8 @@ the system prefers fail-closed behavior and operator recovery.
 
 ### Future goals (non-goals for v1)
 
-- Multi-writer / distributed SQL consensus (Raft, Paxos, SQLite session
-  extension).
+- Multi-writer / distributed SQL consensus (Raft, Paxos).
+- Automated failure mode recovery & self-healing (emergency stale-replica promotion, dead-epoch roll-forward, replica auto-quarantine/re-seed, replicated client idempotency, and diverged-data reconciliation; see [automated-recovery.md](automated-recovery.md) and [roadmap.md](roadmap.md#post-v1--automated-failure-recovery--self-healing)).
 - Cross-region active/active.
 - Drop-in compatibility with the `rsqlite-rsync` standalone sync CLI. hasqlite
   will provide its own commands and implementation. Note: running `hasqlite`

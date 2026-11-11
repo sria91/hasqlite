@@ -143,4 +143,6 @@ The following are gaps to resolve explicitly, not additional guarantees:
   Generation rules depend on an intact authoritative history; reconstruction
   must not silently reset generations or bootstrap competing writers.
 
+Automated recovery strategies for addressing these operational gaps are detailed in the [Post-v1 Roadmap](roadmap.md#post-v1--automated-failure-recovery--self-healing).
+
 ---
