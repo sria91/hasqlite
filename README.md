@@ -12,9 +12,9 @@ protocol, and client functionality without requiring that crate.
 
 ## Status
 
-**Planning / bootstrap.** See [docs/PLAN.md](docs/PLAN.md) for the full
-development and test strategy. Application code lands in phased milestones
-described there.
+**Planning / bootstrap.** See [docs/PLAN.md](docs/PLAN.md) for product goals
+and milestone summary. Detailed guidance is organized in the architecture,
+roadmap, test strategy, configuration, and operations documents linked there.
 
 ## Dependency transition
 
@@ -29,11 +29,16 @@ described there.
 
 The dependency will remain until hasqlite's native replication path and tests
 cover the required behavior. The migration and dependency-removal criteria are
-tracked in [docs/PLAN.md](docs/PLAN.md).
+tracked in [docs/architecture.md](docs/architecture.md).
 
 ## Quick links
 
-- [Comprehensive plan](docs/PLAN.md)
+- [Development plan overview](docs/PLAN.md)
+- [Architecture](docs/architecture.md)
+- [Development roadmap](docs/roadmap.md)
+- [Test strategy](docs/testing.md)
+- [Security and configuration](docs/configuration.md)
+- [Operations and risks](docs/operations.md)
 - [Safety contract (draft)](docs/safety-contract.md)
 - [Prior-art HA guide](https://github.com/sria91/rsqlite-rsync/blob/master/docs/ha-guide.md)
 

@@ -8,5 +8,3 @@ repository.workspace = true
 
 [dependencies]
 hasqlite-core = { path = "../hasqlite-core" }
-tokio.workspace = true
-tracing.workspace = true
