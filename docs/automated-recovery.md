@@ -29,13 +29,13 @@ However, during edge-case cluster degradation or storage anomalies, v1 intention
 Post-v1 introduces deterministic self-healing protocols to:
 - **Minimize Mean Time to Recovery (MTTR)** without sacrificing single-writer safety.
 - **Convert manual runbooks into bounded, auditable state machine transitions**.
-- **Guarantee idempotency and zero duplicate execution** across client retries.
+- **Provide deterministic idempotency** across client retries for all durably replicated commits.
 
 ```mermaid
 flowchart TD
     subgraph S1 ["Tier 1: Node-Local Storage Self-Healing"]
-        T1A["Staged Atomic Snapshots\n- Apply into .db.staging\n- PRAGMA integrity_check\n- Atomic renameat2 swap"]
-        T1B["Auto-Quarantine & Re-Seed\n- Move corrupt file to quarantine/\n- Invalidate ledger & pull fresh snapshot"]
+        T1A["Staged Atomic Snapshots\n- Apply into .db.staging\n- PRAGMA integrity_check\n- Atomic replacement & pre-invalidation"]
+        T1B["Auto-Quarantine & Re-Seed\n- Ledger invalidation\n- Move corrupt file to quarantine/\n- Pull fresh snapshot from writer"]
         T1C["In-DB Replicated Idempotency\n- Store client outcome in SQLite table\n- Replicates with page sync"]
     end
 
@@ -73,10 +73,13 @@ or disk write failure occurs mid-sync.
    the replacement database, and to safely handle WAL/journal sidecars:
    - Acquire an internal controller replacement lock that blocks new read handle checkouts
      and pauses candidate promotion campaigning.
+   - **Pre-Invalidation of Ledger**: Invalidate and fsync the local `.hasqlite.freshness` ledger
+     before modifying the database path, ensuring a crash during replace leaves the node unpromotable (Rule 9).
    - Quiesce open SQLite reader connections by draining or closing active handles.
    - Clean up any inactive WAL or shared-memory sidecars (`-wal`, `-shm`, `-journal`) on the live path.
    - Execute the atomic replacement:
-     - On Linux: `renameat2(AT_FDCWD, staging_path, AT_FDCWD, live_path, RENAME_EXCHANGE)`.
+     - On Linux: If `live_path` exists, use `renameat2(AT_FDCWD, staging_path, AT_FDCWD, live_path, RENAME_EXCHANGE)`.
+       If `live_path` is absent (e.g. after initial bootstrap or quarantine), use standard atomic `rename(staging_path, live_path)`.
      - On macOS/BSD or legacy filesystems: atomic replace via temp-file + rename.
    - Fsync the replacement database file and fsync the containing database directory.
    - Reopen reader connections against the new database file.
@@ -96,9 +99,10 @@ If a replica detects database corruption (`SQLITE_CORRUPT`, bad checksums, or st
    ```
    and fsync the directory.
 3. **Self-Demotion**: The node transitions to `Role::DegradedReplica` and sets `/ready` to 503.
-4. **Automated Seed Clone**: The sync worker issues a streaming full-snapshot pull from
-   the active writer or a designated healthy peer. Once complete and verified with
-   `PRAGMA integrity_check`, the node re-enters normal replica sync and re-enables promotion eligibility.
+4. **Automated Seed Clone**: The sync worker issues a streaming full-snapshot pull strictly
+   from the active writer (peer-to-peer re-seeding is deferred until a verified peer provenance
+   protocol is established). Once complete and verified with `PRAGMA integrity_check`, the node
+   re-enters normal replica sync and re-enables promotion eligibility.
 
 ### 2.3 In-DB Replicated Idempotency
 To solve the "outcome unknown" dilemma where client writes commit but the network fails
@@ -121,21 +125,24 @@ before the client receives the acknowledgment:
    replication syncs the entire database state, the idempotency table is transferred to all
    standby replicas as part of ordinary snapshots.
    - **Guaranteed Scope**: Deduplication is guaranteed for all commits that were durably
-     replicated to the promoted replica prior to writer failure.
-   - **Asynchronous Replication Boundary**: Commits accepted by the former writer within the
-     unreplicated lag window are not present on the promoted replica. When a client retries
+     replicated to the promoted replica prior to writer failure and whose records have not expired.
+   - **Asynchronous Replication & Barrier Limits**: Commits accepted by the former writer within the
+     unreplicated lag window are absent on the promoted replica. When a client retries
      such a transaction, no record exists in `_hasqlite_idempotency` on the new writer, so the
-     statement will execute as a new transaction. True zero-loss deduplication across any crash
-     requires a synchronous replication barrier (e.g. semi-synchronous commit ack) where the
-     writer does not acknowledge the client until at least one replica persists the idempotency record.
+     statement will execute as a new transaction. Even with a semi-synchronous replication acknowledgment,
+     a writer crash after local commit but before acknowledgment leaves an unknown outcome, and a promoting
+     replica might lack the record unless election requires every eligible successor to hold it.
+     Consequently, unless an all-successor durable commit protocol is established, clients must continue
+     to treat unknown outcomes as unconfirmed and adhere to the documented retry restrictions.
    - **Retry Verification Steps**: When a client retries a request against a newly promoted writer:
      1. The writer queries `_hasqlite_idempotency` for `(client_id, idempotency_key)`.
      2. If found, it compares the stored `statement_fingerprint` with the incoming request's fingerprint.
      3. If the fingerprints match, it returns the cached `response_payload` without re-executing the SQL.
      4. If the fingerprints differ, it rejects the request with an `IDEMPOTENCY_KEY_COLLISION` error.
-     5. If not found, it executes the statement normally in a new transaction.
+     5. If not found (unreplicated commit or pruned past retention), it executes the statement normally in a new transaction.
 4. **Retention Window**: A background pruner purges idempotency entries older than
-   `idempotency.retention_period_secs` (default: 24 hours).
+   `idempotency.retention_period_secs` (default: 24 hours). Retries received after retention expiration
+   execute as new transactions.
 
 ---
 
@@ -167,13 +174,17 @@ In post-v1, an automated **Emergency Promotion Protocol** can be enabled:
    - The candidate queries all known cluster peers over gRPC: `rpc GetFreshnessState(Empty) returns (FreshnessLedger)`.
    - A candidate proceeds **only if**:
      a. Counting the candidate's own local state as one vote, a quorum ($\lfloor N/2 \rfloor + 1$ of total cluster nodes, e.g. candidate + 1 reachable peer in a 3-node cluster) participates in the freshness comparison, AND
-     b. Its own `synced_at_secs` is $\ge$ all reachable peers participating in the comparison (freshest surviving replica).
-3. **Emergency CAS Acquisition & Bounded Lag Gate**:
-   - The candidate evaluates its actual lag against the activated writer's last renewal:
-     $$\text{lag} = \text{writer.renewed\_at\_secs} - \text{candidate.synced\_at\_secs}$$
-   - If $\text{lag} > \text{recovery.max\_emergency\_lag\_secs}$, the candidate **rejects acquisition** and aborts promotion, strictly enforcing the maximum configured emergency data loss bound.
-   - If $\text{lag} \le \text{recovery.max\_emergency\_lag\_secs}$, the candidate issues an `acquire` CAS writing metadata annotation `emergency_promotion = true`.
-   - It records an explicit audit entry: `EMERGENCY_PROMOTION_ACCEPTED: lag=<actual_lag_secs>, max_emergency_lag=<config_max>`.
+     b. Its own `synced_at_secs` is $\ge$ all reachable peers participating in the comparison (freshest among reachable quorum peers).
+     *Note on network partitions*: If an unreachable partition holds an eligible replica with a fresher snapshot, electing the quorum candidate accepts the loss of writes between the quorum snapshot and the unreachable replica; this risk is bounded by `recovery.max_emergency_lag_secs`.
+3. **Emergency CAS Acquisition & Bounded Loss Gate**:
+   - The candidate evaluates its potential worst-case data loss window against the activated writer's
+     last renewal plus the writer's renewal deadline:
+     $$\text{potential\_loss\_window} = (\text{writer.renewed\_at\_secs} + \text{lease.renew\_deadline\_secs}) - \text{candidate.synced\_at\_secs}$$
+   - Assuming non-decreasing writer clocks and that no commit stalled beyond the fencing margin (Rule 5),
+     this accounts for all commits potentially accepted prior to writer demotion.
+   - If $\text{potential\_loss\_window} > \text{recovery.max\_emergency\_lag\_secs}$, the candidate **rejects acquisition** and aborts promotion, strictly enforcing the configured emergency data loss bound.
+   - If $\text{potential\_loss\_window} \le \text{recovery.max\_emergency\_lag\_secs}$, the candidate issues an `acquire` CAS writing metadata annotation `emergency_promotion = true`.
+   - It records an explicit audit entry: `EMERGENCY_PROMOTION_ACCEPTED: potential_loss_window=<secs>, max_emergency_lag=<config_max>`.
 4. **Activation**: The candidate activates and resumes write service.
 
 ### 3.2 Dead-Epoch Roll-Forward Protocol
@@ -183,18 +194,23 @@ replica completes a sync:
 - All surviving replicas hold ledgers from generation $g-1$.
 - Standard promotion is blocked because `source_generation (g-1) != writer.generation (g)`.
 
-#### Automated Roll-Forward:
+#### Automated Roll-Forward & Loss Policy:
 1. **Dead Generation Detection**:
    - Lease version remains unchanged for `recovery.dead_epoch_timeout_secs` (default: $2 \times \text{TTL}$).
    - The last recorded writer renewal timestamp `writer.renewed_at_secs` is stagnant.
-2. **Quorum Attestation**:
+2. **Quorum Attestation & Loss Acknowledgment**:
    - Candidates exchange signed attestations: `Attestation { peer: id, max_observed_generation: g-1 }`.
    - If a quorum of replicas confirms zero snapshots received from generation $g$, generation $g$
      is certified as an **Orphaned Dead Epoch**.
+   - *Bounded Loss Policy*: Attestations that replicas received no snapshots do not prove that generation $g$
+     accepted zero client writes. Dead-epoch roll-forward is an explicit, policy-driven recovery transition
+     that forfeits un-replicated writes in generation $g$ in exchange for restoring cluster availability,
+     emitting an `ORPHANED_EPOCH_DISCARDED` audit log entry.
 3. **Superseding Acquisition**:
-   - Candidate executes a CAS targeting generation $g+1$, asserting source epoch $g-1$.
+   - Authorized under the post-v1 dead-epoch exception to [safety contract](safety-contract.md) Rule 10,
+     the candidate executes a CAS targeting generation $g+1$, asserting source epoch $g-1$.
    - The lease store grants generation $g+1$ and updates `writer = (candidate_id, g+1, now)`.
-   - Write traffic resumes with zero manual intervention.
+   - Write traffic resumes without manual runbook execution.
 
 ### 3.3 Clock Skew Auto-Backoff
 If a writer's clock is running fast and stamps snapshot timestamps ahead of a candidate's
@@ -221,9 +237,10 @@ these files.
    explicit primary key; tables without primary keys (or rows with NULL primary-key columns)
    cannot be captured by the session module.
    - **Pre-requisite Validation**: Replicated schemas require explicit, non-null primary keys on
-     all user tables (standard primary key or `WITHOUT ROWID`).
-   - **Authorizer Enforcement**: The SQL gateway authorizer rejects `CREATE TABLE` statements that
-     omit an explicit primary key whenever divergence tracking is enabled.
+     all user tables (standard `PRIMARY KEY NOT NULL` or `WITHOUT ROWID`).
+   - **Authorizer Enforcement**: The SQL gateway authorizer validates non-null primary key constraints
+     for both new and existing tables, rejecting `CREATE TABLE` statements or schemas with nullable
+     primary-key columns whenever divergence tracking is enabled so changes are never omitted.
 2. **Session Attachment**:
    ```c
    sqlite3session_create(db, "main", &session);
@@ -234,9 +251,11 @@ these files.
    - **Atomic In-Transaction Capture**: Changesets are serialized and recorded in an internal append-only
      table (`_hasqlite_changesets`) within the **same SQLite transaction** before `COMMIT`. This guarantees
      that transaction commit and changeset persistence are mutually atomic and crash-safe.
-   - **Sidecar Commit Hook Protocol**: If external files are used (`changesets/gen-<g>-<tx_id>.bin`),
-     the writer registers a `sqlite3_commit_hook`. The hook writes and fsyncs the changeset before the commit
-     can succeed; any I/O failure aborts the SQLite commit.
+   - **Sidecar Commit Hook Protocol & Commit Markers**: If external files are used (`changesets/gen-<g>-<tx_id>.bin`),
+     writing and fsyncing via `sqlite3_commit_hook` alone does not prove the SQLite transaction committed,
+     as a crash immediately after the hook could leave an uncommitted sidecar. The writer must record an atomic
+     transactional commit marker within the database; on recovery, sidecars are verified against the commit
+     marker before consumption, and unconfirmed sidecars are discarded.
    - **Recovery Fallback on Log Gap**: If on restart a sequence gap is detected in the changeset archive
      (e.g. transaction count exceeds durable changesets), divergence recovery marks the archive incomplete
      and falls back to full table diffing against the ancestor snapshot.
@@ -251,9 +270,11 @@ When a former writer re-attaches as a replica:
      `/var/lib/hasqlite/diverged/diverged-g<gen>-export.jsonl`.
    - An alert is emitted: `hasqlite_diverged_commits_exported_total`.
 4. **Automated Replay (Configurable)**:
-   - If `recovery.auto_reconcile_divergence = true`, the reconciler connects to the new writer
-     via gRPC and replays idempotent `INSERT` operations carrying conflict resolution policies
-     (`INSERT OR IGNORE`). Conflicting updates remain in the DLQ for manual inspection.
+   - If `recovery.auto_reconcile_divergence = true`, the reconciler identifies transactions strictly
+     absent from the promoted snapshot and applies an explicit conflict policy before replay. `INSERT OR IGNORE`
+     alone is insufficient because replaying an insert for a row previously deleted on the new writer
+     would improperly resurrect it. Ambiguous or conflicting operations remain quarantined in the DLQ
+     for operator inspection.
 
 ---
 
@@ -324,7 +345,7 @@ The following fault-injection scenarios validate automated recovery in `tests/ch
 | `auto_emergency_lag_failover.rs` | Partition writer until all replicas exceed `max_lag_secs`; kill writer. | Cluster waits `emergency_promotion_timeout_secs`; freshest replica wins quorum and promotes; audit entry emitted. |
 | `auto_dead_epoch_rollforward.rs` | Kill newly activated writer before replica sync starts. | Replicas detect dead epoch; quorum agreement advances $g-1 \to g+1$; cluster recovers without manual runbook. |
 | `auto_replica_quarantine.rs` | Corrupt 4 random pages in replica database during operation. | Replica catches `SQLITE_CORRUPT`, moves file to `quarantine/`, triggers full seed pull, and recovers to healthy standby. |
-| `replicated_idempotency_failover.rs` | Client issues mutating write with idempotency key; kill writer immediately after SQLite `COMMIT`. | Client retries same key against new writer; receives exact cached response; statement executed exactly once. |
+| `replicated_idempotency_failover.rs` | Client issues mutating write with idempotency key; kill writer immediately after SQLite `COMMIT`. | Client retries same key against new writer; receives exact cached response if commit was replicated prior to kill, or executes as a new transaction if unreplicated. |
 | `diverged_changeset_export.rs` | Writer stalled beyond fencing margin; commits diverged row; reconnected as replica. | Diverged file detected; diff extracted into JSON-L DLQ; node re-syncs cleanly. |
 
 ---
