@@ -673,6 +673,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "hasqlite-client"
+version = "0.0.0"
+dependencies = [
+ "hasqlite-proto",
+]
+
+[[package]]
 name = "hasqlite-controller"
 version = "0.0.0"
 dependencies = [
@@ -689,6 +696,13 @@ dependencies = [
  "serde",
  "thiserror",
  "toml",
+]
+
+[[package]]
+name = "hasqlite-gateway"
+version = "0.0.0"
+dependencies = [
+ "hasqlite-core",
 ]
 
 [[package]]
@@ -719,6 +733,10 @@ version = "0.0.0"
 dependencies = [
  "hasqlite-core",
 ]
+
+[[package]]
+name = "hasqlite-proto"
+version = "0.0.0"
 
 [[package]]
 name = "hasqlite-sync"
@@ -904,9 +922,9 @@ checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "libsqlite3-sys"
-version = "0.38.2"
+version = "0.39.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f1d20bef17f513b9b3004532233187769cd072d790971f4e4da0e346eb6401e8"
+checksum = "14a5f01b87b92705d07b433c06f96cbc764637d81a0bffb5734ce17cf0f9a2b3"
 dependencies = [
  "cc",
  "pkg-config",
@@ -1422,8 +1440,8 @@ dependencies = [
 
 [[package]]
 name = "rsqlite-rsync"
-version = "0.5.0"
-source = "git+https://github.com/sria91/rsqlite-rsync?rev=6a836c9abcf418025c29762728e7f9e5af909433#6a836c9abcf418025c29762728e7f9e5af909433"
+version = "0.5.1"
+source = "git+https://github.com/sria91/rsqlite-rsync?rev=9613486a642d8ced82c0e6e391b8bbd448e0a063#9613486a642d8ced82c0e6e391b8bbd448e0a063"
 dependencies = [
  "async-trait",
  "bincode",
@@ -1452,8 +1470,8 @@ dependencies = [
 
 [[package]]
 name = "rsqlite-rsync-client"
-version = "0.5.0"
-source = "git+https://github.com/sria91/rsqlite-rsync?rev=6a836c9abcf418025c29762728e7f9e5af909433#6a836c9abcf418025c29762728e7f9e5af909433"
+version = "0.5.1"
+source = "git+https://github.com/sria91/rsqlite-rsync?rev=9613486a642d8ced82c0e6e391b8bbd448e0a063#9613486a642d8ced82c0e6e391b8bbd448e0a063"
 dependencies = [
  "async-trait",
  "rsqlite-rsync-proto",
@@ -1464,8 +1482,8 @@ dependencies = [
 
 [[package]]
 name = "rsqlite-rsync-proto"
-version = "0.5.0"
-source = "git+https://github.com/sria91/rsqlite-rsync?rev=6a836c9abcf418025c29762728e7f9e5af909433#6a836c9abcf418025c29762728e7f9e5af909433"
+version = "0.5.1"
+source = "git+https://github.com/sria91/rsqlite-rsync?rev=9613486a642d8ced82c0e6e391b8bbd448e0a063#9613486a642d8ced82c0e6e391b8bbd448e0a063"
 dependencies = [
  "prost",
  "protoc-bin-vendored",

@@ -9,10 +9,15 @@ protocol.
 1. **One node accepts commits** per cluster at any instant, across all
    generations, under the timing assumption in rule 5.
 2. **Lease is authoritative** for writer identity: `holder_node_id`, `generation`,
-   `renewed_at_secs`, `ttl_secs`, an opaque `version` that changes on every
-   lease write, and the last **activated writer epoch** (`writer`: node ID,
-   generation, last renewal). Acquiring the lease does not change `writer`; only
-   activation does (rule 10).
+   `renewed_at_secs`, `ttl_secs` (the holder's configured TTL), a hasqlite-owned
+   `version` token that changes on every lease write *made by hasqlite* (acquire,
+   activate, renew, release), and the last **activated writer epoch** (`writer`:
+   node ID, generation, last renewal). The backend's native revision (Kubernetes
+   `resourceVersion`, file record counter) is the compare-and-swap precondition and
+   is bumped atomically with `version`, but it is never used as the liveness
+   signal: an unrelated actor annotating or labelling the Lease object changes the
+   native revision without changing `version`. Acquiring the lease does not change
+   `writer`; only activation does (rule 10).
 3. **Generation increases** on every successful acquisition (never reused).
    Renewals and releases never change it.
 
@@ -20,15 +25,22 @@ protocol.
 
 4. **Candidates never compare wall clocks for lease decisions.** A candidate treats the lease as
    expired only when it is released (no holder) or its `version` has stayed
-   unchanged for `lease.ttl_secs` measured on the candidate's local monotonic
-   clock. `renewed_at_secs` is informational. In rule 10, candidates make two
+   unchanged for the **effective TTL**, `max(local lease.ttl_secs, observed
+   ttl_secs)`, measured on the candidate's local monotonic clock
+   (`LeaseObservation::is_expired_for`). Honouring the holder's recorded TTL keeps
+   rule 5 valid during a rolling change of lease timing: the holder validated
+   `ttl_secs ≥ renew_deadline_secs + margin` against *its own* deadline, so a
+   candidate configured with a shorter TTL must not expire it earlier.
+   `renewed_at_secs` is informational. In rule 10, candidates make two
    time-based comparisons that are not wall-clock vs. lease comparisons: (a) the
    freshness check compares the writer-stamped `writer.renewed_at_secs` with the
    writer-stamped `synced_at_secs` (both from the writer's clock) to enforce the
    lag limit, requiring a rollback-safe time basis on the writer (renewal and
    snapshot timestamps must be non-decreasing, so backward steps in the writer
    clock cannot cause saturating subtraction to make stale snapshots appear fresh
-   or bypass the lag limit); and (b) the future-skew check compares the
+   or bypass the lag limit; the writer issues every stamp through `WriterClock`,
+   which returns `max(wall clock, last stamp)` and is seeded from the writer
+   epoch's last renewal on activation); and (b) the future-skew check compares the
    writer-stamped snapshot timestamp with the candidate's local wall time, which
    can deny promotion but never authorizes it. Candidates do not compare the
    lease's `renewed_at_secs` with their own wall clock.
@@ -74,6 +86,21 @@ protocol.
      succeeds and the database file and its directory are fsynced. Publication
      uses temp file + rename + directory fsync. An interrupted sync therefore
      always leaves the node unpromotable.
+   - **Exclusive application**: at most one sync writes a given replica file at a
+     time (`SyncError::SyncInProgress` otherwise).
+   - **Adapter-era attribution (until Track N)**: the transitional backend stamps
+     neither origin identity nor snapshot time, and its replication server does
+     not refuse to serve when its node is not the activated writer. Until the
+     native backend provides origin stamping, the replica MUST (1) read the lease
+     before the pull and stamp the ledger's `source_node_id`, `source_generation`
+     and `synced_at_secs` from that lease's `writer` epoch (`synced_at_secs :=
+     writer.renewed_at_secs` observed before the pull, a lower bound on the
+     snapshot start on the writer's clock, so lag is overstated, never
+     understated); (2) read the lease again after the database fsync and publish
+     the ledger only if `version` is unchanged and `holder_node_id ==
+     writer.node_id`; and (3) serve pulls only while it is itself the activated
+     writer (a role-gating interceptor in front of the adapter's replication
+     server). A lease change observed in (2) leaves the ledger invalidated.
 
 ## Promotion
 
@@ -84,24 +111,12 @@ protocol.
       (`writer.renewed_at_secs − synced_at_secs`) is at most
       `freshness.max_lag_secs`; both timestamps come from the writer's clock.
       `synced_at_secs` is at most `max_future_skew_secs` ahead of local time.
-      *(Post-v1 exceptions)*:
-      - **Emergency promotion**: When automated emergency promotion is configured,
-        a candidate may promote with lag exceeding `freshness.max_lag_secs` only
-        after `recovery.emergency_promotion_timeout_secs` has elapsed on its clock,
-        provided the candidate proves freshness among a participating quorum, its
-        potential loss window `(writer.renewed_at_secs + lease.renew_deadline_secs) − synced_at_secs`
-        does not exceed `recovery.max_emergency_lag_secs`, and the acquisition records
-        the emergency annotation and audit log entry.
-      - **Dead-epoch roll-forward**: When `recovery.auto_dead_epoch_recovery` is
-        configured and surviving replicas certify via quorum attestation that the
-        activated writer generation $g_{\text{dead}}$ has been abandoned for
-        `recovery.dead_epoch_timeout_secs`, candidates whose ledgers match the prior
-        activated epoch $g_{\text{prior}}$ may campaign to acquire the next generation
-        derived from the observed lease version ($g_{\text{new}} = g_{\text{observed}} + 1$).
-        Attestations do not prove that an unreachable partition lacks a completed snapshot
-        at generation $g_{\text{dead}}$; the transition explicitly gates this potential
-        loss under the configured active duration limit (`recovery.max_dead_epoch_duration_secs`)
-        and audit requirements before clearing the abandoned writer epoch.
+      Checks are evaluated in a fixed order (ledger shape, writer epoch, time
+      bounds) and the first failure is reported; the order is part of the
+      `hasqlite_promotion_denied_total` metric contract. The post-v1 emergency
+      promotion and dead-epoch roll-forward exceptions are specified in
+      [automated-recovery.md](automated-recovery.md#3-tier-2-cluster-consensus--degraded-failover)
+      and are not part of v1.
     - It then wins the acquisition CAS (rule 6). Scheduled sync is paused while
       it campaigns, so the validated inputs cannot change and no second
       freshness check is needed.
@@ -116,9 +131,13 @@ protocol.
     the initial generation and `writer` epoch. Normal failover always applies
     the full rule 10.
 12. **Failed promotion** must not open writable SQL paths (fail closed).
-13. **Post-promotion catch-up** may only run before the writable handle opens,
-    and only from a peer whose ledger has the same `writer` epoch and a newer
-    `synced_at_secs`.
+13. **Post-promotion catch-up is not part of v1.** Under rules 7–8 a replica may
+    pull only from the activated writer, which is unavailable at the moment of
+    promotion, so the promoted node opens its writable handle on the snapshot it
+    validated in rule 10. A peer-to-peer catch-up (from a peer whose ledger has the
+    same `writer` epoch and a newer `synced_at_secs`, run strictly before the
+    writable handle opens) is reserved for post-v1 once a safe peer-transfer
+    protocol exists ([automated-recovery.md](automated-recovery.md)).
 
 ## Demotion
 

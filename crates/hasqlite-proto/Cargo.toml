@@ -1,0 +1,10 @@
+[package]
+name = "hasqlite-proto"
+description = "hasqlite-owned wire API: SQL gateway and replication services (Phase 1a)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]

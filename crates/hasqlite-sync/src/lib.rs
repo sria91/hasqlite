@@ -3,9 +3,12 @@
 //! Replication currently delegates to `rsqlite-rsync`; this integration is
 //! transitional and is replaced when the native backend meets the cutover
 //! criteria in `docs/PLAN.md`.
+#![forbid(unsafe_code)]
 
 use hasqlite_core::SyncSection;
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 /// Sync scheduler policy identifiers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -14,8 +17,6 @@ pub enum SyncTrigger {
     Periodic,
     /// Pre-shutdown catch-up replication to minimize RPO.
     PreShutdown,
-    /// Post-promotion catch-up synchronization.
-    PostPromoteCatchUp,
     /// Triggered replication on observed writer lease transition.
     OnLeaseChange,
 }
@@ -55,6 +56,13 @@ pub enum SyncError {
     /// A configured authentication source contained no token.
     #[error("sync authentication token must not be empty")]
     EmptyAuthToken,
+    /// Another pull into the same replica path is still running in this process (safety contract rule 7:
+    /// a replica file has exactly one writer, the sync engine).
+    #[error("a replication pull into '{path}' is already in progress")]
+    SyncInProgress {
+        /// Replica path that is being written by the other pull.
+        path: String,
+    },
     /// The underlying replication pull failed; the cause is available via `Error::source`.
     #[error("replication pull failed")]
     Replication(#[source] ReplicationError),
@@ -106,6 +114,9 @@ fn map_pull_error(error: rsqlite_rsync::error::SyncError) -> SyncError {
 /// The transitional backend writes pages into `replica_path` in place, so an interrupted pull leaves a
 /// torn file. Callers must invalidate the freshness ledger before calling and publish a new one only
 /// after this returns `Ok`; on success the replica and its directory entry have been fsynced.
+///
+/// At most one pull per replica path runs at a time in this process; a second concurrent call returns
+/// [`SyncError::SyncInProgress`] before touching the network or the file.
 pub async fn pull_replica(
     sync: &SyncSection,
     replica_path: &Path,
@@ -117,11 +128,50 @@ pub async fn pull_replica(
         SyncError::InvalidConfiguration("sync.origin_endpoint is required for replication".into())
     })?;
     let auth_token = load_sync_auth_token(sync).await?;
+    let _exclusive = ActivePullGuard::acquire(replica_path)?;
 
     rsqlite_rsync::grpc_pull_sync(replica_path, endpoint, database, auth_token.as_deref())
         .await
         .map_err(map_pull_error)?;
     fsync_replica(replica_path).await
+}
+
+/// Process-wide set of replica paths currently being written by a pull.
+fn active_pulls() -> &'static Mutex<HashSet<PathBuf>> {
+    static ACTIVE: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    ACTIVE.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// RAII registration of an in-progress pull into one replica path; dropping it releases the path.
+#[derive(Debug)]
+struct ActivePullGuard {
+    path: PathBuf,
+}
+
+impl ActivePullGuard {
+    /// Registers `replica_path` (made absolute so spellings of the same file collide) or fails if it is
+    /// already registered.
+    fn acquire(replica_path: &Path) -> Result<Self, SyncError> {
+        let path = std::path::absolute(replica_path).unwrap_or_else(|_| replica_path.to_path_buf());
+        let mut active = active_pulls()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !active.insert(path.clone()) {
+            return Err(SyncError::SyncInProgress {
+                path: path.display().to_string(),
+            });
+        }
+        Ok(Self { path })
+    }
+}
+
+impl Drop for ActivePullGuard {
+    fn drop(&mut self) {
+        active_pulls()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.path);
+    }
 }
 
 /// Flushes the replica file and, on Unix, its parent directory so a published ledger never outlives the data.
@@ -159,11 +209,23 @@ async fn fsync_replica(replica_path: &Path) -> Result<(), SyncError> {
 
 /// Loads and trims the configured sync token from its environment variable or file, if one is configured.
 async fn load_sync_auth_token(sync: &SyncSection) -> Result<Option<String>, SyncError> {
+    load_sync_auth_token_with(sync, |name: &str| std::env::var(name)).await
+}
+
+/// [`load_sync_auth_token`] with an injectable environment reader, so tests never mutate the process
+/// environment (which is unsound while other threads may read it).
+async fn load_sync_auth_token_with<E>(
+    sync: &SyncSection,
+    read_env: E,
+) -> Result<Option<String>, SyncError>
+where
+    E: Fn(&str) -> Result<String, std::env::VarError>,
+{
     let token = match (
         sync.transport_auth_token_env.as_deref(),
         sync.transport_auth_token_file.as_deref(),
     ) {
-        (Some(name), None) => Some(std::env::var(name).map_err(|e| match e {
+        (Some(name), None) => Some(read_env(name).map_err(|e| match e {
             std::env::VarError::NotPresent => SyncError::AuthTokenEnvNotSet {
                 name: name.to_string(),
             },
@@ -256,18 +318,28 @@ mod tests {
         ));
     }
 
-    // Each env-var test uses its own variable name so parallel tests never observe each other's mutations.
-    #[tokio::test(flavor = "current_thread")]
+    /// Fake environment holding exactly one variable.
+    fn env_with(
+        name: &'static str,
+        value: &'static str,
+    ) -> impl Fn(&str) -> Result<String, std::env::VarError> {
+        move |requested: &str| {
+            if requested == name {
+                Ok(value.to_string())
+            } else {
+                Err(std::env::VarError::NotPresent)
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn sync_auth_token_is_loaded_from_env() {
         const NAME: &str = "HASQLITE_TEST_SYNC_TOKEN_LOADED";
-        // SAFETY: nothing in this test binary reads the environment through non-Rust code (e.g. libc
-        // `getenv`) concurrently; Rust-side reads are serialized by std's environment lock.
-        unsafe { std::env::set_var(NAME, " test-replication-token \n") };
         let mut sync = sync_config();
         sync.transport_auth_token_env = Some(NAME.into());
 
         assert_eq!(
-            load_sync_auth_token(&sync)
+            load_sync_auth_token_with(&sync, env_with(NAME, " test-replication-token \n"))
                 .await
                 .expect("load token")
                 .as_deref(),
@@ -276,7 +348,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sync_auth_token_env_rejects_non_unicode_value() {
+        const NAME: &str = "HASQLITE_TEST_SYNC_TOKEN_BINARY";
+        let mut sync = sync_config();
+        sync.transport_auth_token_env = Some(NAME.into());
+        let read_env = |_: &str| {
+            Err(std::env::VarError::NotUnicode(std::ffi::OsString::from(
+                "\u{fffd}",
+            )))
+        };
+
+        assert!(matches!(
+            load_sync_auth_token_with(&sync, read_env).await.unwrap_err(),
+            SyncError::AuthTokenEnvNotUnicode { name } if name == NAME
+        ));
+    }
+
+    #[tokio::test]
     async fn sync_auth_token_env_missing_is_reported_by_name() {
+        // Uses the real process environment: the variable is never set anywhere in this test binary.
         const NAME: &str = "HASQLITE_TEST_SYNC_TOKEN_MISSING";
         let mut sync = sync_config();
         sync.transport_auth_token_env = Some(NAME.into());
@@ -287,18 +377,90 @@ mod tests {
         ));
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test]
     async fn sync_auth_token_env_rejects_blank_value() {
         const NAME: &str = "HASQLITE_TEST_SYNC_TOKEN_BLANK";
-        // SAFETY: see `sync_auth_token_is_loaded_from_env`.
-        unsafe { std::env::set_var(NAME, "  ") };
         let mut sync = sync_config();
         sync.transport_auth_token_env = Some(NAME.into());
 
         assert!(matches!(
-            load_sync_auth_token(&sync).await.unwrap_err(),
+            load_sync_auth_token_with(&sync, env_with(NAME, "  "))
+                .await
+                .unwrap_err(),
             SyncError::EmptyAuthToken
         ));
+    }
+
+    #[tokio::test]
+    async fn sync_auth_token_rejects_both_sources_at_load_time() {
+        let mut sync = sync_config();
+        sync.transport_auth_token_env = Some("HASQLITE_TEST_SYNC_TOKEN_BOTH".into());
+        sync.transport_auth_token_file = Some(PathBuf::from("/nonexistent/token"));
+
+        assert!(matches!(
+            load_sync_auth_token(&sync).await.unwrap_err(),
+            SyncError::InvalidConfiguration(message) if message.contains("mutually exclusive")
+        ));
+    }
+
+    #[tokio::test]
+    async fn fsync_replica_reports_missing_file_and_never_creates_it() {
+        let directory = tempfile::tempdir().expect("create temporary directory");
+        let replica_path = directory.path().join("missing.db");
+
+        let error = fsync_replica(&replica_path).await.unwrap_err();
+        assert!(matches!(
+            &error,
+            SyncError::Replication(ReplicationError::Operation(message)) if message.contains("failed to fsync")
+        ));
+        assert!(!replica_path.exists());
+    }
+
+    #[tokio::test]
+    async fn fsync_replica_syncs_existing_file_and_directory() {
+        let directory = tempfile::tempdir().expect("create temporary directory");
+        let replica_path = directory.path().join("replica.db");
+        std::fs::write(&replica_path, b"pages").expect("write replica");
+
+        fsync_replica(&replica_path).await.expect("fsync replica");
+    }
+
+    #[test]
+    fn active_pull_guard_is_exclusive_per_path_and_released_on_drop() {
+        let directory = tempfile::tempdir().expect("create temporary directory");
+        let replica_path = directory.path().join("replica.db");
+        let other_path = directory.path().join("other.db");
+
+        let first = ActivePullGuard::acquire(&replica_path).expect("first pull registers");
+        assert!(matches!(
+            ActivePullGuard::acquire(&replica_path).unwrap_err(),
+            SyncError::SyncInProgress { path } if path.ends_with("replica.db")
+        ));
+        // A different replica path is independent.
+        let _other = ActivePullGuard::acquire(&other_path).expect("other path registers");
+        drop(first);
+        let _again = ActivePullGuard::acquire(&replica_path).expect("path is free after drop");
+    }
+
+    #[tokio::test]
+    async fn pull_replica_refuses_second_concurrent_pull_into_same_path() {
+        let directory = tempfile::tempdir().expect("create temporary directory");
+        let token_path = directory.path().join("sync-token");
+        std::fs::write(&token_path, "test-replication-token").expect("write token");
+        let replica_path = directory.path().join("replica.db");
+        let mut sync = sync_config();
+        sync.transport_auth_token_file = Some(token_path);
+
+        let _in_progress = ActivePullGuard::acquire(&replica_path).expect("simulate running pull");
+        let error = pull_replica(&sync, &replica_path, "source.db")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, SyncError::SyncInProgress { .. }),
+            "got {error:?}"
+        );
+        // Rejected before any network or file I/O: the replica path was never created.
+        assert!(!replica_path.exists());
     }
 
     #[test]
@@ -311,9 +473,8 @@ mod tests {
         let mut triggers = HashSet::new();
         triggers.insert(SyncTrigger::Periodic);
         triggers.insert(SyncTrigger::PreShutdown);
-        triggers.insert(SyncTrigger::PostPromoteCatchUp);
         triggers.insert(SyncTrigger::OnLeaseChange);
-        assert_eq!(triggers.len(), 4);
+        assert_eq!(triggers.len(), 3);
         assert!(triggers.contains(&SyncTrigger::Periodic));
     }
 

@@ -8,9 +8,11 @@
 |------|-------|-----------|
 | Lease parsing | empty, `none`, malformed, future renew, missing writer epoch | table-driven |
 | K8s lease JSON | holder, generation and writer-epoch annotations, missing fields | hasqlite-owned fixtures, informed by prior-art cases |
-| Lease observation | version unchanged for TTL → expired; version change restarts timer; wall-clock jumps have no effect | injected `Instant` |
-| Renewal deadline | commit allowed before deadline, refused at and after it | injected `Instant` |
-| Promotion | lag at and past the limit, ledger from older writer generation, other source node, unbound or self-sourced ledger, no activated writer, future skew, aborted acquisition keeps previous epoch valid | pure function asserts |
+| Lease observation | version unchanged for TTL → expired; version change restarts timer; wall-clock jumps have no effect; effective TTL is `max(local, holder's recorded)` in both directions | injected `Instant` (exists) |
+| Writer clock | stamps never decrease across a backward wall-clock step; floor seeded from the writer epoch; a post-step snapshot cannot read as fresher than the renewal | pure function asserts (exists) |
+| Renewal deadline | commit allowed before deadline, refused at and after it; overflow fails closed | injected `Instant` (exists) |
+| Config identifiers | `node.id` charset and length, DNS-1123 Kubernetes names, standalone rejects `sync.origin_endpoint`, `2 × retry ≤ deadline`, `max_lag > interval + retry` | table-driven (exists, `hasqlite-core`) |
+| Promotion | lag at and past the limit, ledger from older writer generation, other source node, unbound or self-sourced ledger, no activated writer, future skew, aborted acquisition keeps previous epoch valid, documented error precedence (ledger shape → writer epoch → time bounds) | pure function asserts (exists) |
 | Write fence | non-writer, deadline passed, generation mismatch | enum `PromotionViolation` |
 | Reconcile | steal lease, renew, partition (stale holder), freshest-first attempt delay | state machine scenarios |
 | CAS acquisition race | renewal between observation and acquisition | mock lease store (assert CAS fails, holder preserved) |
@@ -23,8 +25,9 @@
 - A ledger from any generation other than the writer epoch's is rejected
 - The lag calculation is independent of detection delay; promotion outcome depends on lag and writer-epoch match, while future skew can also affect promotion
 
-**Coverage target:** ≥95% line coverage on `hasqlite-controller` and `hasqlite-lease`, enforced by the CI `coverage` job
-(`cargo llvm-cov --fail-under-lines 95`).
+**Coverage target:** ≥95% line coverage on `hasqlite-controller` and `hasqlite-lease`, and ≥90% on `hasqlite-sync`
+(it holds the crash-safe ledger publication path), enforced by the CI `coverage` job
+(`cargo llvm-cov --fail-under-lines`).
 
 ### 6.1b Deterministic simulation (`tests/sim/`)
 
@@ -55,7 +58,10 @@ Seeds are logged for replay. 1,000 seeds per PR, 100,000 nightly.
 | `planned_switchover.rs` | writer preStop releases the lease; a replica promotes without waiting a TTL; page hashes match; when the final sync times out, the handover follows the [§10.6](operations.md#106-unresolved-guarantees-and-recovery-policy) timeout policy (once defined) and is never reported as lossless | new |
 | `file_lease_lock.rs` | holder rewrites the record 100 times while a second process gets `EWOULDBLOCK` each time; reopening and closing the lock path inside the holder does not release it; NFS/FUSE `data.dir` refused | new (Phase 1) |
 | `gateway_hardening.rs` | [§6.6](#66-security-tests) payload suite on writer and replica | new (Phase 1b) |
-| `token_rotation.rs` | rotated token file takes effect on the next pull without restart | `hasqlite-sync/tests/pull_replica.rs` |
+| `token_rotation.rs` | rotated token file takes effect on the next pull without restart; a rejected token never appears in the error chain and leaves an existing replica file untouched | `hasqlite-sync/tests/pull_replica.rs` (exists) |
+| `adapter_ledger_protocol.rs` | lease version changes between the pre-pull observation and the post-fsync re-check → ledger stays invalidated; holder ≠ writer epoch after the pull → invalidated; unchanged lease → ledger stamped with the pre-pull writer epoch and `writer.renewed_at_secs` | new (Phase 2, safety contract rule 9) |
+| `replication_role_gate.rs` | a node that is not the activated writer refuses to serve pulls through the adapter's replication server | new (Phase 2) |
+| `exclusive_replica_path.rs` | a second pull into a path with a pull in progress fails with `SyncInProgress` before any I/O | `hasqlite-sync` unit tests (exists) |
 | `readonly_replica_reads.rs` | `--allow-replica-reads` with a concurrent reader loop running `PRAGMA integrity_check` during sync (Track N) | gateway flags |
 | `docker_standalone.rs` | Standalone single-node container boot (default and custom UID/GID), volume persistence, gRPC SQL CRUD, probe health, second container rejected, clean `docker stop` | new (Phase 1b) |
 
@@ -85,6 +91,9 @@ in container-less environments.
 | Full-cluster cold restart | stop all nodes for > TTL, restart with coordination available and at least one eligible replica | an eligible replica promotes automatically after observing expiry; acquisition delay favors but does not guarantee the freshest replica |
 | Mixed-version rolling upgrade | version N writer with N-1 replicas, and the reverse | replication and failover keep working |
 | Dual lease claim | corrupt lease file | single winner via generation rules |
+| Rolling lease-timing change | restart replicas with `ttl 4 / deadline 2` while the writer runs `ttl 10 / deadline 6`, then `SIGSTOP` the writer | no replica campaigns before 10s of unchanged version (effective TTL honours the holder's recorded TTL); no overlapping commits |
+| Unrelated Lease writes | annotate and label the Kubernetes Lease object every second while the writer is `SIGSTOP`ped | failover happens after the effective TTL regardless; the extra writes neither renew nor delay |
+| Writer clock step back | libfaketime steps the writer clock −60s between a renewal and the next snapshot | snapshot stamp holds at the renewal value; lag reads 0, not 60s, and promotion eligibility is unchanged |
 
 Every chaos and E2E run records client operations (sequence number; acknowledged, failed or outcome unknown) and checks
 the history afterwards: acknowledged writes on the surviving writer form a prefix with bounded loss, and no two nodes'
@@ -231,24 +240,30 @@ affect both resource use and replication behavior.
 
 ### 6.7 CI matrix
 
+The authoritative definition is [`.github/workflows/ci.yml`](../.github/workflows/ci.yml). Today it runs:
+
 ```yaml
-# illustrative
 jobs:
-  fast:
-    - cargo test --locked -p hasqlite-controller -p hasqlite-lease
-    - cargo test --locked -p hasqlite-sync -- --test-threads=1
-  integration:
+  build-test:   # exists
+    - cargo fmt --all -- --check
+    - cargo clippy --workspace --all-targets --locked -- -D warnings
+    - cargo doc --no-deps --workspace --locked   # RUSTDOCFLAGS=-D warnings -D missing_docs
     - cargo test --workspace --locked
-  coverage:
+  coverage:     # exists
     - cargo llvm-cov --locked -p hasqlite-controller --fail-under-lines 95
     - cargo llvm-cov --locked -p hasqlite-lease --fail-under-lines 95
-  simulation:
+    - cargo llvm-cov --locked -p hasqlite-sync --fail-under-lines 90
+  audit:        # exists (rustsec/audit-check; the workspace carries a Git dependency)
+```
+
+Planned additions, by phase:
+
+```yaml
+  simulation:   # Phase 1
     - cargo test --locked --test sim   # 1,000 seeds per PR, 100,000 nightly
-  lint:
-    - cargo clippy --workspace --all-targets --locked -- -D warnings
-    - cargo fmt --check
-  k8s:
-    if: nightly
+  docker:       # Phase 1b, --features docker-tests
+    - docker build && standalone smoke test
+  k8s:          # Phase 4, nightly
     - k3d cluster create && apply deploy/k8s && run smoke and rolling-update scripts
 ```
 

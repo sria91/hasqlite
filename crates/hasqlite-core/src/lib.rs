@@ -1,4 +1,5 @@
 //! Shared configuration and identifiers for the hasqlite workspace.
+#![forbid(unsafe_code)]
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -48,14 +49,6 @@ impl AsRef<str> for NodeId {
     }
 }
 
-impl std::ops::Deref for NodeId {
-    type Target = str;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
 /// Operational mode for the node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -83,6 +76,35 @@ pub const DEFAULT_LEASE_RETRY_PERIOD_SECS: u64 = 2;
 pub const MIN_LEASE_FENCING_MARGIN_SECS: u64 = 2;
 /// Maximum `lease.ttl_secs`; it also bounds `lease.renew_deadline_secs`, keeping writer deadlines representable.
 pub const MAX_LEASE_TTL_SECS: u64 = 3_600;
+/// Maximum length of `node.id` and of Kubernetes resource names (DNS-1123 subdomain limit).
+pub const MAX_IDENTIFIER_LEN: usize = 253;
+
+/// Returns true if `id` is a safe identifier: 1–253 ASCII letters, digits, `.`, `_` or `-`.
+///
+/// Node IDs are embedded in lease records, ledger files, audit log lines and metrics labels, so
+/// whitespace, separators and control characters are rejected to rule out record and log injection.
+fn is_valid_identifier(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_IDENTIFIER_LEN
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// Returns true if `name` is a DNS-1123 subdomain as required for Kubernetes resource names and namespaces.
+fn is_dns1123_subdomain(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_IDENTIFIER_LEN
+        && name.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        })
+}
 
 /// Returns true if a path is empty or contains only whitespace characters.
 fn is_empty_or_whitespace(path: &std::path::Path) -> bool {
@@ -202,7 +224,7 @@ pub enum LeaseSourceType {
     File,
 }
 
-/// Top-level cluster configuration (see `docs/PLAN.md` §7).
+/// Top-level cluster configuration (see `docs/configuration.md` §8).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClusterConfig {
@@ -248,6 +270,11 @@ impl ClusterConfig {
                 "node.id must not be empty".to_string(),
             ));
         }
+        if !is_valid_identifier(self.node.id.as_str()) {
+            return Err(HasqliteError::Validation(format!(
+                "node.id must be 1-{MAX_IDENTIFIER_LEN} ASCII letters, digits, '.', '_' or '-' (it is embedded in lease records, ledgers and logs)"
+            )));
+        }
         if is_empty_or_whitespace(&self.data.dir) {
             return Err(HasqliteError::Validation(
                 "data.dir must not be empty".to_string(),
@@ -261,7 +288,7 @@ impl ClusterConfig {
                 "node.mode is 'standalone' but lease.source is not 'file' (standalone mode requires file-backed lease for flock mutual exclusion)".to_string(),
             ));
         }
-        Self::validate_lease(&self.lease)?;
+        Self::validate_lease(&self.lease, self.node.mode, &self.data.dir)?;
 
         match self.node.mode {
             NodeMode::Clustered => {
@@ -284,11 +311,16 @@ impl ClusterConfig {
                         "sync.origin_endpoint is required in clustered mode".to_string(),
                     ));
                 }
-                // Steady-state lag reaches about one sync interval, so a smaller bound would deny every promotion.
-                if freshness.max_lag_secs <= sync.interval_secs {
+                // Lag is measured from the snapshot start to the writer's last renewal. Between two snapshot
+                // starts the writer renews every retry period, so steady-state lag reaches about
+                // `interval + retry_period` plus the sync duration; a smaller bound would deny routine promotions.
+                let min_lag_bound = sync
+                    .interval_secs
+                    .saturating_add(self.lease.retry_period_secs);
+                if freshness.max_lag_secs <= min_lag_bound {
                     return Err(HasqliteError::Validation(format!(
-                        "freshness.max_lag_secs ({}) must exceed sync.interval_secs ({})",
-                        freshness.max_lag_secs, sync.interval_secs
+                        "freshness.max_lag_secs ({}) must exceed sync.interval_secs ({}) + lease.retry_period_secs ({}); allow for the sync duration as well",
+                        freshness.max_lag_secs, sync.interval_secs, self.lease.retry_period_secs
                     )));
                 }
 
@@ -300,24 +332,18 @@ impl ClusterConfig {
                 Self::validate_promotion_section(promotion)?;
             }
             NodeMode::Standalone => {
-                let Some(file) = &self.lease.file else {
-                    return Err(HasqliteError::Validation(
-                        "lease.source is 'file' but lease.file section is missing".to_string(),
-                    ));
-                };
-                let canonical_lock = self.canonical_standalone_lease_path();
-                if file.path != canonical_lock {
-                    return Err(HasqliteError::Validation(format!(
-                        "standalone mode requires canonical lease lock path '{}', found '{}'",
-                        canonical_lock.display(),
-                        file.path.display()
-                    )));
-                }
                 if let Some(ref freshness) = self.freshness {
                     Self::validate_freshness(freshness)?;
                 }
                 if let Some(ref sync) = self.sync {
                     sync.validate()?;
+                    // Standalone mode never runs peer replication, so a configured origin is a misconfiguration
+                    // (most likely a clustered profile reused with the wrong mode).
+                    if sync.origin_endpoint.is_some() {
+                        return Err(HasqliteError::Validation(
+                            "sync.origin_endpoint must not be set in standalone mode (standalone nodes never pull from a peer)".to_string(),
+                        ));
+                    }
                 }
                 if let Some(ref promotion) = self.promotion {
                     Self::validate_promotion_section(promotion)?;
@@ -364,8 +390,13 @@ impl ClusterConfig {
         Ok(())
     }
 
-    /// Validates lease timing bounds and the section required by the selected lease backend.
-    fn validate_lease(lease: &LeaseSection) -> Result<(), HasqliteError> {
+    /// Validates lease timing bounds, the section required by the selected lease backend, and in
+    /// standalone mode the canonical lock path inside `data_dir`.
+    fn validate_lease(
+        lease: &LeaseSection,
+        mode: NodeMode,
+        data_dir: &std::path::Path,
+    ) -> Result<(), HasqliteError> {
         if lease.retry_period_secs == 0 {
             return Err(HasqliteError::Validation(
                 "lease.retry_period_secs must be greater than 0".to_string(),
@@ -376,9 +407,10 @@ impl ClusterConfig {
                 "lease.renew_deadline_secs must be greater than 0".to_string(),
             ));
         }
-        if lease.retry_period_secs >= lease.renew_deadline_secs {
+        // At least two renewal attempts must fit before the deadline so one failed attempt does not demote.
+        if lease.retry_period_secs.saturating_mul(2) > lease.renew_deadline_secs {
             return Err(HasqliteError::Validation(format!(
-                "lease.retry_period_secs ({}) must be less than lease.renew_deadline_secs ({})",
+                "lease.retry_period_secs ({}) must be at most half of lease.renew_deadline_secs ({}) so one failed renewal attempt does not demote the writer",
                 lease.retry_period_secs, lease.renew_deadline_secs
             )));
         }
@@ -415,9 +447,19 @@ impl ClusterConfig {
                         "lease.kubernetes.lease_name must not be empty".to_string(),
                     ));
                 }
+                if !is_dns1123_subdomain(&k8s.lease_name) {
+                    return Err(HasqliteError::Validation(
+                        "lease.kubernetes.lease_name must be a DNS-1123 subdomain (lowercase letters, digits, '-' and '.')".to_string(),
+                    ));
+                }
                 if k8s.namespace.trim().is_empty() {
                     return Err(HasqliteError::Validation(
                         "lease.kubernetes.namespace must not be empty".to_string(),
+                    ));
+                }
+                if !is_dns1123_subdomain(&k8s.namespace) {
+                    return Err(HasqliteError::Validation(
+                        "lease.kubernetes.namespace must be a DNS-1123 subdomain (lowercase letters, digits, '-' and '.')".to_string(),
                     ));
                 }
             }
@@ -431,6 +473,16 @@ impl ClusterConfig {
                     return Err(HasqliteError::Validation(
                         "lease.file.path must not be empty".to_string(),
                     ));
+                }
+                if mode == NodeMode::Standalone {
+                    let canonical_lock = data_dir.join(STANDALONE_CANONICAL_LEASE_FILENAME);
+                    if file.path != canonical_lock {
+                        return Err(HasqliteError::Validation(format!(
+                            "standalone mode requires canonical lease lock path '{}', found '{}'",
+                            canonical_lock.display(),
+                            file.path.display()
+                        )));
+                    }
                 }
             }
         }
@@ -729,10 +781,11 @@ http_bind = "127.0.0.1:8088"
         }
     }
 
-    /// Valid standalone configuration with the canonical file lease.
+    /// Valid standalone configuration with the canonical file lease and no `[sync]` section.
     fn valid_standalone_config() -> ClusterConfig {
         let mut config = valid_test_config();
         config.node.mode = NodeMode::Standalone;
+        config.sync = None;
         config.lease.source = LeaseSourceType::File;
         config.lease.kubernetes = None;
         config.lease.file = Some(FileLeaseSection {
@@ -1045,8 +1098,16 @@ http_bind = "0.0.0.0:8088"
         );
         assert_validation_err(
             |c| c.lease.retry_period_secs = c.lease.renew_deadline_secs,
-            "lease.retry_period_secs (6) must be less than lease.renew_deadline_secs (6)",
+            "lease.retry_period_secs (6) must be at most half of lease.renew_deadline_secs (6)",
         );
+        // One failed attempt at 4s would leave no second attempt before the 6s deadline.
+        assert_validation_err(
+            |c| c.lease.retry_period_secs = 4,
+            "lease.retry_period_secs (4) must be at most half of lease.renew_deadline_secs (6)",
+        );
+        let mut config = valid_test_config();
+        config.lease.retry_period_secs = 3;
+        assert!(config.validate().is_ok());
     }
 
     #[test]
@@ -1058,11 +1119,19 @@ http_bind = "0.0.0.0:8088"
     }
 
     #[test]
-    fn clustered_mode_requires_lag_bound_above_sync_interval() {
+    fn clustered_mode_requires_lag_bound_above_sync_interval_plus_retry_period() {
         assert_validation_err(
             |c| c.freshness.as_mut().unwrap().max_lag_secs = c.sync.as_ref().unwrap().interval_secs,
-            "freshness.max_lag_secs (2) must exceed sync.interval_secs (2)",
+            "freshness.max_lag_secs (2) must exceed sync.interval_secs (2) + lease.retry_period_secs (2)",
         );
+        // interval 2 + retry 2 = 4: equal to the bound is still rejected, one more second passes.
+        assert_validation_err(
+            |c| c.freshness.as_mut().unwrap().max_lag_secs = 4,
+            "freshness.max_lag_secs (4) must exceed sync.interval_secs (2) + lease.retry_period_secs (2)",
+        );
+        let mut config = valid_test_config();
+        config.freshness.as_mut().unwrap().max_lag_secs = 5;
+        assert!(config.validate().is_ok());
     }
 
     #[test]
@@ -1083,6 +1152,85 @@ http_bind = "0.0.0.0:8088"
             |c| c.node.id = NodeId::from("   "),
             "node.id must not be empty",
         );
+    }
+
+    #[test]
+    fn validation_rejects_unsafe_node_ids() {
+        for id in [
+            "node 1",
+            "node=1",
+            "node\n1",
+            "node/1",
+            "nöde",
+            "node:1",
+            &"n".repeat(MAX_IDENTIFIER_LEN + 1),
+        ] {
+            assert_validation_err(
+                |c| c.node.id = NodeId::from(id),
+                "node.id must be 1-253 ASCII letters, digits, '.', '_' or '-'",
+            );
+        }
+        for id in ["pod-0", "hasqlite-0.hasqlite.default", "edge_node-7", "a"] {
+            let mut config = valid_test_config();
+            config.node.id = NodeId::from(id);
+            assert!(
+                config.validate().is_ok(),
+                "expected node id '{id}' to be valid"
+            );
+        }
+    }
+
+    #[test]
+    fn validation_rejects_non_dns1123_kubernetes_names() {
+        for name in [
+            "Hasqlite-Writer",
+            "writer_lease",
+            "-writer",
+            "writer.",
+            "a..b",
+        ] {
+            assert_validation_err(
+                |c| c.lease.kubernetes.as_mut().unwrap().lease_name = name.to_string(),
+                "lease.kubernetes.lease_name must be a DNS-1123 subdomain",
+            );
+            assert_validation_err(
+                |c| c.lease.kubernetes.as_mut().unwrap().namespace = name.to_string(),
+                "lease.kubernetes.namespace must be a DNS-1123 subdomain",
+            );
+        }
+        let mut config = valid_test_config();
+        config.lease.kubernetes.as_mut().unwrap().lease_name = "hasqlite-writer.v1".to_string();
+        config.lease.kubernetes.as_mut().unwrap().namespace = "data-plane".to_string();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn standalone_mode_rejects_sync_origin_endpoint() {
+        let mut config = valid_standalone_config();
+        config.sync = valid_test_config().sync;
+        assert!(matches!(
+            config.validate().unwrap_err(),
+            HasqliteError::Validation(message)
+                if message.contains("sync.origin_endpoint must not be set in standalone mode")
+        ));
+        config.sync.as_mut().unwrap().origin_endpoint = None;
+        config.sync.as_mut().unwrap().transport_auth_token_env = None;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn gateway_allows_unauthenticated_ipv6_loopback_bind_in_standalone_mode() {
+        let mut config = valid_standalone_config();
+        config.gateway.auth_token_env = None;
+        config.gateway.allow_unauthenticated = true;
+        config.gateway.bind = "[::1]:50051".to_string();
+        assert!(config.validate().is_ok());
+        config.gateway.bind = "[::]:50051".to_string();
+        assert!(matches!(
+            config.validate().unwrap_err(),
+            HasqliteError::Validation(message)
+                if message.contains("requires gateway.bind to use a loopback address")
+        ));
     }
 
     #[test]
@@ -1292,10 +1440,14 @@ http_bind = "0.0.0.0:8088"
     }
 
     #[test]
-    fn standalone_mode_allows_missing_origin_and_credential() {
+    fn standalone_mode_allows_sync_section_without_origin_and_credential() {
         let mut config = valid_standalone_config();
-        config.sync.as_mut().unwrap().origin_endpoint = None;
-        config.sync.as_mut().unwrap().transport_auth_token_env = None;
+        config.sync = Some(SyncSection {
+            interval_secs: 2,
+            origin_endpoint: None,
+            transport_auth_token_env: None,
+            transport_auth_token_file: None,
+        });
         assert!(config.validate().is_ok());
     }
 
@@ -1350,10 +1502,11 @@ http_bind = "0.0.0.0:8088"
     }
 
     #[test]
-    fn node_id_conversions_and_deref() {
+    fn node_id_conversions() {
         let id = NodeId::new("node-alpha");
         assert_eq!(id.as_str(), "node-alpha");
-        assert_eq!(&*id, "node-alpha");
+        assert_eq!(id.as_ref(), "node-alpha");
+        assert_eq!(NodeId::from(String::from("node-alpha")), id);
         assert_eq!(format!("{id}"), "node-alpha");
         assert_eq!(id.into_inner(), "node-alpha");
     }

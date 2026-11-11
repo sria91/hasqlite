@@ -18,11 +18,11 @@ mcp_codebase-memo_get_architecture({ "project": "<display_name>" })
 
 1. Call `list_projects` to discover the correct project name (index with `index_repository` if not indexed).
 2. Call `get_architecture(project)` to understand the codebase structure.
-3. Use `search_graph` to find relevant symbols, `trace_call_path` for call chains.
+3. Use `search_graph` to find relevant symbols, `trace_path` for call chains.
 4. Use `get_code_snippet` to read specific function implementations.
 5. Use `read_file` when you need exact raw content to edit a specific line, when the index does not cover requested content (including for diagnosis without editing), or to verify indexed content when the index may be stale (refresh a stale index before relying on its relationships or snippet ranges); retain the restriction to exact raw content needed for the task.
 
-### Available Tools (14 MCP tools)
+### Available Tools (14 MCP tools; `check_index_coverage`, `get_file_outline` and `compare_graphs` may also be present depending on server version)
 
 **Indexing:**
 - `index_repository(repo_path)` — Index a repository into the knowledge graph
@@ -32,7 +32,7 @@ mcp_codebase-memo_get_architecture({ "project": "<display_name>" })
 
 **Querying:**
 - `search_graph(name_pattern, name_scope, label, file_pattern, exclude_file_pattern)` — Structured search by label, name/qualified_name, include/exclude file globs
-- `trace_call_path(function_name, direction, depth)` — BFS call chain traversal
+- `trace_path(function_name, direction, depth)` — BFS call chain traversal
 - `detect_changes(project)` — Map git diff to affected symbols + risk
 - `query_graph(query)` — Execute Cypher-like graph queries (read-only)
 - `get_graph_schema(project)` — Node/edge counts, relationship patterns

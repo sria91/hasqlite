@@ -15,7 +15,10 @@ The documents share these conventions: normative requirements use uppercase
 MUST, MUST NOT, SHOULD, and MAY; operational targets are goals, not claims of
 implemented or verified behavior; unresolved guarantees remain explicit product
 risks. The design is safety-first: when correctness and availability conflict,
-the system prefers fail-closed behavior and operator recovery.
+the system prefers fail-closed behavior and operator recovery. Section numbers
+are global across the document set (§1 and §11–12 here, §2–4 architecture, §5
+roadmap, §6 testing, §7–8 configuration, §9–10 operations) so cross-references
+like "§10.6" are unambiguous; the safety contract uses rule numbers instead.
 
 ### Glossary
 
@@ -24,9 +27,16 @@ the system prefers fail-closed behavior and operator recovery.
 - `writer epoch`: the pair of node identity and generation that was activated as
   the current writer; promotion gates validate that the freshest ledger matches
   this epoch.
-- `lease version`: the compare-and-swap token in the lease store (e.g., a
-  Kubernetes `resourceVersion` or a file-record counter); a write succeeds only
-  when the observed version matches the current version.
+- `lease version`: the hasqlite-owned token that changes on every lease write
+  made by hasqlite (acquire, activate, renew, release): a counter in the file
+  record, or a hasqlite annotation on the Kubernetes Lease. Candidates measure
+  liveness by how long it stays unchanged.
+- `CAS precondition`: the backend's native revision (Kubernetes
+  `resourceVersion`, the file record's write counter) that a lease write must
+  match to succeed. It is bumped together with the lease version but is never
+  used for liveness, because unrelated actors can change it.
+- `effective TTL`: `max(candidate's lease.ttl_secs, holder's recorded ttl_secs)`,
+  the time a candidate waits before treating an unchanged lease as expired.
 - `freshness ledger`: the replica-side record of the last successful sync from a
   source writer, including origin node, generation, and snapshot metadata.
 - `outcome unknown`: a write whose client request may have reached the writer but
@@ -69,6 +79,8 @@ the system prefers fail-closed behavior and operator recovery.
 - Multi-writer / distributed SQL consensus (Raft, Paxos).
 - Automated failure mode recovery & self-healing (emergency stale-replica promotion, dead-epoch roll-forward, replica auto-quarantine/re-seed, replicated client idempotency, and diverged-data reconciliation; see [automated-recovery.md](automated-recovery.md) and [roadmap.md](roadmap.md#post-v1--automated-failure-recovery--self-healing)).
 - Cross-region active/active.
+- Post-promotion catch-up from a peer replica (safety contract rule 13) and
+  `allow_replica_reads`; both wait for Track N's atomic snapshot application.
 - Drop-in compatibility with the `rsqlite-rsync` standalone sync CLI. hasqlite
   will provide its own commands and implementation. Note: running `hasqlite`
   *itself* as a standalone single-node database
@@ -109,14 +121,17 @@ The factors above are not a caveat to be hidden; they are the product contract.
 
 | Milestone | Deliverable | Tests |
 |-----------|-------------|-------|
-| M0 | Workspace + PLAN | CI green on empty crates |
-| M1 | Controller parity | unit + proptest + simulation + coverage gate |
-| M1a | Wire API (`hasqlite-proto`) | adjacent-version compatibility |
-| M1.5 (Fast-track) | Standalone Single-Node Docker | Multi-stage Dockerfile, hardened standalone gateway, lock tests, probes |
-| M2 | Sync worker | integration convergence + crash-during-apply |
-| M3 | HA cluster runtime | 3-node local HA + chaos suite |
-| M4 | K8s deploy (requires Track N TLS) | manifest + k3d smoke + rolling update |
-| M5 | 0.1.0 release (requires Track N cutover) | soak + security suite + resource benchmark budgets met |
+| M0 | Workspace + PLAN; all planned crates registered as placeholders | CI green on empty crates (done) |
+| M1 (weeks 2–4) | Controller parity | unit + proptest + simulation + coverage gate |
+| M1a (week 3) | Wire API (`hasqlite-proto`) | adjacent-version compatibility |
+| M1.5 (weeks 4–7, fast-track) | Standalone Single-Node Docker | Multi-stage Dockerfile, hardened standalone gateway, lock tests, probes |
+| M2 (weeks 6–8) | Sync worker with adapter-era ledger protocol | integration convergence + crash-during-apply + lease-change-mid-pull |
+| M3 (weeks 8–11) | HA cluster runtime | 3-node local HA + chaos suite |
+| M4 (weeks 11–13; requires Track N TLS by week 8) | K8s deploy | manifest + k3d smoke + rolling update |
+| M5 (weeks 13–14; requires Track N cutover) | 0.1.0 release | soak + security suite + resource benchmark budgets met |
+
+The critical path is M1 → M1.5 → M3 → M4; Track N TLS is the one external gate
+on M4 and is scheduled three weeks ahead of it.
 
 ---
 
