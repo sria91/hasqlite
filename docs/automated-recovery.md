@@ -13,9 +13,16 @@ those boundaries.
 ## 1. Problem Statement and Philosophy
 
 ### 1.1 The v1 Fail-Closed Posture
-In hasqlite v1, failover is automated only for clean, single-point failures:
-- A writer node dies $\to$ candidate candidates wait out the monotonic TTL $\to$ freshest replica acquires and activates via CAS $\to$ promotes to writer.
+In hasqlite v1, automatic failover depends on replica eligibility and access to
+authoritative lease coordination, not on a quorum of hasqlite nodes:
+- A writer node dies $\to$ candidates wait out the monotonic TTL $\to$ an eligible replica acquires and activates via CAS $\to$ promotes to writer. Lag-based acquisition delay favors, but does not guarantee, the freshest candidate.
 - A writer loses coordination $\to$ self-fences at `renew_deadline_secs` $\to$ demotes.
+- In a 3-node cluster with two nodes unavailable, a surviving writer may continue while it can renew its lease. A sole surviving replica may promote after lease release or expiry if it passes the normal promotion checks and successfully acquires and activates the lease; otherwise it remains non-writable.
+
+The peer quorum required by [post-v1 degraded recovery](#3-tier-2-cluster-consensus--degraded-failover)
+does not apply to ordinary v1 promotion. V1 promotes using the candidate's validated
+snapshot without peer-to-peer catch-up, so acknowledged writes absent from that
+snapshot may be lost even if another replica has them.
 
 However, during edge-case cluster degradation or storage anomalies, v1 intentionally
 **fails closed** to prioritize data safety over availability:
