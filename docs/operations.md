@@ -6,7 +6,7 @@
 |--------|--------|
 | Audit log | append-only JSON lines on the PVC (action, from, to, lease gen, first and last commit time per generation) |
 | Role state file | `replica` / `writer:<gen>` (informational; never used as authority) |
-| Metrics | Prometheus: `hasqlite_sync_lag_seconds`, `hasqlite_lease_held`, `hasqlite_promotion_denied_total` (by `PromotionError` variant), `hasqlite_renewal_deadline_misses_total`, `hasqlite_origin_wal_bytes`, `hasqlite_snapshot_future_skew_seconds` (replica: origin-stamped snapshot start minus local wall time at ledger publication) |
+| Metrics | Prometheus: `hasqlite_sync_lag_seconds`, `hasqlite_lease_held`, `hasqlite_promotion_denied_total` (by `PromotionError` variant), `hasqlite_renewal_deadline_misses_total`, `hasqlite_origin_wal_bytes`, `hasqlite_snapshot_future_skew_seconds` (replica: origin-stamped snapshot start minus local wall time at ledger publication), `hasqlite_diverged_files`, `hasqlite_diverged_bytes`, `hasqlite_divergence_preservation_pending` (1 while a former writer is blocked on rule 15 preservation) |
 | Tracing | `tracing` spans: `tick`, `sync`, `promote` |
 
 Alerts (recommended):
@@ -16,6 +16,8 @@ Alerts (recommended):
 - promotion denied spike
 - lease holder missing > TTL
 - snapshot future skew approaching `max_future_skew_secs` (writer clock ahead; failover would be denied)
+- `hasqlite_diverged_files > 0` (unreconciled divergent commits; follow the diverged data recovery runbook)
+- divergence preservation pending for > 2 sync intervals (former writer blocked, typically by ENOSPC)
 
 ---
 
@@ -52,7 +54,9 @@ constraints, and [§10.6](#106-unresolved-guarantees-and-recovery-policy) identi
 | Writer stalls inside `COMMIT` beyond the fencing margin | A commit can finish after a peer promotes. The default margin is 4 seconds and the minimum is 2 seconds. The `enforce_write_fence` check before `COMMIT` and `sqlite3_interrupt` at the deadline do not eliminate this residual risk. |
 | Replica crashes during in-place page application | The replica can contain a partially applied snapshot. Invalidate and fsync the ledger before application; deny promotion until a full sync and `PRAGMA integrity_check` pass. Track N provides atomic/locked application. |
 | Disk full during page application or ledger publication | Sync fails and the ledger remains invalid; the affected node cannot promote. |
-| Former writer contains divergent commits | Preserve its database before resync. Those commits are not automatically merged into the new writer; recovery may require operator reconciliation. |
+| Former writer contains divergent commits | Preserve its database as a diverged copy before resync (safety contract rule 15). The copy includes WAL-only commits, survives crashes during preservation, and blocks resync and promotion if it cannot be written. Those commits are not automatically merged into the new writer; recovery requires operator reconciliation. |
+| Former writer's volume is lost | Its diverged commits are unrecoverable. Replicas holding snapshots newer than the promoted one are overwritten on their next resync and are not preserved in v1. |
+| Diverged copies accumulate | v1 never deletes them automatically; each one can be as large as the database. Monitor `hasqlite_diverged_bytes` and size the volume for at least one extra database copy. |
 | Commit completes but its response is lost | The client has an unknown outcome. Blind retries can duplicate operations; surface uncertainty and retry automatically only when rejection before execution is definite. |
 
 SQLite transaction atomicity and replication durability are separate concerns.

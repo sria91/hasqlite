@@ -340,7 +340,22 @@ Events per tick (informed by the upstream `ReconcileDecision` model):
      (`/ready`). The sync engine refuses to run once the role is `Writer`.
    - On `Demote`: `sqlite3_interrupt` in-flight statements, close writable
      handles, remove the pod label, update role file to `replica`, update probes.
-     Before the first resync, preserve the database as `*.diverged-g<gen>`.
+     Before the first resync, preserve the database as a diverged copy
+     (contract rule 15):
+     1. The durable divergence marker `.hasqlite.divergence`, written at
+        activation, makes preservation pending. Pending preservation blocks sync,
+        replica reads and promotion. On startup, preservation is also pending if
+        the lease's `writer` epoch names this node while another node holds the
+        lease, or if the marker is unreadable while database files exist. That
+        covers crashes and partitions, where the node never runs `Demote`.
+     2. Back up the database with the SQLite online backup API, so WAL-only
+        commits are included, to `diverged/<db>.diverged-g<gen>.tmp`. Then fsync
+        it, run `integrity_check`, rename it into place and fsync the directory.
+     3. Append an audit entry, then remove the marker. A crash before this step
+        repeats the procedure on the next start.
+     4. If space is short or the copy fails, stay unsynced and unpromotable and
+        raise an alert until an operator frees space or runs the audited
+        `hasqlite diverged discard`.
    - On `StayReplica`: trigger scheduled sync pull from current writer if due.
 
 ### Lease timing and write fencing

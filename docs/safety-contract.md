@@ -122,7 +122,10 @@ protocol.
       freshness check is needed.
     - Before opening a writable handle, it *activates*: a CAS that records
       `writer = (self, generation, now)`. If activation fails, or the renewal
-      deadline has passed, it stays a replica.
+      deadline has passed, it stays a replica. After a successful activation and
+      still before the writable handle opens, it durably writes the divergence
+      marker for that generation (rule 15). If the marker write fails, it does
+      not open the handle and demotes.
     - A lost acquisition or activation CAS denies promotion (fail closed). An
       acquired but never-activated generation leaves the previous `writer` epoch
       in place, so peers synced from that writer remain promotable.
@@ -145,9 +148,53 @@ protocol.
     **immediate demotion**. The node stops accepting writes, interrupts in-flight
     statements, and the gateway returns `NOT_LEADER` with a redirect hint.
 15. A former writer **rejoins as replica** and must resync before it is eligible
-    to promote again. Before its first resync it preserves its database as
-    `*.diverged-g<generation>`, because commits it accepted after the last
-    replica sync are not on the new writer.
+    to promote again. Before its first resync it preserves its database as a
+    *diverged copy*, because commits it accepted after the last replica sync are
+    not on the new writer. Those commits come from normal replication lag, or
+    from a commit that stalled past the fencing margin and finished after a peer
+    promoted (rule 5). Preservation is fail-closed:
+    - **Trigger.** The trigger is a durable divergence marker,
+      `${data.dir}/.hasqlite.divergence`, holding the generation. It is written
+      at activation (rule 10) and removed only after the diverged copy is
+      durable. The informational role file is never the trigger, because a crash
+      or partition usually ends a writer before it can update that file. On
+      startup in clustered mode, preservation is also pending in two other cases:
+      the lease's `writer` epoch names this node while another node holds the
+      lease, or the marker is unreadable while database files exist. A pending
+      preservation blocks every sync pull, replica read and promotion attempt
+      until it completes. Standalone mode writes no marker, because it has no
+      peers to diverge from.
+    - **Contents.** The copy must contain every committed transaction, including
+      frames that exist only in `-wal`. It is taken with the SQLite online backup
+      API (`sqlite3_backup_*`) from a local read connection with no writable
+      handles open. The source files are never renamed or copied file by file,
+      because a main file without its WAL silently drops the commits being
+      preserved.
+    - **Durable, idempotent write.** The copy is written to
+      `${data.dir}/diverged/<db>.diverged-g<generation>.tmp`, fsynced, checked with
+      `PRAGMA integrity_check`, renamed to `<db>.diverged-g<generation>`, and its
+      directory is fsynced. Only then is an audit entry appended and the marker
+      removed (also followed by a directory fsync). A crash at any step leaves the
+      marker in place, and the next start redoes the procedure. A finished copy
+      that already exists is verified and reused, not overwritten. If the
+      generation cannot be determined (an unreadable marker), the copy is named
+      `<db>.diverged-unknown-<unix secs>`.
+    - **Insufficient space or I/O failure.** Free space is checked before the
+      copy (database plus WAL plus a margin). If space is short, or the copy
+      fails, the node does not resync, cannot promote, and raises an alert. The
+      only way past this without preserving is an audited operator command
+      (`hasqlite diverged discard --generation <g>`) that explicitly accepts the
+      loss.
+    - **Isolation.** `${data.dir}/diverged/` is excluded from pre-flight database
+      discovery, gateway database-name resolution (rule 17) and replication
+      serving. A diverged copy is never opened for writes, served or promoted.
+    - **Retention.** v1 never deletes diverged copies automatically. They remain
+      until an operator reconciles and discards them (diverged data recovery
+      runbook). Their count and size are exported as metrics.
+    - **Scope.** The diverged copy exists only on the former writer's volume. If
+      that volume is lost, its unreplicated commits are lost. Replicas whose
+      snapshots are newer than the promoted one are overwritten on their next
+      resync and are not preserved in v1.
 16. **Planned switchover**: a stopping writer stops accepting writes, waits a
     bounded time for replicas to complete a snapshot started after that point,
     then *releases* the lease (holder cleared, generation unchanged, `writer`

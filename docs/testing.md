@@ -60,6 +60,7 @@ Seeds are logged for replay. 1,000 seeds per PR, 100,000 nightly.
 | `gateway_hardening.rs` | [§6.6](#66-security-tests) payload suite on writer and replica | new (Phase 1b) |
 | `token_rotation.rs` | rotated token file takes effect on the next pull without restart; a rejected token never appears in the error chain and leaves an existing replica file untouched | `hasqlite-sync/tests/pull_replica.rs` (exists) |
 | `adapter_ledger_protocol.rs` | lease version changes between the pre-pull observation and the post-fsync re-check → ledger stays invalidated; holder ≠ writer epoch after the pull → invalidated; unchanged lease → ledger stamped with the pre-pull writer epoch and `writer.renewed_at_secs` | new (Phase 2, safety contract rule 9) |
+| `diverged_isolation.rs` | files under `diverged/` are skipped by pre-flight discovery, rejected by gateway database-name resolution, never served by replication, and never deleted by the node | new (Phase 2, safety contract rule 15) |
 | `replication_role_gate.rs` | a node that is not the activated writer refuses to serve pulls through the adapter's replication server | new (Phase 2) |
 | `exclusive_replica_path.rs` | a second pull into a path with a pull in progress fails with `SyncInProgress` before any I/O | `hasqlite-sync` unit tests (exists) |
 | `readonly_replica_reads.rs` | `--allow-replica-reads` with a concurrent reader loop running `PRAGMA integrity_check` during sync (Track N) | gateway flags |
@@ -93,6 +94,10 @@ in container-less environments.
 | Dual lease claim | corrupt lease file | single winner via generation rules |
 | Rolling lease-timing change | restart replicas with `ttl 4 / deadline 2` while the writer runs `ttl 10 / deadline 6`, then `SIGSTOP` the writer | no replica campaigns before 10s of unchanged version (effective TTL honours the holder's recorded TTL); no overlapping commits |
 | Unrelated Lease writes | annotate and label the Kubernetes Lease object every second while the writer is `SIGSTOP`ped | failover happens after the effective TTL regardless; the extra writes neither renew nor delay |
+| Divergence: WAL-only commits | `SIGSTOP` writer past its deadline with `wal_autocheckpoint = 0`, peer promotes, `SIGKILL` the old writer, restart it | before any sync pull, `diverged/<db>.diverged-g<g>` exists, passes `integrity_check` and contains every commit acknowledged by the old writer, including commits present only in `-wal` |
+| Divergence: crash during preservation | `kill -9` the former writer during the backup, after the rename, and before marker removal (one run each) | the marker survives; on restart preservation is redone or the finished copy is verified and reused; no sync pull runs before the marker is removed |
+| Divergence: lost role file | delete the role file on a crashed former writer whose lease `writer` epoch still names it | preservation still runs (triggered by the marker or the lease epoch), never skipped |
+| Divergence: disk full | ENOSPC during preservation | no resync and no promotion from that node; `hasqlite_divergence_preservation_pending = 1` and the alert fires; after space is freed, preservation completes and the node resyncs; `hasqlite diverged discard` is the only bypass and is audited |
 | Writer clock step back | libfaketime steps the writer clock −60s between a renewal and the next snapshot | snapshot stamp holds at the renewal value; lag reads 0, not 60s, and promotion eligibility is unchanged |
 
 Every chaos and E2E run records client operations (sequence number; acknowledged, failed or outcome unknown) and checks
