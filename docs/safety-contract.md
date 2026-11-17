@@ -12,8 +12,10 @@ protocol.
    `renewed_at_secs`, `ttl_secs` (the holder's configured TTL), a hasqlite-owned
    `version` token that changes on every lease write *made by hasqlite* (acquire,
    activate, renew, release), and the last **activated writer epoch** (`writer`:
-   node ID, generation, last renewal). The backend's native revision (Kubernetes
-   `resourceVersion`, file record counter) is the compare-and-swap precondition and
+   node ID, generation, last renewal, `promoted_from` and, after a planned
+   switchover, `stopped_at_secs`; rules 10 and 16). The backend's native
+   revision (Kubernetes `resourceVersion`, file record counter) is the
+   compare-and-swap precondition and
    is bumped atomically with `version`, but it is never used as the liveness
    signal: an unrelated actor annotating or labelling the Lease object changes the
    native revision without changing `version`. Acquiring the lease does not change
@@ -101,6 +103,15 @@ protocol.
      writer.node_id`; and (3) serve pulls only while it is itself the activated
      writer (a role-gating interceptor in front of the adapter's replication
      server). A lease change observed in (2) leaves the ledger invalidated.
+     For a planned switchover (rule 16), the pre-pull renewal may predate the
+     stop stamp, so it cannot show a pull to be post-stop. Instead, right after
+     issuing the stop stamp, the stopping writer performs a renew CAS stamped
+     through `WriterClock` strictly after the stop stamp. A replica whose
+     pre-pull observation in (1) already contains that renewal starts its pull
+     after writes stopped, so its `synced_at_secs := writer.renewed_at_secs`
+     is later than the stop stamp and qualifies for the lossless check. A pull
+     whose observation predates that renewal carries an earlier stamp and does
+     not qualify. Checks (1)–(3) apply unchanged.
 
 ## Promotion
 
@@ -122,7 +133,16 @@ protocol.
       freshness check is needed.
     - Before opening a writable handle, it *activates*: a CAS that records
       `writer = (self, generation, now)`. If activation fails, or the renewal
-      deadline has passed, it stays a replica.
+      deadline has passed, it stays a replica. The activation CAS also records
+      `writer.promoted_from = (source generation, synced_at_secs, source
+      stopped_at_secs)`: the first two come from the validated ledger, and the
+      third is copied from the observed lease's `writer.stopped_at_secs` (absent
+      if the source epoch was not released by a planned switchover). Activation
+      replaces the source epoch, so this copy is the only durable record of the
+      stop stamp that rule 15's lossless handover check compares against.
+      After a successful activation and still before the writable handle opens,
+      it durably writes the divergence marker with id `g<generation>` (rule 15).
+      If the marker write fails, it does not open the handle and demotes.
     - A lost acquisition or activation CAS denies promotion (fail closed). An
       acquired but never-activated generation leaves the previous `writer` epoch
       in place, so peers synced from that writer remain promotable.
@@ -145,13 +165,122 @@ protocol.
     **immediate demotion**. The node stops accepting writes, interrupts in-flight
     statements, and the gateway returns `NOT_LEADER` with a redirect hint.
 15. A former writer **rejoins as replica** and must resync before it is eligible
-    to promote again. Before its first resync it preserves its database as
-    `*.diverged-g<generation>`, because commits it accepted after the last
-    replica sync are not on the new writer.
+    to promote again. Before its first resync it preserves its database as a
+    *diverged copy*, because commits it accepted after the last replica sync are
+    not on the new writer. Those commits come from normal replication lag, or
+    from a commit that stalled past the fencing margin and finished after a peer
+    promoted (rule 5). Preservation is fail-closed. This rule is the normative
+    description of the procedure; other documents only summarize it.
+    - **Trigger.** The trigger is a durable divergence marker,
+      `${data.dir}/.hasqlite.divergence`, holding a *divergence id*. Activation
+      writes it with id `g<generation>` (rule 10). It is removed only after the
+      diverged copy is durable, after a verified lossless handover (rule 16), or
+      by an operator discard. The informational role file is never the trigger,
+      because a crash or partition usually ends a writer before it can update
+      that file. On startup in clustered mode, preservation is also pending in
+      three other cases:
+      - the lease's `writer` epoch names this node while another node holds the
+        lease (id `g<writer generation>`);
+      - the marker is unreadable while database files exist (see *Unknown
+        generation*);
+      - the volume holds database files and a standalone lease record but has
+        never run in clustered mode, so a standalone volume joining a cluster is
+        preserved before its first resync (id `standalone-g<standalone
+        generation>`).
+      A pending preservation blocks every sync pull, replica read and promotion
+      attempt until it completes. Standalone mode writes no marker, because it
+      has no peers to diverge from; the third case covers its later conversion.
+    - **Lossless handover check.** Before copying, the node reads the lease. If
+      an activated writer's `promoted_from` names this node's generation `g`,
+      carries `g`'s stop stamp, and has a snapshot stamp later than that stop
+      stamp (rules 10 and 16), the successor holds every commit of `g`. The node then appends an audit entry
+      and removes the marker without making a copy. If the lease still shows
+      `g` released with `stopped_at_secs` and no successor has activated yet,
+      the node stays pending and checks again on each tick, since it has no
+      writer to sync from anyway. In every other case, including a lease that
+      has since moved past the successor, it preserves.
+    - **Unknown generation.** If the marker is unreadable, the node hard-links it
+      (`linkat`) to `${data.dir}/.hasqlite.divergence.unreadable-<unix secs>`
+      for forensics and fsyncs the directory, leaving the unreadable marker in
+      place as the trigger. It then durably writes a replacement marker with id
+      `unknown-<unix secs>`, taken at that attempt, to a temp file, fsyncs it,
+      renames it over the unreadable marker and fsyncs the directory. A marker
+      exists at every step, so a crash at any point leaves preservation pending;
+      a crash before the rename simply repeats this step with a new id. Later
+      restarts read the replacement and reuse its id, so the procedure stays
+      idempotent. Failure to write the replacement is an I/O failure (below).
+    - **Contents.** The copy must contain every committed transaction, including
+      frames that exist only in `-wal`. It is taken with the SQLite online backup
+      API (`sqlite3_backup_*`) from a local read connection with no writable
+      handles open. The source files are never renamed or copied file by file,
+      because a main file without its WAL silently drops the commits being
+      preserved.
+    - **Naming.** The copy is `${data.dir}/diverged/<db>.diverged-<id>`. `<db>` is
+      the database path relative to `data.dir`, with `%` encoded as `%25` and `/`
+      as `%2F`, so names are flat and cannot collide.
+    - **Durable, idempotent write.** The copy is written to `<name>.tmp`,
+      fsynced, checked with `PRAGMA integrity_check`, renamed to `<name>`, and
+      the directory is fsynced. Only then is an audit entry appended and the
+      marker removed, followed by a directory fsync. A crash at any step leaves
+      the marker in place, and the next start redoes the procedure: a leftover
+      `.tmp` is deleted and retaken, and a finished copy with the same id is
+      verified with `integrity_check` and reused, not overwritten.
+    - **Insufficient space or I/O failure.** Before copying, the node requires
+      free space of the database size plus the WAL size, plus 10% of that sum
+      and at least 64 MiB. If space is short, or the copy fails, the node does
+      not resync, cannot promote, reports
+      `hasqlite_divergence_preservation_pending = 1` and raises an alert. The
+      only way past this without preserving is an operator discard, which
+      explicitly accepts the loss.
+    - **Permissions and paths.** `diverged/` is created with mode `0700` and
+      copies with mode `0600`, owned by the node's UID. Every path is opened
+      relative to a directory handle on `data.dir` (`openat`) with `O_NOFOLLOW`.
+      Startup fails closed if `diverged/` exists but is a symlink, is not a
+      directory, or is owned by another UID.
+    - **Isolation.** `${data.dir}/diverged/` and `${data.dir}/ancestors/`
+      ([automated-recovery.md §4.2](automated-recovery.md#42-automated-divergence-reconciler))
+      are excluded from pre-flight database discovery, gateway database-name
+      resolution and replication serving. A diverged copy is never opened for
+      writes, served or promoted.
+    - **Retention and metrics.** v1 never deletes diverged copies automatically.
+      They remain until an operator reconciles and discards them (diverged data
+      recovery runbook). `hasqlite_diverged_files` and `hasqlite_diverged_bytes`
+      count only finished copies directly under `diverged/` named
+      `<db>.diverged-<id>`; temp files, exports and ancestors are not counted.
+    - **Operator discard.** `hasqlite diverged discard --id <id>
+      --confirm-data-loss --reason <text>` deletes the copy for `<id>` or, while
+      preservation for `<id>` is pending, removes the marker without preserving.
+      It refuses an id that matches neither a copy nor the pending marker, and
+      refuses to run without `--confirm-data-loss`. Each use appends an audit
+      entry with the id, the file size, the reason, the invoking UID and user
+      name, and whether a pending preservation was bypassed.
+    - **Scope.** The diverged copy exists only on the former writer's volume. If
+      that volume is lost, its unreplicated commits are lost. Replicas whose
+      snapshots are newer than the promoted one are overwritten on their next
+      resync and are not preserved in v1.
 16. **Planned switchover**: a stopping writer stops accepting writes, waits a
     bounded time for replicas to complete a snapshot started after that point,
     then *releases* the lease (holder cleared, generation unchanged, `writer`
     renewal time updated) so a replica can acquire without waiting a TTL.
+    Stopping writes means rejecting new write requests, then draining or
+    aborting (`sqlite3_interrupt`) every in-flight write transaction and
+    waiting until no write transaction is open and every in-flight `COMMIT` has
+    returned. Only then does the writer issue a stop stamp through
+    `WriterClock`, so no commit can land after a snapshot that qualifies as
+    post-stop. It stamps every later snapshot strictly after the stop stamp,
+    waiting for its clock to pass it if needed. Normally that is under one
+    second, but after a backward wall-clock step `WriterClock` holds at the
+    last stamp until the wall clock catches up, which can take longer than a
+    minute. The wait is bounded by the switchover's final-sync timeout and
+    spends the shutdown grace period; if it runs out, the switchover is treated
+    as a timed-out final sync (no lossless handover, so the former writer
+    preserves under rule 15). The release CAS records the stop stamp as
+    `writer.stopped_at_secs`. A successor that promotes from a
+    post-stop snapshot therefore records `promoted_from` with a later stamp,
+    which lets the former writer skip the diverged copy (rule 15, *lossless
+    handover check*). If the successor promoted from an older snapshot, for
+    example after the final sync timed out, the former writer preserves as
+    usual.
 
 ## Fencing and access control
 

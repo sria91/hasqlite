@@ -13,16 +13,23 @@ those boundaries.
 ## 1. Problem Statement and Philosophy
 
 ### 1.1 The v1 Fail-Closed Posture
-In hasqlite v1, failover is automated only for clean, single-point failures:
-- A writer node dies $\to$ candidate candidates wait out the monotonic TTL $\to$ freshest replica acquires and activates via CAS $\to$ promotes to writer.
+In hasqlite v1, automatic failover depends on replica eligibility and access to
+authoritative lease coordination, not on a quorum of hasqlite nodes:
+- A writer node dies $\to$ candidates wait out the monotonic TTL $\to$ an eligible replica acquires and activates via CAS $\to$ promotes to writer. Lag-based acquisition delay favors, but does not guarantee, the freshest candidate.
 - A writer loses coordination $\to$ self-fences at `renew_deadline_secs` $\to$ demotes.
+- In a 3-node cluster with two nodes unavailable, a surviving writer may continue while it can renew its lease. A sole surviving replica may promote after lease release or locally observed expiry if it passes the normal promotion checks and successfully acquires and activates the lease; otherwise it remains non-writable.
+
+The peer quorum required by [post-v1 degraded recovery](#3-tier-2-cluster-consensus--degraded-failover)
+does not apply to ordinary v1 promotion. V1 promotes using the candidate's validated
+snapshot without peer-to-peer catch-up, so acknowledged writes absent from that
+snapshot may be lost even if another replica has them.
 
 However, during edge-case cluster degradation or storage anomalies, v1 intentionally
 **fails closed** to prioritize data safety over availability:
 1. **All replicas exceed `max_lag_secs`**: Promotion is denied cluster-wide; cluster halts until an operator manually overrides or force-promotes.
 2. **Activated writer dies before 1st replica sync**: Replicas hold snapshots from generation $g-1$, but lease requires writer epoch $g$; failover blocks.
 3. **Replica corruption or torn snapshot**: Freshness ledger is invalidated; replica is unpromotable and cannot heal without operator intervention.
-4. **Divergent former writer reconnects**: Database preserved as `*.diverged-g<gen>`; orphaned commits remain stranded on local disk.
+4. **Divergent former writer reconnects**: The database is preserved as `diverged/<db>.diverged-<id>` (normally `<id>` = `g<gen>`), crash-safely and including WAL-only commits (safety contract rule 15). The orphaned commits stay on that node's local disk until an operator reconciles them, and are lost if that volume is lost.
 5. **Client "outcome unknown" across failovers**: Network failure between `COMMIT` and response leaves clients unable to safely retry mutating queries.
 
 ### 1.2 The Self-Healing Objectives
@@ -236,7 +243,7 @@ Instead of failing permanently:
 ## 4. Tier 3: Divergent Data Capture & Reconciliation
 
 When a partitioned writer commits writes locally past its renewal deadline and later demotes,
-Rule 15 preserves its database as `*.diverged-g<gen>`. Post-v1 automates data recovery from
+Rule 15 preserves its database as `diverged/<db>.diverged-<id>`. Post-v1 automates data recovery from
 these files.
 
 ### 4.1 SQLite Changeset Stream
@@ -276,20 +283,59 @@ these files.
 
 ### 4.2 Automated Divergence Reconciler
 When a former writer re-attaches as a replica:
-1. **Detection & Ancestor Preservation**:
-   - The supervisor identifies `/var/lib/hasqlite/*.diverged-g<gen>`.
-   - To ensure the common ancestor snapshot is not mutated by subsequent replica writes or writer promotions,
-     the last verified snapshot from the shared epoch is persisted as an immutable ancestor file:
-     `/var/lib/hasqlite/*.ancestor-g<gen>.db` and retained until divergence export is finished.
+1. **Detection & Fork Point**:
+   - The supervisor finds `/var/lib/hasqlite/diverged/<db>.diverged-<id>`, written by the v1 preservation
+     procedure (safety contract rule 15).
+   - The fork point is the snapshot the *new* writer promoted from. That snapshot lives on the promoted node,
+     not on the former writer, so the former writer cannot reconstruct it locally. The fork point is therefore
+     recorded as a changeset watermark, not as a file:
+     - At activation, the promoting node records `fork = (source_generation, highest _hasqlite_changesets
+       sequence in its validated snapshot)` in its audit log and in an internal replicated table
+       (`_hasqlite_epochs`).
+     - The former writer receives that table on its first resync, which runs after preservation. Its diverged
+       row changes are then exactly the changesets in the diverged copy for generation `source_generation` with
+       a sequence above the watermark, and the reconciler exports them directly from that archive, with no
+       ancestor file and no `sqlite3session_diff()`.
+     - Row changesets do not record DDL (a dropped, renamed or altered table leaves no changeset), so the
+       watermark alone is not enough to reconcile schema changes. Schema reconciliation needs either a
+       retained ancestor or a recorded schema history covering the diverged range (DDL captured in the same
+       transaction as the changesets). With neither, the export is flagged incomplete for schema changes and
+       left for the operator.
+     - **Copies without a recorded fork point.** v1 activation does not write `_hasqlite_epochs` and no
+       migration backfills it: v1 has no `_hasqlite_changesets` archive, so there is no watermark to recover.
+       Diverged copies from promotions made before `_hasqlite_epochs` existed therefore use the ancestor
+       fallback below if an ancestor was retained; otherwise they are marked unreconcilable, preserved
+       unchanged, and left for the operator's diverged data recovery runbook.
+   - **Fallback ancestor (archive gap):** a row-level table diff needs the fork snapshot itself. When
+     `recovery.retain_promotion_ancestor = true`, the candidate copies its validated snapshot to
+     `/var/lib/hasqlite/ancestors/<db>.ancestor-g<gen>.db` (online backup API, with rule 15's permission and
+     path rules) after pausing scheduled sync and before the acquisition CAS:
+     - The snapshot cannot change in between, because sync stays paused while the candidate campaigns.
+     - The copy runs while no lease is held, so it never spends the new writer's renewal deadline. It does
+       delay the campaign by about one database copy, and failover takes that much longer.
+     - A failed or short-of-space copy never blocks promotion. The candidate deletes the partial file, records
+       `ancestor = none` in the audit entry and promotes without it. A lost CAS deletes the copy.
+     - The file is kept until every divergence export against it has finished. `ancestors/` is isolated like
+       `diverged/` and is not counted by the diverged-copy metrics.
+
+     The protocol that moves the ancestor
+     or the diverged copy between nodes, or that runs the reconciler on the promoted node instead, is still
+     open. Without a retained ancestor, an archive gap makes the export incomplete: it is flagged as such and
+     left for the operator.
 2. **Schema Audit & Diff Extraction**:
-   - `sqlite3session_diff()` requires identical schemas on compared tables. The reconciler first queries
-     `sqlite_master` on both databases to detect schema modifications (tables added, dropped, or altered).
+   - With a complete changeset archive, row changes come from the archived changesets above the watermark
+     (step 1); schema changes come from the recorded schema history or, failing that, from comparing
+     `sqlite_master` with a retained ancestor.
+   - The steps below are the incomplete-archive fallback and require a retained ancestor.
+     `sqlite3session_diff()` requires identical schemas on compared tables, so the reconciler first queries
+     `sqlite_master` on the diverged copy and the ancestor to detect schema modifications (tables added,
+     dropped, or altered).
    - For compatible tables, `sqlite3session_diff()` computes row-level changesets against the ancestor file.
    - For tables created on the diverged branch, rows are exported via table dumps directly into the DLQ
      outside `sqlite3session_diff()` to ensure no committed rows are stranded.
 3. **Dead-Letter Queue (DLQ) Export**:
    - Orphaned rows and schema DDL are exported to a structured audit file:
-     `/var/lib/hasqlite/diverged/diverged-g<gen>-export.jsonl`.
+     `/var/lib/hasqlite/diverged/exports/<db>.diverged-<id>.jsonl`.
    - An alert is emitted: `hasqlite_diverged_commits_exported_total`.
 4. **Automated Replay (Configurable)**:
    - If `recovery.auto_reconcile_divergence = true`, the reconciler identifies transactions strictly
@@ -344,6 +390,9 @@ max_quarantined_files = 5
 # Divergence reconciliation
 auto_export_diverged_commits = true
 auto_reconcile_divergence = false
+# Keep the promoted snapshot under ancestors/ as a fork-point for table-diff fallback
+# (costs one database copy of disk per promotion and delays each campaign by one copy)
+retain_promotion_ancestor = false
 
 [idempotency]
 # Enable replicated transactional idempotency tables

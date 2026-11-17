@@ -6,7 +6,7 @@
 |--------|--------|
 | Audit log | append-only JSON lines on the PVC (action, from, to, lease gen, first and last commit time per generation) |
 | Role state file | `replica` / `writer:<gen>` (informational; never used as authority) |
-| Metrics | Prometheus: `hasqlite_sync_lag_seconds`, `hasqlite_lease_held`, `hasqlite_promotion_denied_total` (by `PromotionError` variant), `hasqlite_renewal_deadline_misses_total`, `hasqlite_origin_wal_bytes`, `hasqlite_snapshot_future_skew_seconds` (replica: origin-stamped snapshot start minus local wall time at ledger publication) |
+| Metrics | Prometheus: `hasqlite_sync_lag_seconds`, `hasqlite_lease_held`, `hasqlite_promotion_denied_total` (by `PromotionError` variant), `hasqlite_renewal_deadline_misses_total`, `hasqlite_origin_wal_bytes`, `hasqlite_snapshot_future_skew_seconds` (replica: origin-stamped snapshot start minus local wall time at ledger publication), `hasqlite_diverged_files` and `hasqlite_diverged_bytes` (finished `diverged/<db>.diverged-<id>` copies only), `hasqlite_divergence_preservation_pending` (1 while a former writer is blocked on rule 15 preservation) |
 | Tracing | `tracing` spans: `tick`, `sync`, `promote` |
 
 Alerts (recommended):
@@ -16,6 +16,8 @@ Alerts (recommended):
 - promotion denied spike
 - lease holder missing > TTL
 - snapshot future skew approaching `max_future_skew_secs` (writer clock ahead; failover would be denied)
+- `hasqlite_diverged_files > 0` (unreconciled divergent commits; follow the diverged data recovery runbook)
+- `hasqlite_divergence_preservation_pending == 1` for more than 10 minutes (former writer blocked, typically by ENOSPC; a pending preservation stops sync, so sync intervals are not a usable unit)
 
 ---
 
@@ -39,7 +41,7 @@ constraints, and [§10.6](#106-unresolved-guarantees-and-recovery-policy) identi
 | Torn replica promoted after crash during sync | Ledger invalidated before apply, published only after fsync (Phase 2); atomic apply in Track N ([§10.2](#102-data-safety-and-durability-limitations)) |
 | Writer dies before any replica syncs from it | Fail closed; manual promotion runbook; alert on lag ([§10.3](#103-availability-and-promotion-failure-modes)) |
 | Lost or duplicated client writes on failover | Client retries only definite `NOT_LEADER`; "outcome unknown" surfaced; optional idempotency key, whose failover-safe deduplication semantics are unresolved ([§10.2](#102-data-safety-and-durability-limitations), [§10.6](#106-unresolved-guarantees-and-recovery-policy)) |
-| Large catch-up after failover | PreStop sync + pre-activation catch-up from a fresher peer; monitor lag ([§10.3](#103-availability-and-promotion-failure-modes)) |
+| Large catch-up after failover | PreStop sync; monitor lag. Pre-activation catch-up from a fresher peer is post-v1 (safety contract rule 13) ([§10.3](#103-availability-and-promotion-failure-modes)) |
 | Upstream API changes during transition | Pin the adapter by commit, build with `--locked`, isolate it; remove the integration at native-backend cutover ([§10.5](#105-deployment-access-and-compatibility-constraints)) |
 | StatefulSet rollout stall or repeated failovers | Document `/healthz` vs `/ready`; writer-last rollout with planned switchover; PodDisruptionBudget ([§10.5](#105-deployment-access-and-compatibility-constraints)) |
 
@@ -52,7 +54,9 @@ constraints, and [§10.6](#106-unresolved-guarantees-and-recovery-policy) identi
 | Writer stalls inside `COMMIT` beyond the fencing margin | A commit can finish after a peer promotes. The default margin is 4 seconds and the minimum is 2 seconds. The `enforce_write_fence` check before `COMMIT` and `sqlite3_interrupt` at the deadline do not eliminate this residual risk. |
 | Replica crashes during in-place page application | The replica can contain a partially applied snapshot. Invalidate and fsync the ledger before application; deny promotion until a full sync and `PRAGMA integrity_check` pass. Track N provides atomic/locked application. |
 | Disk full during page application or ledger publication | Sync fails and the ledger remains invalid; the affected node cannot promote. |
-| Former writer contains divergent commits | Preserve its database before resync. Those commits are not automatically merged into the new writer; recovery may require operator reconciliation. |
+| Former writer contains divergent commits | Preserve its database as a diverged copy before resync (safety contract rule 15). The copy includes WAL-only commits, survives crashes during preservation, and blocks resync and promotion if it cannot be written. Those commits are not automatically merged into the new writer; recovery requires operator reconciliation. |
+| Former writer's volume is lost | Its diverged commits are unrecoverable. Replicas holding snapshots newer than the promoted one are overwritten on their next resync and are not preserved in v1. |
+| Diverged copies accumulate | v1 never deletes them automatically; each one can be as large as the database. A planned switchover leaves no copy only if, when the former writer returns, the lease's activated writer is still the successor whose `promoted_from` names the former generation, its stop stamp and a later post-stop snapshot stamp (rules 15 and 16). If that successor has already been replaced, the former writer preserves anyway, as it does after crash failovers and timed-out switchovers. Monitor `hasqlite_diverged_bytes` and size the volume for every retained copy, at least one extra database copy (two with `retain_promotion_ancestor`), plus rule 15's preservation headroom: free space for the database and its WAL plus 10% of that sum, at least 64 MiB, on top of copies already kept. Remove reconciled copies with `hasqlite diverged discard --id <id> --confirm-data-loss --reason <text>`, which is audited with the operator's identity. |
 | Commit completes but its response is lost | The client has an unknown outcome. Blind retries can duplicate operations; surface uncertainty and retry automatically only when rejection before execution is definite. |
 
 SQLite transaction atomicity and replication durability are separate concerns.
@@ -68,6 +72,8 @@ restore writes absent from the promoted replica.
 | Writer loses access to coordination | It stops committing at its renewal deadline and demotes, even if its database and client network remain healthy. |
 | Lease store is unreachable from all nodes | The writer demotes; no replacement can acquire authority until the store returns. A local expiry timer alone never authorizes promotion. |
 | Writer is partitioned from replicas but can renew | Writes continue while replica lag grows. If the writer later fails, all replicas may be too stale to promote. |
+| Two nodes are unavailable in a 3-node cluster; the surviving node is the writer | The writer may continue serving while it can renew the authoritative lease. The cluster has no replica redundancy; alert and restore a replica. If the writer loses coordination, it self-fences as described above. |
+| Two nodes are unavailable in a 3-node cluster; the surviving node is a replica | In v1, the sole survivor may promote after lease release or locally observed expiry if `validate_promotion` passes and acquisition and activation CAS operations succeed against the authoritative lease backend. No quorum of hasqlite nodes is required for ordinary v1 promotion; the lease backend must remain available. If validation or coordination fails, keep the node non-writable. The 2-of-3 peer quorum applies only to post-v1 degraded recovery, not ordinary v1 failover. Promotion may lose acknowledged writes because replication is asynchronous. |
 | All replicas exceed the freshness limit | Automatic promotion is denied; availability is sacrificed to limit data loss. While the activated writer is still serving, catch-up sync from it restores eligibility. Once it has failed, the failed writer remains the last activated writer in the observed lease, so a stale ledger may still match its epoch, and `validate_promotion` rejects promotion because lag exceeds the limit; automatic promotion is blocked and manual recovery is required. |
 | Activated writer dies before any replica syncs from it | Replicas have the wrong writer epoch and automatic failover is blocked. An acquired but never-activated generation does not have this effect. |
 | Ledger is missing, invalid, bound to another destination, self-sourced, or from the wrong writer epoch | Promotion fails closed; apparent file recency is insufficient. |

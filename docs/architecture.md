@@ -340,7 +340,14 @@ Events per tick (informed by the upstream `ReconcileDecision` model):
      (`/ready`). The sync engine refuses to run once the role is `Writer`.
    - On `Demote`: `sqlite3_interrupt` in-flight statements, close writable
      handles, remove the pod label, update role file to `replica`, update probes.
-     Before the first resync, preserve the database as `*.diverged-g<gen>`.
+     Before the first resync, preserve the database as a diverged copy. The
+     procedure is specified in [contract rule 15](safety-contract.md); in short,
+     the durable `.hasqlite.divergence` marker written at activation (not the
+     role file, and not this `Demote` path, which a crash or partition skips)
+     keeps preservation pending. Pending preservation blocks sync, replica reads
+     and promotion until a crash-safe online-backup copy exists under
+     `diverged/`, a lossless planned handover is verified from the lease (rule
+     16), or an operator runs `hasqlite diverged discard`.
    - On `StayReplica`: trigger scheduled sync pull from current writer if due.
 
 ### Lease timing and write fencing
