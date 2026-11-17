@@ -69,7 +69,7 @@ Scope:
   - `mode = "standalone"` in `ClusterConfig` (or `--mode standalone` CLI / `HASQLITE_MODE=standalone`).
   - Comprehensive pre-flight check during node startup:
     - Refuses network and FUSE filesystems for `data.dir` (`statfs`).
-    - Discovers all supported database files across `data.dir` (root and nested paths matching SQLite conventions such as `*.db`, `*.sqlite`, `*.sqlite3`, plus their `-wal` and `-shm` sidecars) alongside the lease lock and record files. `${data.dir}/diverged/` is excluded: diverged copies are never served or opened for writes (safety contract rule 15).
+    - Discovers all supported database files across `data.dir` (root and nested paths matching SQLite conventions such as `*.db`, `*.sqlite`, `*.sqlite3`, plus their `-wal` and `-shm` sidecars) alongside the lease lock and record files. `${data.dir}/diverged/` and `${data.dir}/ancestors/` are excluded: diverged copies and ancestors are never served or opened for writes (safety contract rule 15).
     - Verifies write permissions on `data.dir`, on each discovered database/sidecar file, and on the parent directory of every database (so SQLite can create WAL and shared-memory files in nested paths).
     - Fails fast on the first permission denial, logging the unwritable path, the required operation, and the active UID/GID, instead of surfacing raw SQLite I/O errors later at runtime.
   - Auto-acquire genesis writer lease through `FileLeaseSource` in mutex mode ([§3](architecture.md#standalone-single-node-mode-docker--edge--local)), writing an authoritative `LeaseRecord` at `g_prior + 1` (`1` on a fresh volume) and an activated writer epoch for itself, without requiring peer sync history or a freshness section. A volume with database files but no readable lease record fails startup; `hasqlite genesis --generation <g>` is the audited operator override.
@@ -112,10 +112,10 @@ depend on it:
 - Replica reads (`allow_replica_reads`) use read-only connections that are reopened after each completed sync. Because the adapter can expose torn pages to concurrent readers, `allow_replica_reads` stays unsupported until Track N applies snapshots through staging or under SQLite locking.
 - Clustered v1 replicates exactly one database per cluster, so a single ledger describes the whole replica. Standalone mode may still serve several databases.
 - Before its first resync after demotion, a node preserves its database as a diverged copy (safety contract rule 15):
-  - A durable divergence marker (`.hasqlite.divergence`) is written at activation, before the writable handle opens. It triggers preservation on the next demotion or startup, so a crash or partition cannot skip it. The informational role file is never the trigger.
-  - The copy is taken with the SQLite online backup API, so commits that exist only in `-wal` are included. It is written as `diverged/<db>.diverged-g<gen>` by temp file, fsync, `integrity_check`, rename and directory fsync. The marker is removed only after that; the procedure is idempotent across crashes.
-  - Fail closed on ENOSPC or I/O failure: no resync, no promotion, and an alert until the operator frees space or runs the audited `hasqlite diverged discard --generation <g>`.
-  - `diverged/` is excluded from pre-flight discovery, gateway database-name resolution and replication serving. v1 never deletes diverged copies automatically; the `hasqlite_diverged_files` and `hasqlite_diverged_bytes` gauges track them.
+  - Durable divergence marker written at activation; startup triggers for crashes, unreadable markers and standalone volumes joining a cluster.
+  - Online-backup copy to `diverged/<db>.diverged-<id>` with crash-safe, idempotent write; fail closed on ENOSPC or I/O failure.
+  - Lossless planned-handover check (`writer.promoted_from` / `writer.stopped_at_secs` in the lease, rule 16), so planned switchovers do not leave copies behind.
+  - `hasqlite diverged discard --id <id> --confirm-data-loss --reason <text>`; `diverged_files` / `diverged_bytes` / `divergence_preservation_pending` metrics.
 - Backoff and retry configuration for sync batches.
 
 Deliverables:
@@ -155,7 +155,7 @@ Deliverables:
 - Writer Service selecting `hasqlite.io/role=writer`; PodDisruptionBudget `maxUnavailable: 1`; rollout script that updates replicas first and the writer last via StatefulSet `partition`
 - Separate Secrets for the SQL token and the replication token
 - Scripts: `apply-stack.sh`, manifest validator test (copy pattern from rsync)
-- Runbooks: failover, planned switchover, manual promotion (including a writer that died before any replica synced from it), stale replica rebuild, diverged data recovery (locate the diverged copy and its audit entry, compare it with the current writer, reapply or discard the changes by hand, then `hasqlite diverged discard`)
+- Runbooks: failover, planned switchover, manual promotion (including a writer that died before any replica synced from it), stale replica rebuild, diverged data recovery (locate the diverged copy and its audit entry, compare it with the current writer, reapply or discard the changes by hand, then `hasqlite diverged discard --id <id> --confirm-data-loss`)
 
 Deliverables:
 
