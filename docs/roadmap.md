@@ -155,7 +155,7 @@ Deliverables:
 - Writer Service selecting `hasqlite.io/role=writer`; PodDisruptionBudget `maxUnavailable: 1`; rollout script that updates replicas first and the writer last via StatefulSet `partition`
 - Separate Secrets for the SQL token and the replication token
 - Scripts: `apply-stack.sh`, manifest validator test (copy pattern from rsync)
-- Runbooks: failover, planned switchover, manual promotion (including a writer that died before any replica synced from it), stale replica rebuild, diverged data recovery (locate the diverged copy and its audit entry, compare it with the current writer, reapply or discard the changes by hand, then `hasqlite diverged discard --id <id> --confirm-data-loss`)
+- Runbooks: failover, planned switchover, manual promotion (including a writer that died before any replica synced from it), stale replica rebuild, diverged data recovery (locate the diverged copy and its audit entry, compare it with the current writer, reapply or discard the changes by hand, then `hasqlite diverged discard --id <id> --confirm-data-loss --reason <text>`)
 
 Deliverables:
 

@@ -293,8 +293,19 @@ When a former writer re-attaches as a replica:
        sequence in its validated snapshot)` in its audit log and in an internal replicated table
        (`_hasqlite_epochs`).
      - The former writer receives that table on its first resync, which runs after preservation. Its diverged
-       changes are then exactly the changesets in the diverged copy for generation `source_generation` with a
-       sequence above the watermark. No ancestor file is needed while the changeset archive is complete.
+       row changes are then exactly the changesets in the diverged copy for generation `source_generation` with
+       a sequence above the watermark, and the reconciler exports them directly from that archive, with no
+       ancestor file and no `sqlite3session_diff()`.
+     - Row changesets do not record DDL (a dropped, renamed or altered table leaves no changeset), so the
+       watermark alone is not enough to reconcile schema changes. Schema reconciliation needs either a
+       retained ancestor or a recorded schema history covering the diverged range (DDL captured in the same
+       transaction as the changesets). With neither, the export is flagged incomplete for schema changes and
+       left for the operator.
+     - **Copies without a recorded fork point.** v1 activation does not write `_hasqlite_epochs` and no
+       migration backfills it: v1 has no `_hasqlite_changesets` archive, so there is no watermark to recover.
+       Diverged copies from promotions made before `_hasqlite_epochs` existed therefore use the ancestor
+       fallback below if an ancestor was retained; otherwise they are marked unreconcilable, preserved
+       unchanged, and left for the operator's diverged data recovery runbook.
    - **Fallback ancestor (archive gap):** a row-level table diff needs the fork snapshot itself. When
      `recovery.retain_promotion_ancestor = true`, the candidate copies its validated snapshot to
      `/var/lib/hasqlite/ancestors/<db>.ancestor-g<gen>.db` (online backup API, with rule 15's permission and
@@ -312,8 +323,13 @@ When a former writer re-attaches as a replica:
      open. Without a retained ancestor, an archive gap makes the export incomplete: it is flagged as such and
      left for the operator.
 2. **Schema Audit & Diff Extraction**:
-   - `sqlite3session_diff()` requires identical schemas on compared tables. The reconciler first queries
-     `sqlite_master` on both databases to detect schema modifications (tables added, dropped, or altered).
+   - With a complete changeset archive, row changes come from the archived changesets above the watermark
+     (step 1); schema changes come from the recorded schema history or, failing that, from comparing
+     `sqlite_master` with a retained ancestor.
+   - The steps below are the incomplete-archive fallback and require a retained ancestor.
+     `sqlite3session_diff()` requires identical schemas on compared tables, so the reconciler first queries
+     `sqlite_master` on the diverged copy and the ancestor to detect schema modifications (tables added,
+     dropped, or altered).
    - For compatible tables, `sqlite3session_diff()` computes row-level changesets against the ancestor file.
    - For tables created on the diverged branch, rows are exported via table dumps directly into the DLQ
      outside `sqlite3session_diff()` to ensure no committed rows are stranded.

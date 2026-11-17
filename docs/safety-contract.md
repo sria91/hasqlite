@@ -103,6 +103,15 @@ protocol.
      writer.node_id`; and (3) serve pulls only while it is itself the activated
      writer (a role-gating interceptor in front of the adapter's replication
      server). A lease change observed in (2) leaves the ledger invalidated.
+     For a planned switchover (rule 16), the pre-pull renewal may predate the
+     stop stamp, so it cannot show a pull to be post-stop. Instead, right after
+     issuing the stop stamp, the stopping writer performs a renew CAS stamped
+     through `WriterClock` strictly after the stop stamp. A replica whose
+     pre-pull observation in (1) already contains that renewal starts its pull
+     after writes stopped, so its `synced_at_secs := writer.renewed_at_secs`
+     is later than the stop stamp and qualifies for the lossless check. A pull
+     whose observation predates that renewal carries an earlier stamp and does
+     not qualify. Checks (1)–(3) apply unchanged.
 
 ## Promotion
 
@@ -125,8 +134,12 @@ protocol.
     - Before opening a writable handle, it *activates*: a CAS that records
       `writer = (self, generation, now)`. If activation fails, or the renewal
       deadline has passed, it stays a replica. The activation CAS also records
-      `writer.promoted_from = (source generation, synced_at_secs)` from the
-      validated ledger, which rule 16 uses to recognize a lossless handover.
+      `writer.promoted_from = (source generation, synced_at_secs, source
+      stopped_at_secs)`: the first two come from the validated ledger, and the
+      third is copied from the observed lease's `writer.stopped_at_secs` (absent
+      if the source epoch was not released by a planned switchover). Activation
+      replaces the source epoch, so this copy is the only durable record of the
+      stop stamp that rule 15's lossless handover check compares against.
       After a successful activation and still before the writable handle opens,
       it durably writes the divergence marker with id `g<generation>` (rule 15).
       If the marker write fails, it does not open the handle and demotes.
@@ -178,21 +191,24 @@ protocol.
       attempt until it completes. Standalone mode writes no marker, because it
       has no peers to diverge from; the third case covers its later conversion.
     - **Lossless handover check.** Before copying, the node reads the lease. If
-      an activated writer's `promoted_from` names this node's generation `g` and
-      a snapshot stamp later than `g`'s `stopped_at_secs` (rule 16), the
-      successor holds every commit of `g`. The node then appends an audit entry
+      an activated writer's `promoted_from` names this node's generation `g`,
+      carries `g`'s stop stamp, and has a snapshot stamp later than that stop
+      stamp (rules 10 and 16), the successor holds every commit of `g`. The node then appends an audit entry
       and removes the marker without making a copy. If the lease still shows
       `g` released with `stopped_at_secs` and no successor has activated yet,
       the node stays pending and checks again on each tick, since it has no
       writer to sync from anyway. In every other case, including a lease that
       has since moved past the successor, it preserves.
-    - **Unknown generation.** If the marker is unreadable, the node renames it to
-      `${data.dir}/.hasqlite.divergence.unreadable-<unix secs>` for forensics,
-      then durably writes a replacement marker (temp file, fsync, rename,
-      directory fsync) with id `unknown-<unix secs>`, taken at that first
-      attempt. Later restarts read the replacement and reuse the id, so the
-      procedure stays idempotent. Failure to write the replacement is an I/O
-      failure (below).
+    - **Unknown generation.** If the marker is unreadable, the node hard-links it
+      (`linkat`) to `${data.dir}/.hasqlite.divergence.unreadable-<unix secs>`
+      for forensics and fsyncs the directory, leaving the unreadable marker in
+      place as the trigger. It then durably writes a replacement marker with id
+      `unknown-<unix secs>`, taken at that attempt, to a temp file, fsyncs it,
+      renames it over the unreadable marker and fsyncs the directory. A marker
+      exists at every step, so a crash at any point leaves preservation pending;
+      a crash before the rename simply repeats this step with a new id. Later
+      restarts read the replacement and reuse its id, so the procedure stays
+      idempotent. Failure to write the replacement is an I/O failure (below).
     - **Contents.** The copy must contain every committed transaction, including
       frames that exist only in `-wal`. It is taken with the SQLite online backup
       API (`sqlite3_backup_*`) from a local read connection with no writable
@@ -245,11 +261,21 @@ protocol.
 16. **Planned switchover**: a stopping writer stops accepting writes, waits a
     bounded time for replicas to complete a snapshot started after that point,
     then *releases* the lease (holder cleared, generation unchanged, `writer`
-    renewal time updated) so a replica can acquire without waiting a TTL. After
-    writes stop, the writer issues a stop stamp through `WriterClock` and stamps
-    every later snapshot strictly after it, waiting for its clock to pass the
-    stop stamp if needed (at most one second). The release CAS records that
-    stamp as `writer.stopped_at_secs`. A successor that promotes from a
+    renewal time updated) so a replica can acquire without waiting a TTL.
+    Stopping writes means rejecting new write requests, then draining or
+    aborting (`sqlite3_interrupt`) every in-flight write transaction and
+    waiting until no write transaction is open and every in-flight `COMMIT` has
+    returned. Only then does the writer issue a stop stamp through
+    `WriterClock`, so no commit can land after a snapshot that qualifies as
+    post-stop. It stamps every later snapshot strictly after the stop stamp,
+    waiting for its clock to pass it if needed. Normally that is under one
+    second, but after a backward wall-clock step `WriterClock` holds at the
+    last stamp until the wall clock catches up, which can take longer than a
+    minute. The wait is bounded by the switchover's final-sync timeout and
+    spends the shutdown grace period; if it runs out, the switchover is treated
+    as a timed-out final sync (no lossless handover, so the former writer
+    preserves under rule 15). The release CAS records the stop stamp as
+    `writer.stopped_at_secs`. A successor that promotes from a
     post-stop snapshot therefore records `promoted_from` with a later stamp,
     which lets the former writer skip the diverged copy (rule 15, *lossless
     handover check*). If the successor promoted from an older snapshot, for
