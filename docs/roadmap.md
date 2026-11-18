@@ -105,22 +105,26 @@ depend on it:
      `source_generation = writer.generation`, `synced_at_secs = writer.renewed_at_secs` (a lower bound on the snapshot
      start on the writer's clock; lag is overstated by at most one retry period, never understated), and the local
      `destination_node_id`; temp file + rename + directory fsync.
-  6. The ledger lives on the same filesystem as the database (`/var/lib/hasqlite/.hasqlite.freshness` by default);
-     the pre-flight check verifies this with `statfs`/`st_dev`.
+  6. The ledger lives on the same filesystem as the databases (directory `/var/lib/hasqlite/.hasqlite.freshness/` by
+     default, one record per database); the pre-flight check verifies this with `statfs`/`st_dev`.
+  Steps 1–5 run once per database: a sync round pulls the databases of the lease's `writer.databases` concurrently,
+  up to `sync.max_concurrent_pulls`, and each record is invalidated, stamped and published independently. Records
+  carry the database's incarnation; before the first pull of a new incarnation, the replica deletes local files of
+  the old one.
 - Replication role gate: a tonic interceptor in front of the adapter's `ReplicationServer` rejects pull sessions
   with `FAILED_PRECONDITION` unless the node is the current lease holder and activated writer (contract rule 8).
 - Replica reads (`allow_replica_reads`) use read-only connections that are reopened after each completed sync. Because the adapter can expose torn pages to concurrent readers, `allow_replica_reads` stays unsupported until Track N applies snapshots through staging or under SQLite locking.
-- Clustered v1 replicates exactly one database per cluster, so a single ledger describes the whole replica. Standalone mode may still serve several databases.
+- Multiple databases per cluster (ADR-0020, superseding ADR-0018): the database set (1–64 names) is part of the lease's writer epoch, the ledger holds one record per database (`freshness.dir`, replacing `freshness.path` in `hasqlite-core`), and `validate_promotion` requires every database in the set to pass. The `PromotionError` variants gain a database name and a `MissingDatabaseLedger` variant; the pure-function parts (set parsing and name validation, per-database gate, oldest-stamp `promoted_from`) land with the Phase 1 controller work.
 - Before its first resync after demotion, a node preserves its database as a diverged copy (safety contract rule 15):
   - Durable divergence marker written at activation; startup triggers for crashes, unreadable markers and standalone volumes joining a cluster.
-  - Online-backup copy to `diverged/<db>.diverged-<id>` with crash-safe, idempotent write; fail closed on ENOSPC or I/O failure.
+  - Online-backup copy of every database on the volume to `diverged/<db>.diverged-<id>`, one at a time under one id, with crash-safe, idempotent writes; one space check over all copies; fail closed on ENOSPC or I/O failure.
   - Lossless planned-handover check (`writer.promoted_from` / `writer.stopped_at_secs` in the lease, rule 16), so planned switchovers do not leave copies behind.
   - `hasqlite diverged discard --id <id> --confirm-data-loss --reason <text>`; `diverged_files` / `diverged_bytes` / `divergence_preservation_pending` metrics.
 - Backoff and retry configuration for sync batches.
 
 Deliverables:
 
-- Integration tests: writer emits writes → replica converges within N syncs
+- Integration tests: writer emits writes → replica converges within N syncs, for every database in a multi-database set (`multi_database_sync.rs`)
 - `live_writes` convergence test
 - `adapter_ledger_protocol` and `replication_role_gate` tests ([§6.2](testing.md#62-integration-tests-testsintegration)): a lease change between the two observations leaves the ledger invalidated; a non-writer refuses to serve pulls
 - Crash-during-apply test ([§6.3](testing.md#63-fault-injection-testschaos-feature-chaos)) showing the node is unpromotable until a full sync completes
@@ -141,7 +145,9 @@ Deliverables:
 - CLI flags mirroring rsync `--ha-*` for migration (deprecation table in docs)
 - HTTP probes (`hasqlite-probes`) with Kubernetes readiness vs liveness semantics documented; `/live` never touches SQLite or the lease store
 - Writer routing: pod self-labeling (`hasqlite.io/role=writer`) for Kubernetes; for the local and Compose harnesses, an HAProxy front end that health-checks `/ready` provides the stable `sync.origin_endpoint` alias
-- Graceful shutdown: replica preStop catch-up sync; writer planned switchover (stop writes, bounded wait for replicas' post-fence snapshots, release the lease), then drain and checkpoint
+- Graceful shutdown: replica preStop catch-up sync; writer planned switchover (stop writes on every database, bounded wait for replicas' post-fence snapshots of every database, release the lease), then drain and checkpoint
+- Database-set administration on the writer (ADR-0020): `hasqlite db add`, `hasqlite db remove --confirm-data-loss` and `hasqlite db list`, each audited, applied through the writer's renew CAS; removal tombstones the database and every node deletes its files (crash-safe, after any pending divergence preservation); the gateway resolves only names in the set and never creates databases
+- Concurrent serving: per-database connection pools and write locks on the writer, concurrent origin sessions with per-session snapshot deadlines
 
 Deliverables:
 
@@ -155,7 +161,7 @@ Deliverables:
 - Writer Service selecting `hasqlite.io/role=writer`; PodDisruptionBudget `maxUnavailable: 1`; rollout script that updates replicas first and the writer last via StatefulSet `partition`
 - Separate Secrets for the SQL token and the replication token
 - Scripts: `apply-stack.sh`, manifest validator test (copy pattern from rsync)
-- Runbooks: failover, planned switchover, manual promotion (including a writer that died before any replica synced from it), stale replica rebuild, diverged data recovery (locate the diverged copy and its audit entry, compare it with the current writer, reapply or discard the changes by hand, then `hasqlite diverged discard --id <id> --confirm-data-loss --reason <text>`)
+- Runbooks: failover, planned switchover, manual promotion (including a writer that died before any replica synced from it, or before replicas synced a newly added database), adding and removing databases, stale replica rebuild, diverged data recovery (locate the diverged copy and its audit entry, compare it with the current writer, reapply or discard the changes by hand, then `hasqlite diverged discard --id <id> --confirm-data-loss --reason <text>`)
 
 Deliverables:
 

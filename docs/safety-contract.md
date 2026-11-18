@@ -12,14 +12,16 @@ protocol.
    `renewed_at_secs`, `ttl_secs` (the holder's configured TTL), a hasqlite-owned
    `version` token that changes on every lease write *made by hasqlite* (acquire,
    activate, renew, release), and the last **activated writer epoch** (`writer`:
-   node ID, generation, last renewal, `promoted_from` and, after a planned
-   switchover, `stopped_at_secs`; rules 10 and 16). The backend's native
+   node ID, generation, last renewal, the *database set* `databases`,
+   `promoted_from` and, after a planned switchover, `stopped_at_secs`; rules 9,
+   10 and 16). The backend's native
    revision (Kubernetes `resourceVersion`, file record counter) is the
    compare-and-swap precondition and
    is bumped atomically with `version`, but it is never used as the liveness
    signal: an unrelated actor annotating or labelling the Lease object changes the
    native revision without changing `version`. Acquiring the lease does not change
-   `writer`; only activation does (rule 10).
+   `writer`. Only activation (rule 10) and a database-set change by the
+   activated writer (rule 9) do.
 3. **Generation increases** on every successful acquisition (never reused).
    Renewals and releases never change it.
 
@@ -70,26 +72,107 @@ protocol.
 
 7. **Writer is sync origin**; replicas are **exclusive** targets (no concurrent
    writers to replica files). The sync engine never writes to a node whose role
-   is `Writer`.
+   is `Writer`. One writer originates every database in the cluster; there is
+   no per-database leadership. The writer serves reads and writes on
+   different databases concurrently, and serves concurrent replication
+   sessions for them: each database has its own connections and SQLite write
+   lock, so work on one never waits for another. `enforce_write_fence` (rule
+   5) runs before every commit on every database, and demotion interrupts
+   in-flight statements on all of them.
 8. **Origin may be live** (reads/writes); sync produces a consistent snapshot as
    of sync start. The origin stamps each snapshot with its node ID, its lease
-   generation and the snapshot start time (origin clock). It refuses to serve
-   unless it is the current lease holder and activated writer. Replicas reject a
-   snapshot whose stamped identity does not match the lease's `writer` epoch.
-9. **Freshness ledger** records the last successful sync: `source_node_id`,
-   `source_generation`, `synced_at_secs`, `destination_node_id`.
+   generation, the database name and the snapshot start time (origin clock).
+   It refuses to serve unless it is the current lease holder and activated
+   writer, and refuses a database that is not in its current
+   `writer.databases`. Replicas reject a snapshot whose stamped identity does
+   not match the lease's `writer` epoch or whose database name differs from
+   the one requested.
+9. **Freshness ledger** records, for each database, the last successful sync:
+   `database`, `incarnation`, `source_node_id`, `source_generation`,
+   `synced_at_secs`, `destination_node_id`.
+   - **Database set**: the cluster replicates exactly the databases in the
+     lease's `writer.databases`, a list of 1–64 entries `(name, incarnation)`,
+     sorted by name with no duplicate names. Names are relative to `data.dir`.
+     Each `/`-separated component is 1–255 ASCII letters, digits, `.`, `_` or
+     `-` and does not start with `.`; the whole name is at most 255 bytes,
+     ends in `.db`, `.sqlite` or `.sqlite3`, and its first component is not
+     `diverged` or `ancestors`. The *incarnation* is a number the writer takes
+     from the lease counter `writer.next_incarnation` each time a name is
+     added, so a name that is removed and added again never reuses an
+     incarnation. Node configuration never defines the set. Genesis or the
+     seed-snapshot procedure records the initial set (rule 11), and activation
+     copies the set, the counter and the tombstones (below) from the observed
+     lease unchanged (rule 10). Afterwards only the activated writer changes
+     them, with a renew CAS (rule 6) that also writes the new values; a
+     conflict means demotion, as for any renew. Both changes are audited with
+     the operator's identity and reason:
+     - *Add*: the writer validates the name, refuses it if the set already
+       holds 64 names or a file exists at that path (or its `-wal`/`-shm`),
+       creates the database in WAL mode, and fsyncs it and its parent
+       directories. Then it performs the renew CAS, which adds
+       `(name, next_incarnation)`, increments the counter and drops any
+       tombstone for the name. It serves the database only after the CAS
+       succeeds. If the CAS fails, the writer demotes and deletes the empty
+       file it created, which nothing has opened. If it crashes before that,
+       the file is not in the set, is never served and is reported as
+       unmanaged (below).
+     - *Remove*: deletes the database's files on every node. The writer
+       rejects new requests for the database, interrupts and drains its
+       in-flight transactions, and performs the renew CAS, which moves the
+       entry from `writer.databases` to the *tombstones* `writer.removed`.
+       Then it closes its handles and deletes the files (*file deletion*,
+       below). It never removes the last database, and refuses to run during
+       a planned switchover. The command requires `--confirm-data-loss`: the
+       deletion is permanent and is not preserved anywhere, except as rule
+       15's diverged copy on a former writer that had not yet resynced.
+     - *Tombstones*: `writer.removed` holds up to 64 `(name, incarnation)`
+       entries. When it is full, the oldest is dropped. A node deletes local
+       files only for a database named in the tombstones, or for a database
+       whose files belong to an older incarnation of a name in the set
+       (*incarnation check*, below). It never deletes a database that is in
+       neither list; such files are not served or replicated, are reported
+       with `hasqlite_unmanaged_database_files`, and must be removed by hand.
+     - *File deletion*: with no open handle on the database and no pull in
+       progress for it, the node unlinks the `-wal` file, then the `-shm`
+       file, then the database file, treating a missing file as already
+       deleted. It then deletes the database's ledger record and fsyncs the
+       directories. A crash leaves the tombstone in place, so each node
+       finishes the deletion when it next observes the lease. A leftover
+       `-wal` is never paired with a new database file, because *Add*
+       refuses a name while any of its three files exists. While a
+       divergence preservation is pending (rule 15) the node deletes nothing,
+       so a former writer's commits to a database removed by its successor
+       are preserved first.
+     - *Incarnation check*: before the first pull of a database whose local
+       record is missing or carries a different incarnation than the set
+       entry, the replica deletes any local files of that name as above. A
+       replica therefore never applies a new incarnation's pages on top of an
+       old incarnation's file.
+   - **One record per database**: records live in the directory
+     `freshness.dir`, one file per database, named with the encoding of rule
+     15 (`%` → `%25`, `/` → `%2F`). The rules below apply to each record
+     independently. An invalidated record keeps its database name and
+     incarnation. A record for a database outside the set is ignored and is
+     deleted with the database's files.
    - **Replica binding**: `destination_node_id` is mandatory and must equal the
      promoting node.
    - **Snapshot start timestamp**: `synced_at_secs` is the origin-stamped
      snapshot start time, not the sync completion time.
    - **Crash-safe publication**: the ledger lives on the same filesystem as the
-     database. Before writing the first page, the replica invalidates the ledger
-     and fsyncs the invalidation. It publishes a new record only after the sync
+     databases. Before writing the first page of a database, the replica
+     invalidates that database's record and fsyncs the invalidation. It
+     publishes a new record only after the sync
      succeeds and the database file and its directory are fsynced. Publication
      uses temp file + rename + directory fsync. An interrupted sync therefore
      always leaves the node unpromotable.
    - **Exclusive application**: at most one sync writes a given replica file at a
-     time (`SyncError::SyncInProgress` otherwise).
+     time (`SyncError::SyncInProgress` otherwise). Pulls of *different*
+     databases run concurrently: a sync round starts one pull per database in
+     the observed set, at most `sync.max_concurrent_pulls` at a time. Each pull
+     invalidates, stamps and publishes only its own record, so pulls neither
+     wait for nor affect each other. A pull is skipped if its database is not
+     in the set that its own pre-pull lease observation shows, or carries a
+     different incarnation there.
    - **Adapter-era attribution (until Track N)**: the transitional backend stamps
      neither origin identity nor snapshot time, and its replication server does
      not refuse to serve when its node is not the activated writer. Until the
@@ -111,20 +194,29 @@ protocol.
      after writes stopped, so its `synced_at_secs := writer.renewed_at_secs`
      is later than the stop stamp and qualifies for the lossless check. A pull
      whose observation predates that renewal carries an earlier stamp and does
-     not qualify. Checks (1)–(3) apply unchanged.
+     not qualify. Checks (1)–(3) apply unchanged. Each database's pull is
+     bracketed by its own observations (1) and (2) and stamped from its own
+     pre-pull observation, including when pulls run concurrently.
 
 ## Promotion
 
 10. A node may **promote to writer** only if:
-    - `validate_promotion` passes against the lease it observed. The ledger is
-      bound to this replica. Its source node and generation equal the lease's
-      `writer` epoch. Its lag behind that writer's last renewal
-      (`writer.renewed_at_secs − synced_at_secs`) is at most
+    - `validate_promotion` passes against the lease it observed, for **every**
+      database in that lease's `writer.databases`. Each database has a valid
+      ledger record whose incarnation equals the set entry's and that is
+      bound to this replica. Its source node and generation
+      equal the lease's `writer` epoch. Its lag behind that writer's last
+      renewal (`writer.renewed_at_secs − synced_at_secs`) is at most
       `freshness.max_lag_secs`; both timestamps come from the writer's clock.
-      `synced_at_secs` is at most `max_future_skew_secs` ahead of local time.
-      Checks are evaluated in a fixed order (ledger shape, writer epoch, time
-      bounds) and the first failure is reported; the order is part of the
-      `hasqlite_promotion_denied_total` metric contract. The post-v1 emergency
+      Its `synced_at_secs` is at most `max_future_skew_secs` ahead of local
+      time. A missing record, or one from another incarnation, for any
+      database in the set denies promotion.
+      Checks are evaluated in a fixed order of classes (ledger shape, writer
+      epoch, time bounds); within a class, databases are checked in name
+      order. The first failure is reported, naming its database. The class
+      order is part of the `hasqlite_promotion_denied_total` metric contract.
+      The freshest-first delay ([architecture §3](architecture.md#3-architecture))
+      uses the largest lag over the set. The post-v1 emergency
       promotion and dead-epoch roll-forward exceptions are specified in
       [automated-recovery.md](automated-recovery.md#3-tier-2-cluster-consensus--degraded-failover)
       and are not part of v1.
@@ -132,11 +224,15 @@ protocol.
       it campaigns, so the validated inputs cannot change and no second
       freshness check is needed.
     - Before opening a writable handle, it *activates*: a CAS that records
-      `writer = (self, generation, now)`. If activation fails, or the renewal
-      deadline has passed, it stays a replica. The activation CAS also records
-      `writer.promoted_from = (source generation, synced_at_secs, source
-      stopped_at_secs)`: the first two come from the validated ledger, and the
-      third is copied from the observed lease's `writer.stopped_at_secs` (absent
+      `writer = (self, generation, now, databases)`, where `databases` is the
+      validated set, copied unchanged from the observed lease together with
+      `next_incarnation` and the tombstones. If activation
+      fails, or the renewal deadline has passed, it stays a replica. The
+      activation CAS also records `writer.promoted_from = (source generation,
+      synced_at_secs, source stopped_at_secs)`: the first two come from the
+      validated ledger, with `synced_at_secs` the *oldest* snapshot stamp over
+      the set, and the third is copied from the observed lease's
+      `writer.stopped_at_secs` (absent
       if the source epoch was not released by a planned switchover). Activation
       replaces the source epoch, so this copy is the only durable record of the
       stop stamp that rule 15's lossless handover check compares against.
@@ -148,8 +244,11 @@ protocol.
       in place, so peers synced from that writer remain promotable.
 11. **First-writer bootstrap**: for clusters with no activated writer, an
     explicit genesis procedure or verified seed-snapshot procedure establishes
-    the initial generation and `writer` epoch. Normal failover always applies
-    the full rule 10.
+    the initial generation and `writer` epoch, including its database set
+    (rule 9), with incarnations starting at 1 and no tombstones. A seed from
+    a standalone volume records the databases that
+    pre-flight discovery finds there, and fails if any name is invalid or
+    there are more than 64. Normal failover always applies the full rule 10.
 12. **Failed promotion** must not open writable SQL paths (fail closed).
 13. **Post-promotion catch-up is not part of v1.** Under rules 7–8 a replica may
     pull only from the activated writer, which is unavailable at the moment of
@@ -162,19 +261,21 @@ protocol.
 ## Demotion
 
 14. On a renewal conflict, missed renewal deadline or lease loss while writer:
-    **immediate demotion**. The node stops accepting writes, interrupts in-flight
-    statements, and the gateway returns `NOT_LEADER` with a redirect hint.
+    **immediate demotion**. The node stops accepting writes on every database,
+    interrupts in-flight statements, and the gateway returns `NOT_LEADER` with
+    a redirect hint.
 15. A former writer **rejoins as replica** and must resync before it is eligible
-    to promote again. Before its first resync it preserves its database as a
-    *diverged copy*, because commits it accepted after the last replica sync are
+    to promote again. Before its first resync it preserves its databases as
+    *diverged copies*, because commits it accepted after the last replica sync are
     not on the new writer. Those commits come from normal replication lag, or
     from a commit that stalled past the fencing margin and finished after a peer
     promoted (rule 5). Preservation is fail-closed. This rule is the normative
     description of the procedure; other documents only summarize it.
     - **Trigger.** The trigger is a durable divergence marker,
       `${data.dir}/.hasqlite.divergence`, holding a *divergence id*. Activation
-      writes it with id `g<generation>` (rule 10). It is removed only after the
-      diverged copy is durable, after a verified lossless handover (rule 16), or
+      writes it with id `g<generation>` (rule 10). There is one marker per node,
+      not per database. It is removed only after every diverged copy is
+      durable, after a verified lossless handover (rule 16), or
       by an operator discard. The informational role file is never the trigger,
       because a crash or partition usually ends a writer before it can update
       that file. On startup in clustered mode, preservation is also pending in
@@ -209,7 +310,12 @@ protocol.
       a crash before the rename simply repeats this step with a new id. Later
       restarts read the replacement and reuse its id, so the procedure stays
       idempotent. Failure to write the replacement is an I/O failure (below).
-    - **Contents.** The copy must contain every committed transaction, including
+    - **Scope of the copy set.** The node preserves every database that
+      pre-flight discovery finds on its volume, whether or not it is in the
+      current `writer.databases`. This includes databases the cluster has since
+      removed (tombstoned), which rule 9 deletes only after preservation
+      completes. All copies of one preservation share its divergence id.
+    - **Contents.** Each copy must contain every committed transaction, including
       frames that exist only in `-wal`. It is taken with the SQLite online backup
       API (`sqlite3_backup_*`) from a local read connection with no writable
       handles open. The source files are never renamed or copied file by file,
@@ -218,18 +324,29 @@ protocol.
     - **Naming.** The copy is `${data.dir}/diverged/<db>.diverged-<id>`. `<db>` is
       the database path relative to `data.dir`, with `%` encoded as `%25` and `/`
       as `%2F`, so names are flat and cannot collide.
-    - **Durable, idempotent write.** The copy is written to `<name>.tmp`,
+    - **Durable, idempotent write.** Each copy is written to `<name>.tmp`,
       fsynced, checked with `PRAGMA integrity_check`, renamed to `<name>`, and
-      the directory is fsynced. Only then is an audit entry appended and the
-      marker removed, followed by a directory fsync. A crash at any step leaves
-      the marker in place, and the next start redoes the procedure: a leftover
-      `.tmp` is deleted and retaken, and a finished copy with the same id is
-      verified with `integrity_check` and reused, not overwritten.
+      the directory is fsynced. Copies are taken one at a time, in name order.
+      Only when every copy is durable is an audit entry appended (listing each
+      copy) and the marker removed, followed by a directory fsync. A crash at
+      any step leaves the marker in place, and the next start redoes the
+      procedure: a leftover `.tmp` is deleted and retaken, and a finished copy
+      with the same id is verified with `integrity_check` and reused, not
+      overwritten.
     - **Insufficient space or I/O failure.** Before copying, the node requires
-      free space of the database size plus the WAL size, plus 10% of that sum
-      and at least 64 MiB. If space is short, or the copy fails, the node does
+      free space of at least `S + max(S / 10, 64 MiB)`, where `S` is the sum,
+      over every database that still needs a copy (no verified finished copy
+      with this id), of the size of its database file plus the size of its
+      `-wal` file, all measured at the check. The check runs once, before the
+      first copy. The 64 MiB is a floor on the headroom, not on the total, so a
+      small database still keeps a fixed margin. Free space is the space
+      available to the node's UID on the `data.dir` filesystem
+      (`statvfs`: `f_bavail × f_frsize`), not the space reserved for root.
+      If space is short, or the copy fails, the node does
       not resync, cannot promote, reports
-      `hasqlite_divergence_preservation_pending = 1` and raises an alert. The
+      `hasqlite_divergence_preservation_pending = 1` and raises an alert. A
+      failure on one database leaves preservation pending for the whole node;
+      copies already finished are kept and reused on the next attempt. The
       only way past this without preserving is an operator discard, which
       explicitly accepts the loss.
     - **Permissions and paths.** `diverged/` is created with mode `0700` and
@@ -248,24 +365,28 @@ protocol.
       count only finished copies directly under `diverged/` named
       `<db>.diverged-<id>`; temp files, exports and ancestors are not counted.
     - **Operator discard.** `hasqlite diverged discard --id <id>
-      --confirm-data-loss --reason <text>` deletes the copy for `<id>` or, while
-      preservation for `<id>` is pending, removes the marker without preserving.
+      --confirm-data-loss --reason <text>` deletes every copy for `<id>` (all
+      databases) or, while preservation for `<id>` is pending, removes the
+      marker without preserving, leaving any copies already finished in place.
       It refuses an id that matches neither a copy nor the pending marker, and
       refuses to run without `--confirm-data-loss`. Each use appends an audit
-      entry with the id, the file size, the reason, the invoking UID and user
-      name, and whether a pending preservation was bypassed.
-    - **Scope.** The diverged copy exists only on the former writer's volume. If
+      entry with the id, each deleted copy's name and size, the reason, the
+      invoking UID and user name, and whether a pending preservation was
+      bypassed.
+    - **Scope.** Diverged copies exist only on the former writer's volume. If
       that volume is lost, its unreplicated commits are lost. Replicas whose
       snapshots are newer than the promoted one are overwritten on their next
       resync and are not preserved in v1.
 16. **Planned switchover**: a stopping writer stops accepting writes, waits a
-    bounded time for replicas to complete a snapshot started after that point,
-    then *releases* the lease (holder cleared, generation unchanged, `writer`
-    renewal time updated) so a replica can acquire without waiting a TTL.
-    Stopping writes means rejecting new write requests, then draining or
-    aborting (`sqlite3_interrupt`) every in-flight write transaction and
-    waiting until no write transaction is open and every in-flight `COMMIT` has
-    returned. Only then does the writer issue a stop stamp through
+    bounded time for replicas to complete, for every database in the set, a
+    snapshot started after that point, then *releases* the lease (holder
+    cleared, generation unchanged, `writer` renewal time updated, database set
+    unchanged) so a replica can acquire without waiting a TTL. Stopping writes
+    means rejecting new write requests on every database, then draining or
+    aborting (`sqlite3_interrupt`) every in-flight write transaction on every
+    database and waiting until no write transaction is open and every
+    in-flight `COMMIT` has returned. No database-set change is accepted after
+    this point. Only then does the writer issue a stop stamp through
     `WriterClock`, so no commit can land after a snapshot that qualifies as
     post-stop. It stamps every later snapshot strictly after the stop stamp,
     waiting for its clock to pass it if needed. Normally that is under one
@@ -275,10 +396,11 @@ protocol.
     spends the shutdown grace period; if it runs out, the switchover is treated
     as a timed-out final sync (no lossless handover, so the former writer
     preserves under rule 15). The release CAS records the stop stamp as
-    `writer.stopped_at_secs`. A successor that promotes from a
-    post-stop snapshot therefore records `promoted_from` with a later stamp,
-    which lets the former writer skip the diverged copy (rule 15, *lossless
-    handover check*). If the successor promoted from an older snapshot, for
+    `writer.stopped_at_secs`. A successor that promotes from post-stop
+    snapshots of every database therefore records `promoted_from` with a later
+    stamp (the oldest over the set, rule 10), which lets the former writer
+    skip the diverged copies (rule 15, *lossless handover check*). If the
+    successor promoted from an older snapshot of even one database, for
     example after the final sync timed out, the former writer preserves as
     usual.
 
@@ -289,7 +411,11 @@ protocol.
     inspecting SQL text. Replica connections are opened read-only with
     `PRAGMA query_only = 1`. An authorizer denies `ATTACH`, `DETACH`,
     `VACUUM INTO` and non-allowlisted pragmas. `SQLITE_DBCONFIG_DEFENSIVE` is
-    on, extension loading is off, and `trusted_schema` is off.
+    on, extension loading is off, and `trusted_schema` is off. In clustered
+    mode the gateway resolves only names in the current `writer.databases`. It
+    rejects any other name with `NOT_FOUND`, a definite rejection, and never
+    opens a database with `SQLITE_OPEN_CREATE`, so no unreplicated database can
+    be created through SQL.
 18. **Authentication** (bearer token) is independent of fencing; both are
     required in production configurations. SQL gateway and replication use
     distinct credentials, compared in constant time. Unauthenticated gateways

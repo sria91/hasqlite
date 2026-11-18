@@ -13,16 +13,20 @@
 | Renewal deadline | commit allowed before deadline, refused at and after it; overflow fails closed | injected `Instant` (exists) |
 | Config identifiers | `node.id` charset and length, DNS-1123 Kubernetes names, standalone rejects `sync.origin_endpoint`, `2 × retry ≤ deadline`, `max_lag > interval + retry` | table-driven (exists, `hasqlite-core`) |
 | Promotion | lag at and past the limit, ledger from older writer generation, other source node, unbound or self-sourced ledger, no activated writer, future skew, aborted acquisition keeps previous epoch valid, documented error precedence (ledger shape → writer epoch → time bounds) | pure function asserts (exists) |
+| Promotion, several databases | one database missing a record, one stale while the others are fresh, one from an older generation; class precedence holds across databases (a shape failure on the last database beats a lag failure on the first) and name order breaks ties within a class; records for databases outside the set are ignored; freshest-first delay uses the largest lag; `promoted_from` carries the oldest stamp | pure function asserts |
+| Database set | incarnations increase across remove/re-add and survive activation; tombstones capped at 64 with the oldest dropped; name rules (empty, `.`-prefixed, `..`, over-long components and names, wrong suffix, `diverged/`/`ancestors/` prefixes, non-ASCII); unsorted, duplicate, empty and 65-entry sets rejected by lease parsing; activation copies the set unchanged; a set change is accepted only as the holder's renew and a conflict demotes | table-driven; mock lease store |
 | Write fence | non-writer, deadline passed, generation mismatch | enum `PromotionViolation` |
 | Reconcile | steal lease, renew, partition (stale holder), freshest-first attempt delay | state machine scenarios |
 | CAS acquisition race | renewal between observation and acquisition | mock lease store (assert CAS fails, holder preserved) |
 | Superseded writer | peer acquired g+1, old writer renews | mock lease store (renew fails, writer demotes in the same tick) |
 | Action execution | partial failure, continue-on-error | mock executor |
+| Preservation space check | `S` summed over several databases, excluding ones with a verified finished copy; `S` = 0, 640 MiB − 1 B, 640 MiB and 1 GiB; free space exactly at and 1 byte under `S + max(S / 10, 64 MiB)`; `S` near `u64::MAX` fails closed (checked arithmetic); free space read as `f_bavail`, not `f_bfree` | table-driven |
 
 **Property-based** (proptest, mirror `property_tests.rs`):
 
 - Generation never decreases on valid transitions; acquire always yields `observed + 1`; renew, activate and release never change it
 - A ledger from any generation other than the writer epoch's is rejected
+- For any database set and any assignment of records, promotion passes only if every database in the set passes on its own
 - The lag calculation is independent of detection delay; promotion outcome depends on lag and writer-epoch match, while future skew can also affect promotion
 
 **Coverage target:** ≥95% line coverage on `hasqlite-controller` and `hasqlite-lease`, and ≥90% on `hasqlite-sync`
@@ -37,7 +41,7 @@ pauses and crashes are injected. Each step checks:
 
 - At most one node is inside its commit window (before its renewal deadline) at any simulated instant
 - Generation is monotonic, and every promotion is preceded by acquire and activate successes
-- No node promotes with a ledger from anything but the current writer epoch
+- No node promotes with a ledger from anything but the current writer epoch, or without a fresh record for every database in the set (set changes are injected as writer renews)
 
 Across seeds, the least-lagged eligible replica must win the majority of acquisition races in which several replicas
 are eligible (freshest-first delay, [§3](architecture.md#3-architecture)); the threshold is set when the harness lands.
@@ -65,6 +69,8 @@ Seeds are logged for replay. 1,000 seeds per PR, 100,000 nightly.
 | `divergence_marker.rs` | a failed marker write after activation leaves no writable handle and demotes; standalone mode writes no marker; a standalone volume started in clustered mode for the first time is preserved as `standalone-g<g>` before its first resync | new (Phase 2, safety contract rules 10 and 15) |
 | `diverged_discard.rs` | `discard` refuses without `--confirm-data-loss` and for an id matching neither a copy nor the pending marker; each use appends an audit entry with id, size, reason, UID and whether pending preservation was bypassed | new (Phase 2, safety contract rule 15) |
 | `promotion_ancestor.rs` | with `retain_promotion_ancestor = true` the ancestor is written to `ancestors/` before the acquisition CAS; a failed copy still promotes with `ancestor = none` audited; a lost CAS deletes it | new (post-v1, automated recovery §4.2) |
+| `multi_database_sync.rs` | a round pulls every database in the set concurrently, never more than `max_concurrent_pulls` at once and never two into one file, and each converges to the writer's page hashes; a slow pull on one database does not delay publication of the others; a database added mid-round is pulled next round; a removed database is deleted locally and no longer pulled; remove then re-add the same name: the replica deletes the old incarnation's files before pulling and an old-incarnation record never passes the gate; the origin refuses a name outside its set with `NOT_FOUND` | new (Phase 2, ADR-0020) |
+| `database_set.rs` | `db add` creates the database before the CAS and serves it only after; a failed CAS leaves the file unserved and demotes; `db add` refuses an existing file and a 65th database; `db remove` requires `--confirm-data-loss`, refuses the last database and refuses during a switchover, drains in-flight transactions, and deletes the `-wal`, `-shm` and main files and the ledger record on the writer and on every replica; files in neither the set nor the tombstones are never deleted and are counted as unmanaged; writes to different databases proceed concurrently while one database holds a long write transaction; the gateway returns `NOT_FOUND` for names outside the set and cannot create a database through SQL; every change is audited | new (Phase 3, ADR-0020) |
 | `replication_role_gate.rs` | a node that is not the activated writer refuses to serve pulls through the adapter's replication server | new (Phase 2) |
 | `exclusive_replica_path.rs` | a second pull into a path with a pull in progress fails with `SyncInProgress` before any I/O | `hasqlite-sync` unit tests (exists) |
 | `readonly_replica_reads.rs` | `--allow-replica-reads` with a concurrent reader loop running `PRAGMA integrity_check` during sync (Track N) | gateway flags |
@@ -105,6 +111,10 @@ in container-less environments.
 | Divergence: unreadable marker | corrupt the marker on a crashed former writer, then `kill -9` it during the copy and restart | the corrupt marker is kept as `.hasqlite.divergence.unreadable-<secs>`; one `<db>.diverged-unknown-<secs>` copy exists after the restarts (the id is reused, not regenerated) |
 | Divergence: planned switchover | rolling restart of the writer with a successful final sync; repeat with the final sync timed out | successful run: the successor's `promoted_from` stamp is after `stopped_at_secs`, no diverged copy is written and the marker is removed with an audit entry; timed-out run: a diverged copy is written |
 | Divergence: disk full | ENOSPC during preservation | no resync and no promotion from that node; `hasqlite_divergence_preservation_pending = 1` and the alert fires; after space is freed, preservation completes and the node resyncs; `hasqlite diverged discard --id <id> --confirm-data-loss --reason <text>` is the only bypass and is audited |
+| Writer dies after `db add` | add a database, then `SIGKILL` the writer before any replica syncs it | automatic promotion denied (`MissingDatabaseLedger`); alert fires; manual promotion runbook required |
+| Crash mid-round | `kill -9` a replica after it has synced some databases of a round, then kill the writer | only the database being applied is invalidated; the replica promotes only if every record still passes the gate |
+| Crash during database deletion | `kill -9` a node after each unlink of a removed database (one run each) | on restart the node finishes the deletion from the tombstone; `db add` of the same name is refused while any of its files remains |
+| Divergence: multiple databases | as *WAL-only commits*, with three databases (one nested) and one removed by the successor; `kill -9` the former writer between copies | one copy per database under one id, the removed database included; the removed database's files are deleted only after the marker is removed; finished copies are reused after the restart; the marker is removed only after the last copy |
 | Writer clock step back | libfaketime steps the writer clock −60s between a renewal and the next snapshot | snapshot stamp holds at the renewal value; lag reads 0, not 60s, and promotion eligibility is unchanged |
 
 Every chaos and E2E run records client operations (sequence number; acknowledged, failed or outcome unknown) and checks
@@ -124,7 +134,7 @@ Assertions:
 
 - No two pods' audit logs record commits in overlapping intervals (the lease API always shows one holder, so checking it proves nothing)
 - History checker ([§6.3](#63-fault-injection-testschaos-feature-chaos)) passes after every failover
-- Page hashes match after planned switchovers where the final sync completed successfully; after crash failovers, the prefix property holds. A timed-out final sync is never reported as lossless (see [§10.4](operations.md#104-replication-and-request-serving-limits), [§10.6](operations.md#106-unresolved-guarantees-and-recovery-policy)).
+- Page hashes match, for every database, after planned switchovers where the final sync completed successfully; after crash failovers, the prefix property holds. A timed-out final sync is never reported as lossless (see [§10.4](operations.md#104-replication-and-request-serving-limits), [§10.6](operations.md#106-unresolved-guarantees-and-recovery-policy)).
 - A rolling update causes at most one failover and loses no acknowledged write
 
 ### 6.5 Performance & benchmarks
@@ -148,6 +158,9 @@ environment.
    - standalone read-heavy and write-heavy service at documented concurrency
      and offered load;
    - clustered steady state with an idle replica and with active replication;
+   - clustered idle and active with several databases (for example 1, 8 and
+     64 small databases) at `max_concurrent_pulls` 1 and 4, to measure the
+     per-database cost of a sync round and the peak cost of concurrency;
    - replica catch-up under controlled write churn.
    Record startup separately from steady state. Include representative database
    sizes and document the chosen sizes and workload mix; do not generalize
