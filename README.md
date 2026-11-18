@@ -40,6 +40,8 @@ tracked in [docs/architecture.md](docs/architecture.md).
 - [Security and configuration](docs/configuration.md)
 - [Operations and risks](docs/operations.md)
 - [Safety contract (draft)](docs/safety-contract.md)
+- [Requirements (EARS)](docs/requirements.md)
+- [Architecture decision records](docs/adr/README.md)
 - [Prior-art HA guide](https://github.com/sria91/rsqlite-rsync/blob/master/docs/ha-guide.md)
 
 ## License

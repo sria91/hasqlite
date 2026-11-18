@@ -45,7 +45,7 @@ flowchart TB
   subgraph cluster ["hasqlite Cluster"]
     WRITER["Writer Node (Active Leader)\n- gRPC SQL Gateway (:50051)\n- Write Fence (Generation g)\n- SQLite DB & WAL (Live Origin)\n- HTTP Probes (/ready=200, /live, /healthz)"]
 
-    REPLICAS["Replica Nodes (Standby Replicas)\n- gRPC Gateway (:50051 NOT_LEADER Redirect)\n- Sync Worker (Scheduled Page Pull)\n- SQLite DB & Local Freshness Ledger\n- HTTP Probes (/ready=503, /live, /healthz)"]
+    REPLICAS["Replica Nodes (Standby Replicas)\n- gRPC Gateway (:50051 NOT_LEADER Redirect)\n- Sync Worker (Scheduled Page Pull)\n- SQLite DBs (database set) & per-database Freshness Ledger\n- HTTP Probes (/ready=503, /live, /healthz)"]
   end
 
   subgraph coord ["Authoritative Coordination"]
@@ -171,7 +171,7 @@ flowchart TB
 
       subgraph p1_vols ["Volumes & Storage"]
         P1_PVC[("PVC: data-hasqlite-1\n(/var/lib/hasqlite: Exclusive Replica DB)")]
-        P1_LEDGER[("Freshness Ledger: /var/lib/hasqlite/.hasqlite.freshness on the PVC\n(Replica-bound sync timestamp & gen)")]
+        P1_LEDGER[("Freshness Ledger: /var/lib/hasqlite/.hasqlite.freshness/ on the PVC\n(one replica-bound record per database: sync timestamp & gen)")]
         P1_SEC["Secrets: /run/secrets/hasqlite_token (SQL) and hasqlite_replication_token (mode 0440; restricted fsGroup)"]
       end
 
@@ -283,29 +283,33 @@ States: `Starting` → `Replica` | `Writer(g)` → `Demoting` → `Replica`.
 
 Events per tick (informed by the upstream `ReconcileDecision` model):
 
-1. Observe lease (holder, generation, version, activated writer epoch, holder's
-   `ttl_secs`). Candidates feed the hasqlite-owned version token (not the backend's
+1. Observe lease (holder, generation, version, activated writer epoch with its
+   database set, holder's `ttl_secs`). Candidates feed the hasqlite-owned version token (not the backend's
    native revision, see contract rule 2) into a `LeaseObservation`, which measures
    expiry with the local monotonic clock against the effective TTL
    `max(local ttl_secs, observed ttl_secs)` (rule 4); they never compare the
    holder's `renewed_at_secs` with their own wall clock.
-2. Observe freshness ledger (source node ID, source generation, origin-stamped
-   snapshot start, destination node ID).
+2. Observe the freshness ledger: one record per database in the observed set
+   (database, source node ID, source generation, origin-stamped snapshot start,
+   destination node ID).
 3. Evaluate:
    - If writer: renew (step 4). Commits are allowed only before the renewal
      deadline (see *Lease timing and write fencing*).
    - If replica and the lease is released, or its version has been unchanged for
      the effective TTL on the local monotonic clock: run `validate_promotion`
-     against the observed lease. The ledger must be bound to this node, come from
-     the lease's activated writer epoch (same node and generation), lag that
+     against the observed lease. For every database in the epoch's database
+     set, the ledger record must exist, be bound to this node, come from the
+     lease's activated writer epoch (same node and generation), lag that
      writer's last renewal by at most `freshness.max_lag_secs`, and not be stamped
-     more than `max_future_skew_secs` in the future. Both lag timestamps come from
+     more than `max_future_skew_secs` in the future. One missing or stale
+     database makes the whole replica ineligible (ADR-0020). Both lag timestamps come from
      the writer's clock, so detection delay and cross-node skew do not affect the
      result. A whole-cluster cold restart can therefore promote an eligible
      replica without operator action when coordination is available; the
      acquisition delay below favors, but does not guarantee, the freshest one.
    - Freshest replica first: an eligible candidate waits
-     `retry_period_secs × lag_secs / max_lag_secs` before its acquisition attempt
+     `retry_period_secs × lag_secs / max_lag_secs`, with `lag_secs` the largest
+     lag over its databases, before its acquisition attempt
      and aborts if the lease version changes meanwhile, so the least-lagged
      replica normally wins the race. Because lag uses saturating subtraction
      (`writer.renewed_at_secs.saturating_sub(synced_at_secs)`), multiple snapshots
@@ -333,14 +337,15 @@ Events per tick (informed by the upstream `ReconcileDecision` model):
      manual promotion runbook).
 5. Decide: `KeepWriter`, `Promote`, `Demote`, `StayReplica`, `NoOp`.
 6. Execute actions:
-   - On `Promote` (strictly gated by acquire and activate success): open the
-     writable handle on the validated snapshot (no catch-up in v1, contract rule
+   - On `Promote` (strictly gated by acquire and activate success): open a
+     writable handle on the validated snapshot of each database in the set (no catch-up in v1, contract rule
      13), activate generation write fence, update
      role file to `writer:<gen>`, label the pod, append audit, update probes
      (`/ready`). The sync engine refuses to run once the role is `Writer`.
    - On `Demote`: `sqlite3_interrupt` in-flight statements, close writable
      handles, remove the pod label, update role file to `replica`, update probes.
-     Before the first resync, preserve the database as a diverged copy. The
+     Before the first resync, preserve every database on the volume as a
+     diverged copy. The
      procedure is specified in [contract rule 15](safety-contract.md); in short,
      the durable `.hasqlite.divergence` marker written at activation (not the
      role file, and not this `Demote` path, which a crash or partition skips)
@@ -492,7 +497,8 @@ flowchart TB
   mechanisms, running both concurrently without prior fencing would create a dual-writer split-brain hazard. The migration
   procedure requires: (1) terminate the standalone container and verify the POSIX lock is released, (2) inspect the standalone
   lease record to seed the initial generation `g_k8s = g_prior` and the activated writer epoch on the Kubernetes Lease
-  object, and (3) launch the HA cluster nodes under Kubernetes lease coordination. The first node is seeded through the
+  object, with the databases discovered on the volume as its database set (the seed refuses invalid names or more
+  than 64 databases; ADR-0020), and (3) launch the HA cluster nodes under Kubernetes lease coordination. The first node is seeded through the
   genesis procedure from the standalone database; the others join as replicas and sync before they are eligible to
   promote.
 

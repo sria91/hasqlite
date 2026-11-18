@@ -51,14 +51,17 @@ namespace = "default"
 # annotation writes to the Lease object cannot postpone failover.
 
 [freshness]
-path = "/var/lib/hasqlite/.hasqlite.freshness" # on the PVC, same filesystem as the database
-max_lag_secs = 8 # max lag of the last snapshot behind the writer's last lease renewal (both on the writer's clock); > interval_secs + retry_period_secs
+# One ledger record per replicated database (ADR-0020). Directory on the PVC, same filesystem as data.dir,
+# owned by the node UID with mode 0700. Replaces the single-file `path` key, which is now rejected.
+dir = "/var/lib/hasqlite/.hasqlite.freshness"
+max_lag_secs = 8 # max lag of each database's last snapshot behind the writer's last lease renewal (both on the writer's clock); > interval_secs + retry_period_secs
 
 [promotion]
 max_future_skew_secs = 2
 
 [sync]
 interval_secs = 2
+max_concurrent_pulls = 4 # pulls of different databases run in parallel (1–64); one pull per database at a time
 # Required in clustered mode on every node, including the current writer: any node can be demoted and
 # must then resync. Use a stable alias that always routes to the current writer, never a pod hostname.
 origin_endpoint = "https://hasqlite-writer:50443" # remote origins require TLS; grpc:// is limited to loopback IPs and `localhost`
@@ -86,6 +89,18 @@ http_bind = "0.0.0.0:8088"
 
 CLI: `hasqlite run --config cluster.toml` plus env overrides.
 
+The configuration does not list databases. In clustered mode the set of replicated databases lives in the lease's
+writer epoch ([safety contract rule 9](safety-contract.md#replication), ADR-0020), so every node always agrees on it.
+Genesis or the seed-snapshot procedure records the initial set (for example
+`hasqlite genesis --database app.db --database tenants/acme.db`, or the databases found on a seeded standalone
+volume). Afterwards it is changed only on the writer, with audited commands:
+
+```bash
+hasqlite db add tenants/globex.db --reason "new tenant"
+hasqlite db remove tenants/initech.db --confirm-data-loss --reason "tenant offboarded" # deletes the files on every node
+hasqlite db list   # the set as recorded in the lease, with per-database sync lag on replicas
+```
+
 Validation (`ClusterConfig::from_toml`) fails closed:
 
 - Unknown keys or sections are rejected, so a misspelled setting cannot silently fall back to its default.
@@ -99,8 +114,12 @@ Validation (`ClusterConfig::from_toml`) fails closed:
   bounds the writer's renewal deadline. At runtime a candidate waits the *effective* TTL,
   `max(its ttl_secs, the holder's recorded ttl_secs)`, so lease timing can be changed in a rolling fashion.
 - `freshness.max_lag_secs > sync.interval_secs + lease.retry_period_secs`: between two snapshot starts the
-  writer renews every retry period, so steady-state lag reaches about that sum plus the sync duration. Allow
-  for the sync duration of your database size on top of the validated minimum.
+  writer renews every retry period, so steady-state lag reaches about that sum plus the sync duration. Pulls of
+  different databases run concurrently up to `sync.max_concurrent_pulls`, so allow for the slowest pull, or a full
+  round when there are more databases than pull slots, on top of the validated minimum.
+- `sync.max_concurrent_pulls` is 1–64 (default 4).
+- `freshness.path` is rejected (replaced by `freshness.dir`). At pre-flight, `freshness.dir` must be a directory
+  owned by the node UID with mode `0700`, must not be a symlink and must be on the same filesystem as `data.dir`.
 - Standalone mode rejects `sync.origin_endpoint` (a standalone node never pulls from a peer); `[sync]`,
   `[freshness]` and `[promotion]` are otherwise optional there.
 - Plaintext `grpc://` origins are accepted only for literal loopback IPs and `localhost`; `*.localhost`

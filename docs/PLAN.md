@@ -10,6 +10,8 @@ implementation guidance is organized by topic:
 - [Observability, risks, and operational limits](operations.md)
 - [Safety contract](safety-contract.md) — authoritative safety invariants
 - [Automated recovery & self-healing architecture](automated-recovery.md) (post-v1)
+- [Requirements (EARS)](requirements.md) — v1 requirements as testable EARS statements, traced to sources and tests
+- [Architecture decision records](adr/README.md)
 
 The documents share these conventions: normative requirements use uppercase
 MUST, MUST NOT, SHOULD, and MAY; operational targets are goals, not claims of
@@ -37,8 +39,14 @@ like "§10.6" are unambiguous; the safety contract uses rule numbers instead.
   used for liveness, because unrelated actors can change it.
 - `effective TTL`: `max(candidate's lease.ttl_secs, holder's recorded ttl_secs)`,
   the time a candidate waits before treating an unchanged lease as expired.
-- `freshness ledger`: the replica-side record of the last successful sync from a
-  source writer, including origin node, generation, and snapshot metadata.
+- `database set`: the 1–64 databases a cluster replicates, recorded in the
+  lease's activated writer epoch (`writer.databases`). It is set at genesis and
+  changed only by the writer through audited `hasqlite db add` / `db remove`
+  commands; `db remove` deletes the database's files on every node. Node
+  configuration does not list databases.
+- `freshness ledger`: the replica-side record, one per database in the set, of
+  the last successful sync from a source writer, including origin node,
+  generation, and snapshot metadata.
 - `outcome unknown`: a write whose client request may have reached the writer but
   whose final status cannot be definitively known; retries are forbidden unless a
   prior rejection proves the statement never executed.
@@ -50,7 +58,8 @@ like "§10.6" are unambiguous; the safety contract uses rule numbers instead.
 ### Goals
 
 1. **Single logical writer** at all times, with **lease-backed fencing** and
-   **generation monotonicity** (no split-brain writes).
+   **generation monotonicity** (no split-brain writes). One writer serves every
+   database in the cluster.
 2. **Fast failover** (target: low-second RTO) with **bounded RPO** via
    incremental rsync-style page sync from the current writer snapshot.
 3. **Operator-grade** observability: audit log, readiness/liveness semantics,
@@ -73,10 +82,21 @@ like "§10.6" are unambiguous; the safety contract uses rule numbers instead.
    workload-specific budgets against reproducible baselines before declaring
    this goal met; see
    [§6.5](testing.md#65-performance--benchmarks).
+8. **Multiple databases per cluster**: clustered mode replicates and serves a
+   set of up to 64 SQLite databases under one lease and one writer, as
+   standalone mode already serves several. Reads, writes and replica sync of
+   different databases run concurrently. Promotion requires every database
+   in the set to pass the freshness gate, and all databases fail over together
+   ([ADR-0020](adr/0020-multiple-databases-per-cluster.md), superseding
+   ADR-0018). Transactions stay within one database, and different databases
+   can reflect different points in time after an unplanned failover
+   ([§10.2](operations.md#102-data-safety-and-durability-limitations)).
 
 ### Future goals (non-goals for v1)
 
 - Multi-writer / distributed SQL consensus (Raft, Paxos).
+- Per-database leadership (different writers for different databases) and
+  cross-database transactions or cross-database consistent failover points.
 - Automated failure mode recovery & self-healing (emergency stale-replica promotion, dead-epoch roll-forward, replica auto-quarantine/re-seed, replicated client idempotency, and diverged-data reconciliation; see [automated-recovery.md](automated-recovery.md) and [roadmap.md](roadmap.md#post-v1--automated-failure-recovery--self-healing)).
 - Cross-region active/active.
 - Post-promotion catch-up from a peer replica (safety contract rule 13) and
@@ -93,10 +113,10 @@ like "§10.6" are unambiguous; the safety contract uses rule numbers instead.
 |--------|--------|
 | Split-brain write window | 0: no node commits after its renewal deadline, which precedes any candidate's TTL by the fencing margin ([§3](architecture.md#3-architecture) Lease timing; assumes no single commit stalls longer than the margin) |
 | Steady-state sync interval | Configurable 1–5s default |
-| Promotion block on stale replica | 100% when lag behind the activated writer's last renewal > `freshness.max_lag_secs`, or the ledger is not from that writer epoch |
+| Promotion block on stale replica | 100% when, for any database in the set, lag behind the activated writer's last renewal > `freshness.max_lag_secs`, the ledger record is missing, or it is not from that writer epoch |
 | Failover under synthetic load | RTO p95 < 15s on 3-node k3s (node-local disk) with default lease timing (TTL 10s, renew deadline 6s, retry 2s) |
-| Data after planned switchover | Page-hash match vs writer at switchover, provided the promoted replica durably holds the final snapshot before claiming a match; a timed-out final sync does not establish a lossless handover (see [§10.4](operations.md#104-replication-and-request-serving-limits), [§10.6](operations.md#106-unresolved-guarantees-and-recovery-policy)) |
-| Data after unplanned failover | New writer holds a prefix of acknowledged writes; loss window ≤ `max_lag_secs` + `renew_deadline_secs`, assuming no commit stalls inside `COMMIT` beyond the fencing margin (see [§10.2](operations.md#102-data-safety-and-durability-limitations)) |
+| Data after planned switchover | Page-hash match vs writer at switchover for every database in the set, provided the promoted replica durably holds the final snapshot before claiming a match; a timed-out final sync does not establish a lossless handover (see [§10.4](operations.md#104-replication-and-request-serving-limits), [§10.6](operations.md#106-unresolved-guarantees-and-recovery-policy)) |
+| Data after unplanned failover | For each database, the new writer holds a prefix of its acknowledged writes; loss window ≤ `max_lag_secs` + `renew_deadline_secs`, assuming no commit stalls inside `COMMIT` beyond the fencing margin (see [§10.2](operations.md#102-data-safety-and-durability-limitations)) |
 | Resource footprint | Workload-specific CPU, memory, network, and disk-I/O budgets are documented and pass the reproducible benchmark process in [§6.5](testing.md#65-performance--benchmarks). Numeric budgets are TBD until measured against declared baselines; no "very low resource consumption" claim is made before they are set and met. |
 
 ### Product posture and unresolved guarantees
@@ -125,8 +145,8 @@ The factors above are not a caveat to be hidden; they are the product contract.
 | M1 (weeks 2–4) | Controller parity | unit + proptest + simulation + coverage gate |
 | M1a (week 3) | Wire API (`hasqlite-proto`) | adjacent-version compatibility |
 | M1.5 (weeks 4–7, fast-track) | Standalone Single-Node Docker | Multi-stage Dockerfile, hardened standalone gateway, lock tests, probes |
-| M2 (weeks 6–8) | Sync worker with adapter-era ledger protocol | integration convergence + crash-during-apply + lease-change-mid-pull |
-| M3 (weeks 8–11) | HA cluster runtime | 3-node local HA + chaos suite |
+| M2 (weeks 6–8) | Sync worker with adapter-era, per-database ledger protocol | integration convergence across a multi-database set + crash-during-apply + lease-change-mid-pull |
+| M3 (weeks 8–11) | HA cluster runtime, including `hasqlite db add` / `db remove` | 3-node local HA + chaos suite (incl. writer dies after `db add`) |
 | M4 (weeks 11–13; requires Track N TLS by week 8) | K8s deploy | manifest + k3d smoke + rolling update |
 | M5 (weeks 13–14; requires Track N cutover) | 0.1.0 release | soak + security suite + resource benchmark budgets met |
 
