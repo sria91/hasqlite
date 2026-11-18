@@ -166,7 +166,9 @@ protocol.
      uses temp file + rename + directory fsync. An interrupted sync therefore
      always leaves the node unpromotable.
    - **Exclusive application**: at most one sync writes a given replica file at a
-     time (`SyncError::SyncInProgress` otherwise). Pulls of *different*
+     time (`SyncError::SyncInProgress` otherwise): an in-process check rejects a
+     duplicate before any I/O, and an advisory lock on `<replica>.pull-lock`
+     excludes other processes on the same host. Pulls of *different*
      databases run concurrently: a sync round starts one pull per database in
      the observed set, at most `sync.max_concurrent_pulls` at a time. Each pull
      invalidates, stamps and publishes only its own record, so pulls neither
@@ -211,8 +213,9 @@ protocol.
       Its `synced_at_secs` is at most `max_future_skew_secs` ahead of local
       time. A missing record, or one from another incarnation, for any
       database in the set denies promotion.
-      Checks are evaluated in a fixed order of classes (ledger shape, writer
-      epoch, time bounds); within a class, databases are checked in name
+      A lease without an activated writer is denied first, since its epoch
+      supplies the set. The remaining checks are evaluated in a fixed order of
+      classes (ledger shape, writer epoch, time bounds); within a class, databases are checked in name
       order. The first failure is reported, naming its database. The class
       order is part of the `hasqlite_promotion_denied_total` metric contract.
       The freshest-first delay ([architecture §3](architecture.md#3-architecture))

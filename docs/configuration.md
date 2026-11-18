@@ -87,7 +87,9 @@ allow_replica_reads = false # unsupported until Track N applies snapshots atomic
 http_bind = "0.0.0.0:8088"
 ```
 
-CLI: `hasqlite run --config cluster.toml` plus env overrides.
+CLI: `hasqlite run --config cluster.toml` plus env overrides. `hasqlite check --config cluster.toml` validates a
+configuration and exits (0 if valid, 78 if not), so it can gate deployments; both commands log every problem
+found, each with the setting it concerns.
 
 The configuration does not list databases. In clustered mode the set of replicated databases lives in the lease's
 writer epoch ([safety contract rule 9](safety-contract.md#replication), ADR-0020), so every node always agrees on it.
@@ -101,13 +103,16 @@ hasqlite db remove tenants/initech.db --confirm-data-loss --reason "tenant offbo
 hasqlite db list   # the set as recorded in the lease, with per-database sync lag on replicas
 ```
 
-Validation (`ClusterConfig::from_toml`) fails closed:
+Validation (`ClusterConfig::from_toml`) fails closed and reports every problem it finds, not just the first:
 
 - Unknown keys or sections are rejected, so a misspelled setting cannot silently fall back to its default.
 - Clustered mode requires `[freshness]`, `[promotion]`, `[sync]`, and `sync.origin_endpoint`.
 - Identifiers: `node.id` is 1–253 ASCII letters, digits, `.`, `_` or `-` (it is embedded in lease records,
   ledgers, audit lines and metric labels, so separators and control characters are rejected);
-  `lease.kubernetes.lease_name` and `namespace` are DNS-1123 subdomains.
+  `lease.kubernetes.lease_name` and `namespace` are DNS-1123 subdomains. The same node-ID rule, and the
+  database-name rule of ADR-0020, are enforced whenever a lease record or ledger record is parsed, so an
+  identifier read back from the lease store or disk is held to the same standard.
+- `promotion.max_future_skew_secs ≤ 300`.
 - Lease timing: `retry_period_secs > 0`, `2 × retry_period_secs ≤ renew_deadline_secs` (one failed renewal
   attempt must not demote the writer), `ttl_secs ≥ renew_deadline_secs + 2` (the fencing margin,
   [§3](architecture.md#3-architecture), computed with checked arithmetic), and `ttl_secs ≤ 3600`, which also

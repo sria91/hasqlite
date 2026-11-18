@@ -12,6 +12,10 @@ name = "hasqlite"
 path = "src/main.rs"
 
 [dependencies]
+hasqlite-core = { path = "../crates/hasqlite-core" }
 hasqlite-node = { path = "../crates/hasqlite-node" }
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile.workspace = true
