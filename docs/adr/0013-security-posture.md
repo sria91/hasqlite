@@ -2,7 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-11-17
-- Related: REQ-SEC-001 to REQ-SEC-010; safety contract rule 18; configuration §7; ADR-0012
+- Related: REQ-SEC-001 to REQ-SEC-011; safety contract rule 18; configuration §7; ADR-0012
 
 ## Context
 
@@ -23,10 +23,15 @@ replication access, and the reverse. Environment variables leak through
   loopback bind; clustered mode rejects `allow_unauthenticated` even on
   loopback, because the sidecar forwards remote traffic there.
 - SQL and replication use **distinct credentials** with separate scopes,
-  compared in constant time; startup rejects identical resolved values.
+  compared in constant time. Distinctness is enforced at startup and on every
+  rotation: startup rejects identical resolved values, and when a rotated
+  credential is read, the node compares it with the other active credential
+  before using it. On a match it keeps the previous value active, rejects the
+  new one and raises an alert.
 - Secrets are read from **files** by preference; environment variables only
-  where the deployment requires them. Tokens never appear in logs or errors
-  and rotate without restart.
+  where the deployment requires them. Tokens never appear in logs or errors.
+  A valid rotated token that differs from the other credential takes effect
+  without a restart.
 - Private-CA trust (`sync.tls_ca_file`, optional `sync.tls_server_name`) comes
   with the native transport; no plaintext fallback.
 

@@ -13,7 +13,7 @@ embedded in lease records, ledgers, audit lines and metric labels.
 
 ## Decision
 
-`ClusterConfig::from_toml` (one TOML/YAML file replacing long flag lists)
+`ClusterConfig::from_toml` (one TOML file replacing long flag lists)
 rejects, at startup:
 
 - unknown keys or sections;
@@ -24,8 +24,16 @@ rejects, at startup:
 - lease timing violating `retry > 0`, `2 × retry ≤ renew_deadline`,
   `ttl ≥ renew_deadline + 2` (checked arithmetic) or `ttl ≤ 3600`;
 - `max_lag_secs ≤ interval_secs + retry_period_secs`;
-- credential, plaintext-origin and authentication rules from ADR-0013;
+- the credential-source, plaintext-origin and authentication rules from
+  ADR-0013 that the file alone determines (exactly one source per credential,
+  plaintext origins only on loopback, no unauthenticated clustered gateway);
 - a standalone lease path other than the canonical one (ADR-0015).
+
+Rules that need resolved secret values are not `from_toml` checks. The
+startup step that resolves both credentials rejects identical SQL and
+replication token values with a constant-time comparison (ADR-0013). That
+step lands with the Phase 1a credential-resolution path; it does not exist
+yet.
 
 ## Consequences
 

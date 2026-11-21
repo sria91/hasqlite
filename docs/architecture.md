@@ -539,7 +539,7 @@ docstring, test and coverage gates apply to their first line of real code.
 
 ### Dependency-removal plan
 
-`hasqlite-sync` currently uses the `rsqlite-rsync` v0.5.0 Git dependency, pinned
+`hasqlite-sync` currently uses the `rsqlite-rsync` v0.5.1 Git dependency, pinned
 by commit `rev` rather than the movable tag, for replication pulls (CI builds with
 `--locked`); its integration test also uses the upstream server and
 protocol types. Keep this dependency only as a bridge while hasqlite builds its

@@ -14,7 +14,7 @@ hasqlite must eventually own its replication, wire protocol and client.
 
 ## Decision
 
-- `hasqlite-sync` uses `rsqlite-rsync` v0.5.0 as a Git dependency **pinned by
+- `hasqlite-sync` uses `rsqlite-rsync` v0.5.1 as a Git dependency **pinned by
   commit `rev`**, built with `--locked`.
 - The adapter is an **isolation boundary**: no upstream types in control,
   gateway or client crates, and public `hasqlite-sync` errors map upstream
