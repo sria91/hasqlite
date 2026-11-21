@@ -55,9 +55,12 @@ writer's databases, or holds a stale copy of one, must not be promotable.
   replica deletes local files of an older incarnation before its first pull
   of a new one. An old copy of a removed database therefore can neither pass
   the gate nor be patched into a re-added one.
-- **Names.** Each `/`-separated component is 1–255 ASCII letters, digits, `.`,
-  `_` or `-` and does not start with `.`. The whole name is at most 255 bytes
-  and ends in `.db`, `.sqlite` or `.sqlite3`. The first component is not
+- **Names.** Each `/`-separated component is non-empty, uses only ASCII
+  letters, digits, `.`, `_` or `-`, and does not start with `.`. The whole
+  name ends in `.db`, `.sqlite` or `.sqlite3` and is at most 200 bytes with
+  each `/` counted as three bytes (its `%2F` encoding), so every generated
+  ledger-record and diverged-copy name, including its `.tmp` file, stays
+  within the 255-byte file-name limit. The first component is not
   `diverged` or `ancestors`. With the cap of 64, the set fits in the Kubernetes
   Lease annotations (well under 256 KiB).
 - **One ledger record per database.** The freshness ledger becomes a directory
