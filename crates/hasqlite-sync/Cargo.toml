@@ -9,18 +9,23 @@ rust-version.workspace = true
 
 [dependencies]
 hasqlite-core = { path = "../hasqlite-core" }
+hasqlite-lease = { path = "../hasqlite-lease" }
 # Transitional implementation dependency; remove after the native backend and
 # dependency-free replication tests satisfy the cutover criteria in docs/PLAN.md.
 # Pinned by commit (tag v0.5.1: libsqlite3-sys 0.39, closes RUSTSEC-2026-0459) because tags can be moved.
 rsqlite-rsync = { git = "https://github.com/sria91/rsqlite-rsync", rev = "9613486a642d8ced82c0e6e391b8bbd448e0a063" }
 thiserror.workspace = true
-tokio = { workspace = true, features = ["fs"] }
+tokio = { workspace = true, features = ["fs", "io-util"] }
+toml.workspace = true
+tracing.workspace = true
+zeroize = "1"
 
 [dev-dependencies]
 # Must track the exact libsqlite3-sys major used by the pinned rsqlite-rsync rev: the crate's `links = "sqlite3"`
 # key forbids two versions in one build, so bumping either one alone breaks `cargo test -p hasqlite-sync`.
 libsqlite3-sys = { version = "0.39", features = ["bundled"] }
-tempfile = "3"
+tempfile.workspace = true
+toml.workspace = true
 tokio = { workspace = true, features = ["net"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 tonic = { version = "0.14", features = ["transport"] }

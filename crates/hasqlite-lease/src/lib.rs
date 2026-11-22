@@ -1,7 +1,7 @@
 //! Native lease records and freshness metadata, informed by prior HA designs.
 #![forbid(unsafe_code)]
 
-use hasqlite_core::NodeId;
+use hasqlite_core::{DatabaseName, MAX_DATABASES, MAX_LEASE_TTL_SECS, NodeId};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 
@@ -50,6 +50,192 @@ pub struct WriterEpoch {
     /// Stamped by the same clock as the origin's snapshot timestamps, so replica lag measured against it
     /// is independent of skew between the writer and the candidate.
     pub renewed_at_secs: u64,
+    /// The databases this cluster replicates; the lease is the only authority for the set (ADR-0020).
+    pub databases: DatabaseSet,
+    /// Incarnation the next `db add` assigns, so a removed and re-added name is a different database.
+    pub next_incarnation: u64,
+    /// Removed databases whose files every node deletes when it observes them, oldest first.
+    #[serde(default)]
+    pub removed: Tombstones,
+}
+
+/// One database of the set: its name and the incarnation it was added under.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DatabaseEntry {
+    /// Database path relative to `data.dir`.
+    pub name: DatabaseName,
+    /// Incarnation assigned when the database was added; ledger records must carry the same value.
+    pub incarnation: u64,
+}
+
+/// The writer epoch's database set: 1–64 entries, strictly sorted by name (so names are unique).
+///
+/// Deserialization rejects a record that breaks these rules, so a corrupt or hand-edited lease fails
+/// closed instead of silently replicating a different set (REQ-MDB-001).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "Vec<DatabaseEntry>", into = "Vec<DatabaseEntry>")]
+pub struct DatabaseSet(Vec<DatabaseEntry>);
+
+impl DatabaseSet {
+    /// Builds a set from entries in any order, rejecting duplicates, an empty set or more than 64 entries.
+    pub fn new(mut entries: Vec<DatabaseEntry>) -> Result<Self, DatabaseSetError> {
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        Self::try_from(entries)
+    }
+
+    /// Returns the entries in name order.
+    pub fn entries(&self) -> &[DatabaseEntry] {
+        &self.0
+    }
+
+    /// Returns the entry for `name`, if the set contains it.
+    pub fn get(&self, name: &DatabaseName) -> Option<&DatabaseEntry> {
+        self.0
+            .binary_search_by(|entry| entry.name.cmp(name))
+            .ok()
+            .map(|index| &self.0[index])
+    }
+
+    /// Returns the number of databases in the set (always 1–64).
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Always false: a database set holds at least one database.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl TryFrom<Vec<DatabaseEntry>> for DatabaseSet {
+    type Error = DatabaseSetError;
+
+    fn try_from(entries: Vec<DatabaseEntry>) -> Result<Self, Self::Error> {
+        if entries.is_empty() {
+            return Err(DatabaseSetError::Empty);
+        }
+        if entries.len() > MAX_DATABASES {
+            return Err(DatabaseSetError::TooMany {
+                count: entries.len(),
+            });
+        }
+        if let Some(pair) = entries.windows(2).find(|pair| pair[0].name >= pair[1].name) {
+            return Err(if pair[0].name == pair[1].name {
+                DatabaseSetError::Duplicate {
+                    name: pair[0].name.clone(),
+                }
+            } else {
+                DatabaseSetError::Unsorted {
+                    name: pair[1].name.clone(),
+                }
+            });
+        }
+        // A name that is a directory ancestor of another (`a.db` and `a.db/b.db`) cannot exist as both a
+        // file and a directory. Only whole `/`-separated components count, so `a.db-copy/b.db` is fine.
+        for entry in &entries {
+            let name = entry.name.as_str();
+            for (index, _) in name.match_indices('/') {
+                let ancestor = &name[..index];
+                if let Ok(found) = entries.binary_search_by(|e| e.name.as_str().cmp(ancestor)) {
+                    return Err(DatabaseSetError::Nested {
+                        ancestor: entries[found].name.clone(),
+                        name: entry.name.clone(),
+                    });
+                }
+            }
+        }
+        Ok(Self(entries))
+    }
+}
+
+impl From<DatabaseSet> for Vec<DatabaseEntry> {
+    fn from(set: DatabaseSet) -> Self {
+        set.0
+    }
+}
+
+/// Reasons a database set is malformed.
+#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
+pub enum DatabaseSetError {
+    /// The set holds no database.
+    #[error("database set must hold at least one database")]
+    Empty,
+    /// The set holds more than [`MAX_DATABASES`] databases.
+    #[error("database set holds {count} databases (max {MAX_DATABASES})")]
+    TooMany {
+        /// Number of entries found.
+        count: usize,
+    },
+    /// The same name appears twice.
+    #[error("database set lists '{name}' more than once")]
+    Duplicate {
+        /// The repeated name.
+        name: DatabaseName,
+    },
+    /// Entries are not sorted by name.
+    #[error("database set is not sorted by name at '{name}'")]
+    Unsorted {
+        /// First entry found out of order.
+        name: DatabaseName,
+    },
+    /// One name is a directory ancestor of another, so both cannot exist on disk.
+    #[error("database set lists '{ancestor}', which is a directory ancestor of '{name}'")]
+    Nested {
+        /// The name used as a directory by `name`.
+        ancestor: DatabaseName,
+        /// The name nested under `ancestor`.
+        name: DatabaseName,
+    },
+    /// The tombstone list holds more than [`MAX_DATABASES`] entries.
+    #[error("tombstone list holds {count} entries (max {MAX_DATABASES})")]
+    TooManyTombstones {
+        /// Number of entries found.
+        count: usize,
+    },
+}
+
+/// Removed databases, oldest first, at most 64 (REQ-MDB-020).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "Vec<DatabaseEntry>", into = "Vec<DatabaseEntry>")]
+pub struct Tombstones(Vec<DatabaseEntry>);
+
+impl Tombstones {
+    /// Returns the tombstones, oldest first.
+    pub fn entries(&self) -> &[DatabaseEntry] {
+        &self.0
+    }
+
+    /// Records a removal, dropping the oldest tombstone when the list is full.
+    pub fn push(&mut self, entry: DatabaseEntry) {
+        if self.0.len() == MAX_DATABASES {
+            self.0.remove(0);
+        }
+        self.0.push(entry);
+    }
+
+    /// Drops any tombstone for `name` (a `db add` of a previously removed name).
+    pub fn forget(&mut self, name: &DatabaseName) {
+        self.0.retain(|entry| &entry.name != name);
+    }
+}
+
+impl TryFrom<Vec<DatabaseEntry>> for Tombstones {
+    type Error = DatabaseSetError;
+
+    fn try_from(entries: Vec<DatabaseEntry>) -> Result<Self, Self::Error> {
+        if entries.len() > MAX_DATABASES {
+            return Err(DatabaseSetError::TooManyTombstones {
+                count: entries.len(),
+            });
+        }
+        Ok(Self(entries))
+    }
+}
+
+impl From<Tombstones> for Vec<DatabaseEntry> {
+    fn from(tombstones: Tombstones) -> Self {
+        tombstones.0
+    }
 }
 
 /// Opaque hasqlite-owned token that changes on every lease write made *by hasqlite* (acquire, activate,
@@ -130,8 +316,13 @@ impl LeaseObservation {
 }
 
 /// The TTL a candidate must wait on `observed`: the longer of its own `local_ttl` and the holder's recorded TTL.
+///
+/// The recorded TTL is capped at [`MAX_LEASE_TTL_SECS`]. Every holder validated its own TTL against that
+/// cap, so the cap never shortens a legitimate wait, but a corrupt record cannot stall failover forever.
 pub fn effective_ttl(local_ttl: Duration, observed: &LeaseRecord) -> Duration {
-    local_ttl.max(Duration::from_secs(observed.ttl_secs))
+    local_ttl.max(Duration::from_secs(
+        observed.ttl_secs.min(MAX_LEASE_TTL_SECS),
+    ))
 }
 
 /// Writer-side time basis for every timestamp the writer stamps into the lease (`renewed_at_secs`) and
@@ -191,9 +382,13 @@ impl RenewalDeadline {
     }
 }
 
-/// Last successful replica sync metadata.
+/// Last successful replica sync metadata for one database (one record per database, ADR-0020).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FreshnessLedger {
+    /// Database the snapshot is of.
+    pub database: DatabaseName,
+    /// Incarnation of that database in the writer's set when it was pulled; promotion requires a match.
+    pub incarnation: u64,
     /// Node identifier of the writer origin that produced the snapshot.
     pub source_node_id: NodeId,
     /// Generation counter of the writer origin at sync time.
@@ -242,31 +437,186 @@ mod tests {
     #[test]
     fn freshness_ledger_records_source_and_destination() {
         let ledger = FreshnessLedger {
-            source_node_id: NodeId::from("node-1"),
+            database: DatabaseName::parse("app.db").unwrap(),
+            incarnation: 1,
+            source_node_id: NodeId::new("node-1"),
             source_generation: 42,
             synced_at_secs: 1_700_000_000,
-            destination_node_id: NodeId::from("node-2"),
+            destination_node_id: NodeId::new("node-2"),
         };
-        assert_eq!(ledger.source_node_id, NodeId::from("node-1"));
+        assert_eq!(ledger.source_node_id, NodeId::new("node-1"));
         assert_eq!(ledger.source_node_id.as_str(), "node-1");
         assert_eq!(ledger.source_generation, 42);
         assert_eq!(ledger.synced_at_secs, 1_700_000_000);
-        assert_eq!(ledger.destination_node_id, NodeId::from("node-2"));
+        assert_eq!(ledger.destination_node_id, NodeId::new("node-2"));
     }
 
     #[test]
     fn freshness_ledger_without_destination_is_rejected() {
         let error = toml::from_str::<FreshnessLedger>(
-            "source_node_id = \"node-1\"\nsource_generation = 1\nsynced_at_secs = 1",
+            "database = \"app.db\"\nincarnation = 1\nsource_node_id = \"node-1\"\nsource_generation = 1\nsynced_at_secs = 1",
         )
         .unwrap_err();
         assert!(error.to_string().contains("destination_node_id"));
     }
 
     #[test]
+    fn freshness_ledger_rejects_invalid_identities() {
+        let valid = "database = \"app.db\"\nincarnation = 1\nsource_node_id = \"node-1\"\nsource_generation = 1\nsynced_at_secs = 1\ndestination_node_id = \"node-2\"";
+        assert!(toml::from_str::<FreshnessLedger>(valid).is_ok());
+        let injected = valid.replace("\"node-1\"", "\"node-1\\nforged=1\"");
+        let error = toml::from_str::<FreshnessLedger>(&injected).unwrap_err();
+        assert!(error.to_string().contains("invalid node id"), "got {error}");
+        let escaping = valid.replace("\"app.db\"", "\"../app.db\"");
+        let error = toml::from_str::<FreshnessLedger>(&escaping).unwrap_err();
+        assert!(
+            error.to_string().contains("invalid database name"),
+            "got {error}"
+        );
+    }
+
+    /// Builds a set entry.
+    fn entry(name: &str, incarnation: u64) -> DatabaseEntry {
+        DatabaseEntry {
+            name: DatabaseName::parse(name).unwrap(),
+            incarnation,
+        }
+    }
+
+    #[test]
+    fn database_set_sorts_and_looks_up_entries() {
+        let set = DatabaseSet::new(vec![entry("b.db", 2), entry("a.db", 1)]).unwrap();
+        assert_eq!(set.len(), 2);
+        assert!(!set.is_empty());
+        assert_eq!(set.entries()[0].name.as_str(), "a.db");
+        assert_eq!(
+            set.get(&DatabaseName::parse("b.db").unwrap())
+                .map(|e| e.incarnation),
+            Some(2)
+        );
+        assert!(set.get(&DatabaseName::parse("c.db").unwrap()).is_none());
+    }
+
+    #[test]
+    fn database_set_rejects_malformed_sets() {
+        assert_eq!(DatabaseSet::new(vec![]), Err(DatabaseSetError::Empty));
+        assert!(matches!(
+            DatabaseSet::new(vec![entry("a.db", 1), entry("a.db", 2)]),
+            Err(DatabaseSetError::Duplicate { .. })
+        ));
+        assert!(matches!(
+            DatabaseSet::try_from(vec![entry("b.db", 1), entry("a.db", 2)]),
+            Err(DatabaseSetError::Unsorted { .. })
+        ));
+        assert_eq!(
+            DatabaseSet::new(vec![entry("a.db/b.db", 2), entry("a.db", 1)]),
+            Err(DatabaseSetError::Nested {
+                ancestor: DatabaseName::parse("a.db").unwrap(),
+                name: DatabaseName::parse("a.db/b.db").unwrap(),
+            })
+        );
+        assert!(matches!(
+            DatabaseSet::new(vec![entry("x/a.db/c/b.db", 2), entry("x/a.db", 1)]),
+            Err(DatabaseSetError::Nested { .. })
+        ));
+        // A shared string prefix that is not a whole component is not nesting.
+        let set = DatabaseSet::new(vec![
+            entry("a.db-copy/b.db", 2),
+            entry("a.db", 1),
+            entry("a.dbx/b.db", 3),
+        ])
+        .unwrap();
+        assert_eq!(set.len(), 3);
+        let too_many = (0..=MAX_DATABASES)
+            .map(|i| entry(&format!("db{i:03}.db"), i as u64 + 1))
+            .collect();
+        assert_eq!(
+            DatabaseSet::new(too_many),
+            Err(DatabaseSetError::TooMany {
+                count: MAX_DATABASES + 1
+            })
+        );
+    }
+
+    #[test]
+    fn lease_parsing_rejects_unsorted_database_set() {
+        let record = r#"
+generation = 2
+renewed_at_secs = 100
+ttl_secs = 10
+holder_node_id = "node-1"
+
+[writer]
+node_id = "node-1"
+generation = 2
+renewed_at_secs = 100
+next_incarnation = 3
+
+[[writer.databases]]
+name = "b.db"
+incarnation = 2
+
+[[writer.databases]]
+name = "a.db"
+incarnation = 1
+"#;
+        let error = toml::from_str::<LeaseRecord>(record).unwrap_err();
+        assert!(error.to_string().contains("not sorted"), "got {error}");
+
+        let sorted = record
+            .replacen("\"b.db\"", "\"tmp\"", 1)
+            .replacen("\"a.db\"", "\"b.db\"", 1)
+            .replacen("\"tmp\"", "\"a.db\"", 1);
+        let lease: LeaseRecord = toml::from_str(&sorted).expect("sorted set parses");
+        let writer = lease.writer.expect("writer epoch");
+        assert_eq!(writer.databases.len(), 2);
+        assert!(writer.removed.entries().is_empty());
+    }
+
+    #[test]
+    fn tombstones_drop_the_oldest_when_full() {
+        let mut tombstones = Tombstones::default();
+        for i in 0..MAX_DATABASES {
+            tombstones.push(entry(&format!("db{i:03}.db"), i as u64 + 1));
+        }
+        tombstones.push(entry("newest.db", 100));
+        assert_eq!(tombstones.entries().len(), MAX_DATABASES);
+        assert_eq!(tombstones.entries()[0].name.as_str(), "db001.db");
+        assert_eq!(
+            tombstones.entries().last().unwrap().name.as_str(),
+            "newest.db"
+        );
+        tombstones.forget(&DatabaseName::parse("newest.db").unwrap());
+        assert_eq!(tombstones.entries().len(), MAX_DATABASES - 1);
+
+        let too_many: Vec<_> = (0..=MAX_DATABASES)
+            .map(|i| entry(&format!("db{i:03}.db"), 1))
+            .collect();
+        assert!(matches!(
+            Tombstones::try_from(too_many),
+            Err(DatabaseSetError::TooManyTombstones { .. })
+        ));
+    }
+
+    #[test]
+    fn effective_ttl_caps_a_corrupt_recorded_ttl() {
+        let observed = LeaseRecord {
+            holder_node_id: Some(NodeId::new("node-1")),
+            generation: 3,
+            renewed_at_secs: 100,
+            ttl_secs: u64::MAX,
+            writer: None,
+        };
+        assert_eq!(
+            effective_ttl(Duration::from_secs(10), &observed),
+            Duration::from_secs(MAX_LEASE_TTL_SECS)
+        );
+    }
+
+    #[test]
     fn lease_record_construction_and_holder() {
         let lease = LeaseRecord {
-            holder_node_id: Some(NodeId::from("node-1")),
+            holder_node_id: Some(NodeId::new("node-1")),
             generation: 1,
             renewed_at_secs: 100,
             ttl_secs: 10,
@@ -277,8 +627,8 @@ mod tests {
             Some("node-1")
         );
         assert_eq!(lease.generation, 1);
-        assert!(lease.is_held_by(&NodeId::from("node-1")));
-        assert!(!lease.is_held_by(&NodeId::from("node-2")));
+        assert!(lease.is_held_by(&NodeId::new("node-1")));
+        assert!(!lease.is_held_by(&NodeId::new("node-2")));
     }
 
     #[test]
@@ -290,7 +640,7 @@ mod tests {
             ttl_secs: 10,
             writer: None,
         };
-        assert!(!lease.is_held_by(&NodeId::from("node-1")));
+        assert!(!lease.is_held_by(&NodeId::new("node-1")));
     }
 
     #[test]
@@ -340,7 +690,7 @@ mod tests {
         let local_ttl = Duration::from_secs(4);
         // Holder runs ttl 10 / renew deadline 6; a candidate rolled out with ttl 4 must not expire it at 4s.
         let observed = LeaseRecord {
-            holder_node_id: Some(NodeId::from("node-1")),
+            holder_node_id: Some(NodeId::new("node-1")),
             generation: 3,
             renewed_at_secs: 100,
             ttl_secs: 10,
@@ -358,7 +708,7 @@ mod tests {
         let t0 = Instant::now();
         let local_ttl = Duration::from_secs(10);
         let observed = LeaseRecord {
-            holder_node_id: Some(NodeId::from("node-1")),
+            holder_node_id: Some(NodeId::new("node-1")),
             generation: 3,
             renewed_at_secs: 100,
             ttl_secs: 4,
@@ -425,8 +775,8 @@ mod tests {
     #[test]
     fn lease_unauthorized_error_display() {
         let unauthorized = LeaseError::UnauthorizedHolder {
-            expected: NodeId::from("node-1"),
-            actual: Some(NodeId::from("node-2")),
+            expected: NodeId::new("node-1"),
+            actual: Some(NodeId::new("node-2")),
         };
         assert_eq!(
             unauthorized.to_string(),
@@ -434,7 +784,7 @@ mod tests {
         );
 
         let unassigned = LeaseError::UnauthorizedHolder {
-            expected: NodeId::from("node-1"),
+            expected: NodeId::new("node-1"),
             actual: None,
         };
         assert_eq!(

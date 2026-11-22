@@ -145,16 +145,18 @@ protocol.
    `synced_at_secs`, `destination_node_id`.
    - **Database set**: the cluster replicates exactly the databases in the
      lease's `writer.databases`, a list of 1–64 entries `(name, incarnation)`,
-     sorted by name with no duplicate names. Names are relative to `data.dir`.
-     Each `/`-separated component is non-empty, uses only ASCII letters,
-     digits, `.`, `_` or `-`, and does not start with `.`. The whole name ends
-     in `.db`, `.sqlite` or `.sqlite3`, its first component is not `diverged`
-     or `ancestors`, and it is at most 200 bytes when each `/` is counted as
-     three bytes (its `%2F` encoding; `%` cannot occur in a name). That bound
-     keeps every generated name within the 255-byte file-name limit: the
-     encoded ledger record name and its `.tmp` file, and the diverged copy
-     `<db>.diverged-<id>` and its `.tmp` file, where `.diverged-`, the longest
-     id (`standalone-g<u64>`, 32 bytes) and `.tmp` add at most 46 bytes. The *incarnation* is a number the writer takes
+     sorted by name with no duplicate names, and no name is a directory
+     ancestor of another (`a.db` and `a.db/b.db`). Names are relative to
+     `data.dir`. Each `/`-separated component is non-empty, uses only ASCII
+     letters, digits, `.`, `_` or `-`, and does not start with `.`. The whole
+     name ends in `.db`, `.sqlite` or `.sqlite3`, its first component is not
+     `diverged` or `ancestors`, and it is at most 200 bytes when each `/` is
+     counted as three bytes (its `%2F` encoding; `%` cannot occur in a name).
+     That bound keeps every generated name within the 255-byte file-name
+     limit: the encoded ledger record name and its `.tmp` file, and the
+     diverged copy `<db>.diverged-<id>` and its `.tmp` file, where
+     `.diverged-`, the longest id (`standalone-g<u64>`, 32 bytes) and `.tmp`
+     add at most 46 bytes. The *incarnation* is a number the writer takes
      from the lease counter `writer.next_incarnation` each time a name is
      added, so a name that is removed and added again never reuses an
      incarnation. Node configuration never defines the set. Genesis or the
@@ -246,7 +248,17 @@ protocol.
      uses temp file + rename + directory fsync. An interrupted sync therefore
      always leaves the node unpromotable.
    - **Exclusive application**: at most one sync writes a given replica file at a
-     time (`SyncError::SyncInProgress` otherwise). Pulls of *different*
+     time (`SyncError::SyncInProgress` otherwise): an in-process check rejects a
+     duplicate before any I/O, and an advisory lock excludes other processes on
+     the same host. The lock is taken before the record is invalidated or any
+     page is written. Lock files live in the reserved directory
+     `${data.dir}/.hasqlite.pull-locks/`, which every process pulling into the
+     volume shares and which is outside the database namespace (names never
+     start with `.`). Each is named after the database (rule 15's encoding plus
+     `.pull-lock`, shortened with a hash of the name when it would exceed 255
+     bytes), and the replica file is always `${data.dir}/<name>` with `data.dir`
+     canonicalized, so every spelling of the path shares one lock and one write
+     target; a name whose existing path components include a symlink is refused. Pulls of *different*
      databases run concurrently: a sync round starts one pull per database in
      the observed set, at most `sync.max_concurrent_pulls` at a time. Each pull
      invalidates, stamps and publishes only its own record, so pulls neither
@@ -300,8 +312,10 @@ protocol.
       lease's `format` is one this node supports (rule 2). A
       missing record, or one from another incarnation, for any database in
       the set denies promotion.
-      The lease format is checked first. The other checks are evaluated in
-      a fixed order of classes (ledger shape, writer epoch, time bounds);
+      The lease format is checked first, then a lease without an activated
+      writer is denied, since its epoch supplies the set. The remaining
+      checks are evaluated in a fixed order of classes (ledger shape, writer
+      epoch, time bounds);
       within a class, databases are checked in name order. The first failure
       is reported, naming its database. The class order is part of the
       `hasqlite_promotion_denied_total` metric contract. The freshest-first

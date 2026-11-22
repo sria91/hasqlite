@@ -59,10 +59,9 @@ namespace = "default"
 # annotation writes to the Lease object cannot postpone failover.
 
 [freshness]
-path = "/var/lib/hasqlite/.hasqlite.freshness" # current parser: single ledger file on the PVC, same filesystem as the database
-# Planned (ADR-0020, Phase 2): a directory with one ledger record per replicated database, on the same filesystem as
-# data.dir, owned by the node UID with mode 0700. It replaces `path`; the current parser does not accept it yet.
-# dir = "/var/lib/hasqlite/.hasqlite.freshness"
+# One ledger record per replicated database (ADR-0020), on the same filesystem as data.dir, owned by the node UID
+# with mode 0700. The single-file `path` key of earlier versions is rejected.
+dir = "/var/lib/hasqlite/.hasqlite.freshness"
 max_lag_secs = 8 # max lag of each database's last snapshot behind the writer's last lease renewal (both on the writer's clock); > interval_secs + retry_period_secs
 
 [promotion]
@@ -70,7 +69,7 @@ max_future_skew_secs = 2
 
 [sync]
 interval_secs = 2
-# max_concurrent_pulls = 4 # planned (ADR-0020): pulls of different databases in parallel (1–64); not yet accepted by the parser
+max_concurrent_pulls = 4 # pulls of different databases in parallel (1–64, default 4); validated today, used once the multi-database sync round lands (Phase 2)
 # Required in clustered mode on every node, including the current writer: any node can be demoted and
 # must then resync. Use a stable alias that always routes to the current writer, never a pod hostname.
 origin_endpoint = "https://hasqlite-writer:50443" # remote origins require TLS; grpc:// is limited to loopback IPs and `localhost`
@@ -96,7 +95,11 @@ allow_replica_reads = false # unsupported until Track N applies snapshots atomic
 http_bind = "0.0.0.0:8088"
 ```
 
-CLI: `hasqlite run --config cluster.toml` plus env overrides.
+CLI: `hasqlite check --config cluster.toml` validates a configuration and exits (0 if valid, 78 if not), so it
+can gate deployments; it logs every problem found, each with the setting it concerns. Starting a node with
+`hasqlite run --config cluster.toml`, and environment-variable overrides of configuration settings, are planned
+(Phase 1b): today `run` validates the configuration the same way and then exits with status 69 without starting
+a node, and no environment overrides are applied.
 
 The configuration does not list databases. In clustered mode the set of replicated databases lives in the lease's
 writer epoch ([safety contract rule 9](safety-contract.md#replication), ADR-0020), so every node always agrees on it.
@@ -110,27 +113,28 @@ hasqlite db remove tenants/initech.db --confirm-data-loss --reason "tenant offbo
 hasqlite db list   # the set as recorded in the lease, with per-database sync lag on replicas
 ```
 
-Validation (`ClusterConfig::from_toml`) fails closed:
+Validation (`ClusterConfig::from_toml`) fails closed and reports every problem it finds, not just the first:
 
 - Unknown keys or sections are rejected, so a misspelled setting cannot silently fall back to its default.
 - Clustered mode requires `[freshness]`, `[promotion]`, `[sync]`, and `sync.origin_endpoint`.
 - Identifiers: `node.id` is 1–253 ASCII letters, digits, `.`, `_` or `-` (it is embedded in lease records,
   ledgers, audit lines and metric labels, so separators and control characters are rejected);
-  `lease.kubernetes.lease_name` and `namespace` are DNS-1123 subdomains.
+  `lease.kubernetes.lease_name` and `namespace` are DNS-1123 subdomains. The same node-ID rule, and the
+  database-name rule of ADR-0020, are enforced whenever a lease record or ledger record is parsed, so an
+  identifier read back from the lease store or disk is held to the same standard.
+- `promotion.max_future_skew_secs ≤ 300`.
 - Lease timing: `retry_period_secs > 0`, `2 × retry_period_secs ≤ renew_deadline_secs` (one failed renewal
   attempt must not demote the writer), `ttl_secs ≥ renew_deadline_secs + 2` (the fencing margin,
   [§3](architecture.md#3-architecture), computed with checked arithmetic), and `ttl_secs ≤ 3600`, which also
   bounds the writer's renewal deadline. At runtime a candidate waits the *effective* TTL,
   `max(its ttl_secs, the holder's recorded ttl_secs)`, so lease timing can be changed in a rolling fashion.
 - `freshness.max_lag_secs > sync.interval_secs + lease.retry_period_secs`: between two snapshot starts the
-  writer renews every retry period, so steady-state lag reaches about that sum plus the sync duration. Today a
-  node syncs a single database, so allow for that database's pull time on top of the validated minimum. Planned
-  with ADR-0020 (Phase 2, not yet in the parser or the sync engine): pulls of different databases run concurrently
-  up to `sync.max_concurrent_pulls`, and the allowance becomes the slowest pull, or a full round when there are
-  more databases than pull slots.
-- `freshness.path` is required today. Planned with ADR-0020 (Phase 2, not yet in the parser):
-  `sync.max_concurrent_pulls` becomes 1–64 (default 4), and `freshness.dir` replaces `freshness.path`, which is then
-  rejected. At pre-flight, `freshness.dir` must be a directory owned by the node UID with mode `0700`, must not be a
+  writer renews every retry period, so steady-state lag reaches about that sum plus the sync duration. The
+  multi-database sync round is not implemented yet (ADR-0020, Phase 2). Once it is, pulls of different databases
+  run concurrently up to `sync.max_concurrent_pulls`, so allow for the slowest pull, or a full round when there are
+  more databases than pull slots, on top of the validated minimum.
+- `freshness.dir` is required and `freshness.path` is rejected as an unknown key (ADR-0020).
+  `sync.max_concurrent_pulls` is 1–64 (default 4). At pre-flight, `freshness.dir` must be a directory owned by the node UID with mode `0700`, must not be a
   symlink and must be on the same filesystem as `data.dir`.
 - Standalone mode rejects `sync.origin_endpoint` (a standalone node never pulls from a peer); `[sync]`,
   `[freshness]` and `[promotion]` are otherwise optional there.

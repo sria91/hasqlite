@@ -80,8 +80,9 @@ writer's databases, or holds a stale copy of one, must not be promotable.
   Only pulls into the same database file are exclusive.
 - **Promotion requires every database.** `validate_promotion` passes only if
   each database in the observed lease's set has a record that passes the
-  existing checks. The checks run class by class (ledger shape, writer epoch,
-  time bounds); within a class, databases are checked in name order, and the
+  existing checks. The lease must record an activated writer, whose set says
+  which records to check; the checks then run class by class (ledger shape,
+  writer epoch, time bounds); within a class, databases are checked in name order, and the
   first failure is reported. The freshest-first delay uses the largest lag
   over all databases. `writer.promoted_from.synced_at_secs` records the oldest
   snapshot stamp over all databases.

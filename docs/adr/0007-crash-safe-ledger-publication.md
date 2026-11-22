@@ -37,7 +37,14 @@ and completely on disk, nor attribute it to the wrong writer.
      rejects pulls (`FAILED_PRECONDITION`) unless the node is the current lease
      holder and activated writer.
 - **Exclusive application**: at most one pull per replica path
-  (`SyncError::SyncInProgress`).
+  (`SyncError::SyncInProgress`), enforced in-process before any I/O and across
+  processes by an advisory lock in the reserved directory
+  `${data.dir}/.hasqlite.pull-locks/`, one lock file per database name
+  (safety contract rule 9).
+- **Order enforced by types**: `LedgerStore::begin_pull` claims the replica and
+  invalidates the record, returning a `PullPermit`; `pull_replica` consumes it
+  and returns a `PulledReplica` only after the fsyncs; only `PulledReplica`
+  can publish. Skipping or reordering a step does not compile.
 - With the native backend, the origin stamps node ID, generation and snapshot
   start in the stream header and applies snapshots atomically (staging + rename
   or under SQLite locking), retiring steps 1–3.
