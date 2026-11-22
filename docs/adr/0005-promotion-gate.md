@@ -19,13 +19,17 @@ the writer died, because in v1 it may pull only from the activated writer.
   a mandatory `destination_node_id`.
 - `validate_promotion` passes only if, in this fixed order (first failure
   reported):
+  0. **Lease format**: the observed lease's `format` is one this node
+     supports (ADR-0006).
   1. **Ledger shape**: present, valid, bound to this node, not self-sourced,
      and an activated writer exists.
   2. **Writer epoch**: source node and generation equal the observed lease's
      activated `writer` epoch.
-  3. **Time bounds**: `writer.renewed_at_secs − synced_at_secs` (saturating)
-     ≤ `freshness.max_lag_secs`, both stamps from the writer's clock; and
-     `synced_at_secs` ≤ local wall time + `promotion.max_future_skew_secs`.
+  3. **Time bounds**: `writer.renewed_at_secs + writer.clock_deficit_secs −
+     synced_at_secs` (saturating) ≤ `freshness.max_lag_secs`, all from the
+     writer's clock; `synced_at_secs` ≤ local wall time +
+     `promotion.max_future_skew_secs`; and `synced_at_secs` is later than
+     `writer.clock_rebased_at_secs` when that is set (ADR-0006).
 - **Freshest first**: an eligible candidate waits
   `retry_period_secs × lag_secs / max_lag_secs` before acquiring and aborts if
   the lease version changes meanwhile.

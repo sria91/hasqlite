@@ -15,10 +15,14 @@ The default deployment posture is intentionally conservative:
   preferred credential source in Kubernetes or Docker-based production use.
 - The SQL token and replication token are separate credentials with separate
   scopes; they are never interchangeable. Distinctness is enforced at startup
-  and on every rotation: when a rotated credential is read, the node compares it
-  in constant time with the other active credential before using it, and on a
-  match keeps the previous value, rejects the new one and raises an alert.
-  Rotation to a distinct value needs no restart.
+  and on every rotation. The node holds the two credentials as one pair and
+  replaces the pair only as a whole: whenever either credential's source
+  changes, it reads both under one lock, compares the resolved values in
+  constant time, and installs the new pair only if they differ. On a match it
+  keeps the previous pair active, rejects the change and raises an alert.
+  Because reloads are serialized and always read both sources, two rotations
+  that land together are compared with each other, never each with the other's
+  old value. Rotation to a distinct value needs no restart.
 
 This section is normative for v1 and is intentionally stricter than a permissive
 local-dev default.
@@ -119,9 +123,11 @@ Validation (`ClusterConfig::from_toml`) fails closed:
   bounds the writer's renewal deadline. At runtime a candidate waits the *effective* TTL,
   `max(its ttl_secs, the holder's recorded ttl_secs)`, so lease timing can be changed in a rolling fashion.
 - `freshness.max_lag_secs > sync.interval_secs + lease.retry_period_secs`: between two snapshot starts the
-  writer renews every retry period, so steady-state lag reaches about that sum plus the sync duration. Pulls of
-  different databases run concurrently up to `sync.max_concurrent_pulls`, so allow for the slowest pull, or a full
-  round when there are more databases than pull slots, on top of the validated minimum.
+  writer renews every retry period, so steady-state lag reaches about that sum plus the sync duration. Today a
+  node syncs a single database, so allow for that database's pull time on top of the validated minimum. Planned
+  with ADR-0020 (Phase 2, not yet in the parser or the sync engine): pulls of different databases run concurrently
+  up to `sync.max_concurrent_pulls`, and the allowance becomes the slowest pull, or a full round when there are
+  more databases than pull slots.
 - `freshness.path` is required today. Planned with ADR-0020 (Phase 2, not yet in the parser):
   `sync.max_concurrent_pulls` becomes 1–64 (default 4), and `freshness.dir` replaces `freshness.path`, which is then
   rejected. At pre-flight, `freshness.dir` must be a directory owned by the node UID with mode `0700`, must not be a

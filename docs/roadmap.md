@@ -18,9 +18,10 @@ Implement native equivalents of the required pure HA logic in
 
 - `parse_lease_record`, `parse_freshness_ledger` (mandatory destination binding, non-empty source attribution)
 - `LeaseObservation` (candidate-side expiry on the local monotonic clock against the effective TTL `max(local, holder's recorded ttl_secs)`; done) and `RenewalDeadline` (writer-side commit cutoff; done)
-- `WriterClock` (non-decreasing time basis for every writer stamp, seeded from the writer epoch's last renewal on activation; done). Still to do: hold detection (wall clock behind
-  the last stamp, or behind the monotonic clock by more than 1 second) and the lease fields `writer.clock_held` /
-  `writer.clock_resumed_at_secs` that make candidates fail closed (safety contract rule 4) wired into renew, activate, release and snapshot stamping
+- `WriterClock` (non-decreasing time basis for every writer stamp, seeded from the writer epoch's last renewal on activation; done). Still to do: the monotonic reference and
+  cumulative deficit, the lease fields `writer.clock_deficit_secs` / `writer.clock_rebased_at_secs` and the lease
+  `format` number (safety contract rules 2 and 4) wired into renew, activate, release and snapshot stamping, and
+  `validate_promotion` using the corrected lag and rejecting snapshots stamped at or before the rebase
 - `validate_promotion` against the observed lease's activated writer epoch (done), and `enforce_write_fence` checked before `COMMIT`
 - Lease store trait with conditional operations only; the store, not the caller, derives the new generation. Every write bumps the hasqlite-owned `LeaseVersion` token and uses the backend's native revision only as the CAS precondition (contract rule 2):
   - `acquire(observed: &VersionedLease) -> Result<VersionedLease, LeaseError>` (generation + 1, writer epoch unchanged)

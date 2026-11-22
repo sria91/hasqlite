@@ -24,10 +24,13 @@ replication access, and the reverse. Environment variables leak through
   loopback, because the sidecar forwards remote traffic there.
 - SQL and replication use **distinct credentials** with separate scopes,
   compared in constant time. Distinctness is enforced at startup and on every
-  rotation: startup rejects identical resolved values, and when a rotated
-  credential is read, the node compares it with the other active credential
-  before using it. On a match it keeps the previous value active, rejects the
-  new one and raises an alert.
+  rotation: startup rejects identical resolved values. At runtime the node
+  holds both credentials as one pair. When either source changes, it reads
+  both under one lock and installs the new pair only if the resolved values
+  differ. On a match it keeps the previous pair active, rejects the change
+  and raises an alert. Serialized reloads that always read both sources mean
+  two concurrent rotations to the same value cannot each pass by comparing
+  against the other's old value.
 - Secrets are read from **files** by preference; environment variables only
   where the deployment requires them. Tokens never appear in logs or errors.
   A valid rotated token that differs from the other credential takes effect
