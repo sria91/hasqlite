@@ -6,8 +6,8 @@
 //!
 //! The crash-safe ledger protocol (ADR-0007, safety contract rule 9) is enforced by types:
 //!
-//! 1. [`LedgerStore::begin_pull`] claims exclusive use of the replica file and invalidates the database's
-//!    ledger record durably, returning a [`PullPermit`].
+//! 1. [`LedgerStore::begin_pull`] claims exclusive use of the database's replica file under `data.dir` and
+//!    invalidates the database's ledger record durably, returning a [`PullPermit`].
 //! 2. [`pull_replica`] consumes the permit, applies the pull and fsyncs the replica, returning a
 //!    [`PulledReplica`].
 //! 3. [`PulledReplica::publish`] writes the new ledger record with temp file + rename + directory fsync.
@@ -21,12 +21,14 @@ use hasqlite_lease::{DatabaseSet, FreshnessLedger};
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-use tokio::io::AsyncReadExt;
 use zeroize::Zeroizing;
 
 /// Maximum size of a sync token file; larger files are rejected rather than read into memory.
 pub const MAX_AUTH_TOKEN_FILE_BYTES: u64 = 4_096;
-/// Suffix appended to a replica path to name its cross-process pull lock file.
+/// Reserved directory under `data.dir`, outside the database namespace (database names never start with
+/// `.`), that holds the cross-process pull lock files of every database on the volume.
+pub const PULL_LOCK_DIR: &str = ".hasqlite.pull-locks";
+/// Suffix of a pull lock file name (see [`pull_lock_file_name`]).
 pub const PULL_LOCK_SUFFIX: &str = ".pull-lock";
 
 /// Sync scheduler policy identifiers.
@@ -161,13 +163,17 @@ impl LedgerStore {
     /// Reads `database`'s ledger record.
     ///
     /// A missing record is `Ok(None)`. A record that cannot be parsed, or that names a different database,
-    /// is also `Ok(None)`: it is treated as invalidated, which denies promotion (fail closed). Other read
-    /// errors are returned.
+    /// is also `Ok(None)`: it is treated as invalidated, which denies promotion (fail closed). So is a
+    /// record whose publication failed after its rename and whose rollback could not be confirmed. Other
+    /// read errors are returned.
     pub async fn read(
         &self,
         database: &DatabaseName,
     ) -> Result<Option<FreshnessLedger>, SyncError> {
         let path = self.record_path(database);
+        if unconfirmed_records().contains(&path) {
+            return Ok(None);
+        }
         let contents = match tokio::fs::read_to_string(&path).await {
             Ok(contents) => contents,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -178,8 +184,10 @@ impl LedgerStore {
             .filter(|record| &record.database == database))
     }
 
-    /// Reads the record of every database in `set`, omitting databases without a valid record, in the
-    /// shape `validate_promotion` expects.
+    /// Reads the record of every database in `set`, in the shape `validate_promotion` expects.
+    ///
+    /// Databases without a valid record (missing, unparseable or misfiled, see [`Self::read`]) are omitted.
+    /// Any other read failure aborts with [`SyncError::Ledger`]; the caller must not campaign on it.
     pub async fn read_set(
         &self,
         set: &DatabaseSet,
@@ -193,40 +201,113 @@ impl LedgerStore {
         Ok(records)
     }
 
-    /// Claims exclusive use of `replica_path` for a pull of `database` and durably invalidates that
+    /// Claims exclusive use of `database`'s replica file under `data_dir` and durably invalidates that
     /// database's ledger record (REQ-SYNC-002, REQ-SYNC-005).
     ///
+    /// The replica file is always `<data_dir>/<database>` with `data_dir` canonicalized, so the record
+    /// invalidated is the one for the file the pull writes. A name whose existing components under
+    /// `data_dir` include a symlink is rejected, because its write target would not be determined by the
+    /// name alone.
+    ///
     /// A pull already in progress in this process is refused before any I/O. A pull held by another
-    /// process is detected through an advisory lock on `<replica_path>.pull-lock`; the lock file is never
-    /// deleted, since unlinking a lock file races with processes that have it open. Both cases return
-    /// [`SyncError::SyncInProgress`] without touching the ledger or the replica.
+    /// process is detected through an advisory lock on [`PULL_LOCK_DIR`]`/<bounded name>`
+    /// (see [`pull_lock_file_name`]), keyed by the database name, so every spelling of `data_dir` contends
+    /// for the same lock. Lock files are never deleted, since unlinking a lock file races with processes
+    /// that have it open. Both cases return [`SyncError::SyncInProgress`] without touching the ledger or
+    /// the replica.
+    ///
+    /// The lock and invalidation run on a blocking task that owns the claim, so cancelling this future
+    /// cannot release the claim while an issued unlink may still complete.
     pub async fn begin_pull(
         &self,
-        replica_path: &Path,
+        data_dir: &Path,
         database: DatabaseName,
     ) -> Result<PullPermit, SyncError> {
-        let guard = ActivePullGuard::acquire(replica_path)?;
-        let lock = lock_replica(replica_path).await?;
-        self.invalidate(&database).await?;
-        Ok(PullPermit {
-            replica_path: replica_path.to_path_buf(),
-            database,
-            store: self.clone(),
-            _lock: lock,
-            _guard: guard,
+        let guard = ActivePullGuard::acquire(&data_dir.join(database.as_str()))?;
+        let store = self.clone();
+        let data_dir = data_dir.to_path_buf();
+        run_blocking(move || {
+            let data_dir = std::fs::canonicalize(&data_dir).map_err(|error| {
+                replication_operation(format!(
+                    "failed to resolve data directory '{}': {error}",
+                    data_dir.display()
+                ))
+            })?;
+            let replica_path = resolve_replica_path(&data_dir, &database)?;
+            let lock = lock_replica(&data_dir, &database)?;
+            store.invalidate(&database)?;
+            Ok(PullPermit {
+                replica_path,
+                database,
+                store,
+                _lock: lock,
+                _guard: guard,
+            })
         })
+        .await
     }
 
     /// Removes `database`'s record (a missing record is already invalid) and fsyncs the directory.
-    async fn invalidate(&self, database: &DatabaseName) -> Result<(), SyncError> {
+    fn invalidate(&self, database: &DatabaseName) -> Result<(), SyncError> {
         let path = self.record_path(database);
-        match tokio::fs::remove_file(&path).await {
+        match std::fs::remove_file(&path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(ledger_error(&path, error)),
         }
-        fsync_dir(&self.dir).await
+        fsync_dir(&self.dir)?;
+        unconfirmed_records().remove(&path);
+        Ok(())
     }
+}
+
+/// Runs blocking I/O that owns everything it needs, so dropping the awaiting future cannot cut it short.
+async fn run_blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, SyncError> + Send + 'static,
+) -> Result<T, SyncError> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|error| replication_operation(format!("ledger I/O task failed: {error}")))?
+}
+
+/// Builds a [`ReplicationError::Operation`] sync error.
+fn replication_operation(message: String) -> SyncError {
+    SyncError::Replication(ReplicationError::Operation(message))
+}
+
+/// Returns `<data_dir>/<database>`, rejecting a name whose existing components are symlinks.
+fn resolve_replica_path(data_dir: &Path, database: &DatabaseName) -> Result<PathBuf, SyncError> {
+    let mut path = data_dir.to_path_buf();
+    for component in database.as_str().split('/') {
+        path.push(component);
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(replication_operation(format!(
+                    "replica path '{}' contains a symlink; refusing an aliased write target",
+                    path.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => {
+                return Err(replication_operation(format!(
+                    "failed to inspect '{}': {error}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    Ok(data_dir.join(database.as_str()))
+}
+
+/// Ledger record paths whose publication failed after the rename and whose removal could not be
+/// confirmed; [`LedgerStore::read`] treats them as invalidated until the next successful invalidation.
+fn unconfirmed_records() -> std::sync::MutexGuard<'static, HashSet<PathBuf>> {
+    static UNCONFIRMED: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    UNCONFIRMED
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Exclusive, ledger-invalidated claim on a replica path, required to start a pull.
@@ -240,7 +321,7 @@ pub struct PullPermit {
 }
 
 impl PullPermit {
-    /// Replica file the pull writes into.
+    /// Replica file the pull writes into: `<canonical data_dir>/<database>`.
     pub fn replica_path(&self) -> &Path {
         &self.replica_path
     }
@@ -265,7 +346,18 @@ impl PulledReplica {
 
     /// Publishes `record` as the database's new ledger record with temp file + fsync + rename + directory
     /// fsync (REQ-SYNC-006), then releases the claim. On error the record stays invalidated.
+    ///
+    /// The whole transaction runs on a blocking task that owns the claim, so cancelling this future cannot
+    /// release it while the rename may still install the record. If the directory fsync after the rename
+    /// fails, the record is removed again and the removal synced; if that cannot be confirmed, the record
+    /// is treated as invalidated by [`LedgerStore::read`] in this process.
     pub async fn publish(self, record: &FreshnessLedger) -> Result<(), SyncError> {
+        let record = record.clone();
+        run_blocking(move || self.publish_blocking(&record)).await
+    }
+
+    /// Blocking body of [`Self::publish`]; the claim is released when `self` drops at the end.
+    fn publish_blocking(self, record: &FreshnessLedger) -> Result<(), SyncError> {
         let store = &self.permit.store;
         let path = store.record_path(&self.permit.database);
         if record.database != self.permit.database {
@@ -281,17 +373,27 @@ impl PulledReplica {
         let mut temp_name = path.file_name().unwrap_or_default().to_os_string();
         temp_name.push(".tmp");
         let temp = path.with_file_name(temp_name);
-        let write = async {
-            let mut file = tokio::fs::File::create(&temp).await?;
-            tokio::io::AsyncWriteExt::write_all(&mut file, contents.as_bytes()).await?;
-            file.sync_all().await?;
-            tokio::fs::rename(&temp, &path).await
+        let write = || -> std::io::Result<()> {
+            let mut file = std::fs::File::create(&temp)?;
+            std::io::Write::write_all(&mut file, contents.as_bytes())?;
+            file.sync_all()?;
+            std::fs::rename(&temp, &path)
         };
-        if let Err(error) = write.await {
-            let _ = tokio::fs::remove_file(&temp).await;
+        if let Err(error) = write() {
+            let _ = std::fs::remove_file(&temp);
             return Err(ledger_error(&temp, error));
         }
-        fsync_dir(&store.dir).await
+        if let Err(error) = fsync_dir(&store.dir) {
+            let rolled_back = match std::fs::remove_file(&path) {
+                Ok(()) => true,
+                Err(remove) => remove.kind() == std::io::ErrorKind::NotFound,
+            } && fsync_dir(&store.dir).is_ok();
+            if !rolled_back {
+                unconfirmed_records().insert(path);
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 }
 
@@ -336,7 +438,8 @@ fn active_pulls() -> &'static Mutex<HashSet<PathBuf>> {
 /// RAII registration of an in-progress pull into one replica path; dropping it releases the path.
 ///
 /// This is the I/O-free fast path for REQ-SYNC-002. It compares absolute paths lexically, so two spellings
-/// of one file (via `..` or symlinks) may both register; the advisory file lock taken next catches those.
+/// of one data directory (via `..` or symlinks) may both register; the advisory file lock taken next
+/// catches those.
 #[derive(Debug)]
 struct ActivePullGuard {
     path: PathBuf,
@@ -368,53 +471,92 @@ impl Drop for ActivePullGuard {
     }
 }
 
-/// Returns the lock file path guarding pulls into `replica_path`.
-pub fn pull_lock_path(replica_path: &Path) -> PathBuf {
-    let mut name = replica_path.as_os_str().to_os_string();
-    name.push(PULL_LOCK_SUFFIX);
-    PathBuf::from(name)
+/// Maximum length of one path component on the supported filesystems.
+const MAX_FILE_NAME_BYTES: usize = 255;
+
+/// Returns the lock file name for `database` inside [`PULL_LOCK_DIR`].
+///
+/// It is the database's [`DatabaseName::encoded_file_name`] plus [`PULL_LOCK_SUFFIX`] when that fits in
+/// one path component. Otherwise the encoded name is truncated and followed by `-` and a 64-bit FNV-1a
+/// hash of the full encoded name, so the name is deterministic, at most 255 bytes, and distinct for
+/// distinct databases (a hash collision would only cause a spurious `SyncInProgress`).
+pub fn pull_lock_file_name(database: &DatabaseName) -> String {
+    let encoded = database.encoded_file_name();
+    if encoded.len() + PULL_LOCK_SUFFIX.len() <= MAX_FILE_NAME_BYTES {
+        return format!("{encoded}{PULL_LOCK_SUFFIX}");
+    }
+    let hash = encoded
+        .bytes()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        });
+    // Encoded names are ASCII, so any byte offset is a character boundary.
+    let keep = MAX_FILE_NAME_BYTES - PULL_LOCK_SUFFIX.len() - 17;
+    format!("{}-{hash:016x}{PULL_LOCK_SUFFIX}", &encoded[..keep])
 }
 
-/// Takes a non-blocking exclusive advisory lock on `replica_path`'s lock file, held until the file is dropped.
+/// Returns the lock file path guarding pulls of `database` into `data_dir`.
+pub fn pull_lock_path(data_dir: &Path, database: &DatabaseName) -> PathBuf {
+    data_dir
+        .join(PULL_LOCK_DIR)
+        .join(pull_lock_file_name(database))
+}
+
+/// Takes a non-blocking exclusive advisory lock on `database`'s lock file in `data_dir`, creating the
+/// reserved lock directory (mode `0700`) if needed; the lock is held until the file is dropped.
 ///
-/// The lock is on the lock file's inode, so every spelling of the path, and every process, contends for it.
-async fn lock_replica(replica_path: &Path) -> Result<std::fs::File, SyncError> {
-    let lock_path = pull_lock_path(replica_path);
-    let file = tokio::fs::OpenOptions::new()
+/// The lock is on the lock file's inode, so every process, and every spelling of the path, contends for it.
+fn lock_replica(data_dir: &Path, database: &DatabaseName) -> Result<std::fs::File, SyncError> {
+    let lock_dir = data_dir.join(PULL_LOCK_DIR);
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    let is_dir = builder
+        .create(&lock_dir)
+        .and_then(|()| std::fs::symlink_metadata(&lock_dir))
+        .map_err(|error| {
+            replication_operation(format!(
+                "failed to create pull lock directory '{}': {error}",
+                lock_dir.display()
+            ))
+        })?
+        .is_dir();
+    if !is_dir {
+        return Err(replication_operation(format!(
+            "pull lock directory '{}' is not a directory",
+            lock_dir.display()
+        )));
+    }
+    let lock_path = pull_lock_path(data_dir, database);
+    let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
         .open(&lock_path)
-        .await
         .map_err(|error| {
-            SyncError::Replication(ReplicationError::Operation(format!(
+            replication_operation(format!(
                 "failed to open pull lock '{}': {error}",
                 lock_path.display()
-            )))
-        })?
-        .into_std()
-        .await;
+            ))
+        })?;
     match file.try_lock() {
         Ok(()) => Ok(file),
         Err(std::fs::TryLockError::WouldBlock) => Err(SyncError::SyncInProgress {
-            path: replica_path.display().to_string(),
+            path: data_dir.join(database.as_str()).display().to_string(),
         }),
-        Err(std::fs::TryLockError::Error(error)) => {
-            Err(SyncError::Replication(ReplicationError::Operation(
-                format!("failed to lock '{}': {error}", lock_path.display()),
-            )))
-        }
+        Err(std::fs::TryLockError::Error(error)) => Err(replication_operation(format!(
+            "failed to lock '{}': {error}",
+            lock_path.display()
+        ))),
     }
 }
 
 /// Fsyncs a directory so renames and unlinks inside it are durable (a no-op off Unix).
-async fn fsync_dir(dir: &Path) -> Result<(), SyncError> {
+fn fsync_dir(dir: &Path) -> Result<(), SyncError> {
     #[cfg(unix)]
-    tokio::fs::File::open(dir)
-        .await
-        .map_err(|error| ledger_error(dir, error))?
-        .sync_all()
-        .await
+    std::fs::File::open(dir)
+        .and_then(|file| file.sync_all())
         .map_err(|error| ledger_error(dir, error))?;
     #[cfg(not(unix))]
     let _ = dir;
@@ -463,16 +605,29 @@ async fn load_sync_auth_token(sync: &SyncSection) -> Result<Option<AuthToken>, S
 }
 
 /// Reads a token file of at most [`MAX_AUTH_TOKEN_FILE_BYTES`], warning if other users can read it.
+///
+/// The file is read with blocking reads straight into one fixed, zeroized buffer one byte larger than
+/// the limit, so no growing or intermediate buffer is left holding token bytes.
 async fn read_token_file(path: &Path) -> Result<AuthToken, SyncError> {
+    let owned = path.to_path_buf();
+    tokio::task::spawn_blocking(move || read_token_file_blocking(&owned))
+        .await
+        .map_err(|error| SyncError::AuthTokenFile {
+            path: path.display().to_string(),
+            message: format!("token read task failed: {error}"),
+        })?
+}
+
+/// Blocking body of [`read_token_file`].
+fn read_token_file_blocking(path: &Path) -> Result<AuthToken, SyncError> {
+    use std::io::Read;
     let file_error = |message: String| SyncError::AuthTokenFile {
         path: path.display().to_string(),
         message,
     };
-    let file = tokio::fs::File::open(path)
-        .await
-        .map_err(|error| file_error(error.to_string()))?;
+    let mut file = std::fs::File::open(path).map_err(|error| file_error(error.to_string()))?;
     #[cfg(unix)]
-    if let Ok(metadata) = file.metadata().await {
+    if let Ok(metadata) = file.metadata() {
         use std::os::unix::fs::PermissionsExt;
         if metadata.permissions().mode() & 0o004 != 0 {
             tracing::warn!(
@@ -481,17 +636,22 @@ async fn read_token_file(path: &Path) -> Result<AuthToken, SyncError> {
             );
         }
     }
-    let mut bytes = Zeroizing::new(Vec::new());
-    file.take(MAX_AUTH_TOKEN_FILE_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .await
-        .map_err(|error| file_error(error.to_string()))?;
-    if bytes.len() as u64 > MAX_AUTH_TOKEN_FILE_BYTES {
+    let mut buffer = Zeroizing::new([0u8; MAX_AUTH_TOKEN_FILE_BYTES as usize + 1]);
+    let mut len = 0;
+    while len < buffer.len() {
+        match file.read(&mut buffer[len..]) {
+            Ok(0) => break,
+            Ok(read) => len += read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(file_error(error.to_string())),
+        }
+    }
+    if len as u64 > MAX_AUTH_TOKEN_FILE_BYTES {
         return Err(file_error(format!(
             "file is larger than {MAX_AUTH_TOKEN_FILE_BYTES} bytes"
         )));
     }
-    let text = std::str::from_utf8(&bytes)
+    let text = std::str::from_utf8(&buffer[..len])
         .map_err(|_| file_error("stream did not contain valid UTF-8".to_string()))?;
     Ok(Zeroizing::new(text.to_string()))
 }
@@ -768,48 +928,102 @@ mod tests {
     async fn begin_pull_refuses_in_process_duplicate_before_any_io() {
         let directory = tempfile::tempdir().expect("create temporary directory");
         let store = LedgerStore::new(directory.path().join("ledger"));
-        let replica_path = directory.path().join("replica.db");
+        let replica_path = directory.path().join("app.db");
 
         let _in_progress = ActivePullGuard::acquire(&replica_path).expect("simulate running pull");
         let error = store
-            .begin_pull(&replica_path, db("app.db"))
+            .begin_pull(directory.path(), db("app.db"))
             .await
             .unwrap_err();
         assert!(
             matches!(error, SyncError::SyncInProgress { .. }),
             "got {error:?}"
         );
-        // Rejected before any I/O: neither the lock file nor the replica was created.
-        assert!(!pull_lock_path(&replica_path).exists());
+        // Rejected before any I/O: neither the lock directory nor the replica was created.
+        assert!(!directory.path().join(PULL_LOCK_DIR).exists());
         assert!(!replica_path.exists());
     }
 
     #[tokio::test]
-    async fn begin_pull_refuses_a_path_locked_by_another_process() {
+    async fn begin_pull_refuses_a_database_locked_by_another_process() {
         let directory = tempfile::tempdir().expect("create temporary directory");
         let ledger_dir = directory.path().join("ledger");
         std::fs::create_dir(&ledger_dir).unwrap();
         let store = LedgerStore::new(&ledger_dir);
-        let replica_path = directory.path().join("replica.db");
+        let data_dir = std::fs::canonicalize(directory.path()).unwrap();
         // flock locks belong to an open file description, so a second open in this process behaves like
         // another process holding the lock while the in-process guard is free.
-        let held_elsewhere = lock_replica(&replica_path).await.expect("take lock");
+        let held_elsewhere = lock_replica(&data_dir, &db("app.db")).expect("take lock");
         let error = store
-            .begin_pull(&replica_path, db("app.db"))
+            .begin_pull(directory.path(), db("app.db"))
             .await
             .unwrap_err();
         assert!(
             matches!(error, SyncError::SyncInProgress { .. }),
             "got {error:?}"
         );
-        // Another spelling of the same path contends for the same lock file inode.
-        let alias = ledger_dir.join("..").join("replica.db");
+        // Other spellings of the data directory resolve to the same lock.
+        let alias = ledger_dir.join("..");
         assert!(matches!(
             store.begin_pull(&alias, db("app.db")).await.unwrap_err(),
             SyncError::SyncInProgress { .. }
         ));
+        #[cfg(unix)]
+        {
+            let link = tempfile::tempdir().unwrap();
+            let link = link.path().join("data-link");
+            std::os::unix::fs::symlink(directory.path(), &link).unwrap();
+            assert!(matches!(
+                store.begin_pull(&link, db("app.db")).await.unwrap_err(),
+                SyncError::SyncInProgress { .. }
+            ));
+        }
+        // A different database is independent.
+        let other = store.begin_pull(directory.path(), db("other.db")).await;
+        assert!(other.is_ok());
         drop(held_elsewhere);
-        assert!(store.begin_pull(&replica_path, db("app.db")).await.is_ok());
+        let permit = store
+            .begin_pull(directory.path(), db("app.db"))
+            .await
+            .unwrap();
+        assert_eq!(permit.replica_path(), data_dir.join("app.db"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn begin_pull_rejects_a_symlinked_replica_path() {
+        let directory = tempfile::tempdir().expect("create temporary directory");
+        let elsewhere = tempfile::tempdir().expect("create temporary directory");
+        std::os::unix::fs::symlink(elsewhere.path(), directory.path().join("tenants")).unwrap();
+        let store = LedgerStore::new(directory.path());
+        let error = store
+            .begin_pull(directory.path(), db("tenants/acme.db"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, SyncError::Replication(ReplicationError::Operation(message)) if message.contains("symlink")),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn pull_lock_file_names_are_bounded_and_distinct() {
+        assert_eq!(
+            pull_lock_file_name(&db("tenants/acme.db")),
+            "tenants%2Facme.db.pull-lock"
+        );
+        let long = |last: char| {
+            let component = format!("{}{last}.db", "a".repeat(120));
+            db(&format!("{component}/{component}"))
+        };
+        let (first, second) = (
+            pull_lock_file_name(&long('x')),
+            pull_lock_file_name(&long('y')),
+        );
+        assert_eq!(first.len(), MAX_FILE_NAME_BYTES);
+        assert!(first.ends_with(PULL_LOCK_SUFFIX));
+        assert_ne!(first, second);
+        assert_eq!(first, pull_lock_file_name(&long('x')), "deterministic");
     }
 
     #[tokio::test]
@@ -818,7 +1032,10 @@ mod tests {
         let ledger_dir = directory.path().join("ledger");
         std::fs::create_dir(&ledger_dir).unwrap();
         let store = LedgerStore::new(&ledger_dir);
-        let replica_path = directory.path().join("tenants%2Facme.db");
+        std::fs::create_dir(directory.path().join("tenants")).unwrap();
+        let replica_path = std::fs::canonicalize(directory.path())
+            .unwrap()
+            .join("tenants/acme.db");
         std::fs::write(&replica_path, b"pages").unwrap();
         let database = db("tenants/acme.db");
         let mut published = record("tenants/acme.db");
@@ -833,7 +1050,7 @@ mod tests {
         );
 
         let permit = store
-            .begin_pull(&replica_path, database.clone())
+            .begin_pull(directory.path(), database.clone())
             .await
             .unwrap();
         assert_eq!(permit.database(), &database);
@@ -851,6 +1068,27 @@ mod tests {
             .map(|entry| entry.unwrap().file_name().into_string().unwrap())
             .collect();
         assert_eq!(names, ["tenants%2Facme.db"]);
+        // The claim was released when publication finished.
+        assert!(store.begin_pull(directory.path(), database).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn unconfirmed_record_reads_as_invalidated_until_next_invalidation() {
+        let directory = tempfile::tempdir().expect("create temporary directory");
+        let store = LedgerStore::new(directory.path());
+        let database = db("unconfirmed.db");
+        std::fs::write(
+            store.record_path(&database),
+            toml::to_string(&record("unconfirmed.db")).unwrap(),
+        )
+        .unwrap();
+        unconfirmed_records().insert(store.record_path(&database));
+        assert_eq!(store.read(&database).await.unwrap(), None);
+        let _permit = store
+            .begin_pull(directory.path(), database.clone())
+            .await
+            .unwrap();
+        assert!(!unconfirmed_records().contains(&store.record_path(&database)));
     }
 
     #[tokio::test]
@@ -859,9 +1097,11 @@ mod tests {
         let ledger_dir = directory.path().join("ledger");
         std::fs::create_dir(&ledger_dir).unwrap();
         let store = LedgerStore::new(&ledger_dir);
-        let replica_path = directory.path().join("app.db");
         let pulled = PulledReplica {
-            permit: store.begin_pull(&replica_path, db("app.db")).await.unwrap(),
+            permit: store
+                .begin_pull(directory.path(), db("app.db"))
+                .await
+                .unwrap(),
         };
         assert!(matches!(
             pulled.publish(&record("other.db")).await.unwrap_err(),

@@ -130,6 +130,20 @@ impl TryFrom<Vec<DatabaseEntry>> for DatabaseSet {
                 }
             });
         }
+        // A name that is a directory ancestor of another (`a.db` and `a.db/b.db`) cannot exist as both a
+        // file and a directory. Only whole `/`-separated components count, so `a.db-copy/b.db` is fine.
+        for entry in &entries {
+            let name = entry.name.as_str();
+            for (index, _) in name.match_indices('/') {
+                let ancestor = &name[..index];
+                if let Ok(found) = entries.binary_search_by(|e| e.name.as_str().cmp(ancestor)) {
+                    return Err(DatabaseSetError::Nested {
+                        ancestor: entries[found].name.clone(),
+                        name: entry.name.clone(),
+                    });
+                }
+            }
+        }
         Ok(Self(entries))
     }
 }
@@ -162,6 +176,14 @@ pub enum DatabaseSetError {
     #[error("database set is not sorted by name at '{name}'")]
     Unsorted {
         /// First entry found out of order.
+        name: DatabaseName,
+    },
+    /// One name is a directory ancestor of another, so both cannot exist on disk.
+    #[error("database set lists '{ancestor}', which is a directory ancestor of '{name}'")]
+    Nested {
+        /// The name used as a directory by `name`.
+        ancestor: DatabaseName,
+        /// The name nested under `ancestor`.
         name: DatabaseName,
     },
     /// The tombstone list holds more than [`MAX_DATABASES`] entries.
@@ -486,6 +508,25 @@ mod tests {
             DatabaseSet::try_from(vec![entry("b.db", 1), entry("a.db", 2)]),
             Err(DatabaseSetError::Unsorted { .. })
         ));
+        assert_eq!(
+            DatabaseSet::new(vec![entry("a.db/b.db", 2), entry("a.db", 1)]),
+            Err(DatabaseSetError::Nested {
+                ancestor: DatabaseName::parse("a.db").unwrap(),
+                name: DatabaseName::parse("a.db/b.db").unwrap(),
+            })
+        );
+        assert!(matches!(
+            DatabaseSet::new(vec![entry("x/a.db/c/b.db", 2), entry("x/a.db", 1)]),
+            Err(DatabaseSetError::Nested { .. })
+        ));
+        // A shared string prefix that is not a whole component is not nesting.
+        let set = DatabaseSet::new(vec![
+            entry("a.db-copy/b.db", 2),
+            entry("a.db", 1),
+            entry("a.dbx/b.db", 3),
+        ])
+        .unwrap();
+        assert_eq!(set.len(), 3);
         let too_many = (0..=MAX_DATABASES)
             .map(|i| entry(&format!("db{i:03}.db"), i as u64 + 1))
             .collect();

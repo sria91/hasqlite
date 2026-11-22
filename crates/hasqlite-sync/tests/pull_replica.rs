@@ -133,7 +133,9 @@ struct PullTestSetup {
     _directory: tempfile::TempDir,
     /// Path where the token should be written before each pull attempt.
     pub token_file: PathBuf,
-    /// Destination path for the pulled replica.
+    /// Data directory the replica is pulled into.
+    pub data_dir: PathBuf,
+    /// Destination path for the pulled replica (`data_dir/DATABASE`).
     pub replica_path: PathBuf,
     /// Freshness ledger directory.
     pub ledger: LedgerStore,
@@ -145,13 +147,15 @@ impl PullTestSetup {
         seed_database(&server.database_path(DATABASE));
         let directory = tempfile::tempdir().expect("create replica directory");
         let token_file = directory.path().join("sync-token");
-        let replica_path = directory.path().join("replica.db");
+        let data_dir = directory.path().to_path_buf();
+        let replica_path = data_dir.join(DATABASE);
         let ledger_dir = directory.path().join("ledger");
         fs::create_dir(&ledger_dir).expect("create ledger directory");
         Self {
             server,
             _directory: directory,
             token_file,
+            data_dir,
             replica_path,
             ledger: LedgerStore::new(ledger_dir),
         }
@@ -164,10 +168,7 @@ impl PullTestSetup {
 
     /// Runs the protocol up to (not including) publication: claim + invalidate, then pull.
     async fn pull(&self, sync: &SyncSection) -> Result<PulledReplica, SyncError> {
-        let permit = self
-            .ledger
-            .begin_pull(&self.replica_path, database())
-            .await?;
+        let permit = self.ledger.begin_pull(&self.data_dir, database()).await?;
         pull_replica(sync, permit).await
     }
 }
@@ -337,7 +338,7 @@ async fn pull_replica_rejects_origin_without_credential() {
     };
     let directory = tempfile::tempdir().expect("create replica directory");
     let permit = LedgerStore::new(directory.path())
-        .begin_pull(&directory.path().join("replica.db"), database())
+        .begin_pull(directory.path(), database())
         .await
         .expect("claim replica");
 
@@ -362,7 +363,7 @@ async fn pull_replica_requires_origin_endpoint() {
     };
     let directory = tempfile::tempdir().expect("create replica directory");
     let permit = LedgerStore::new(directory.path())
-        .begin_pull(&directory.path().join("replica.db"), database())
+        .begin_pull(directory.path(), database())
         .await
         .expect("claim replica");
 

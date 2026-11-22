@@ -158,9 +158,12 @@ impl PromotionPolicy {
 /// Validates whether a replica meets all freshness and fencing criteria to promote to writer (rule 10).
 ///
 /// `observed_lease` is the lease the candidate is about to replace; its writer epoch's database set lists
-/// the databases that must each have a passing record in `ledgers`, keyed by database name. Records that
-/// are missing, unreadable or unparseable must simply be absent from the map. Records for databases
-/// outside the set are ignored.
+/// the databases that must each have a passing record in `ledgers`, keyed by database name, normally as
+/// returned by `LedgerStore::read_set`. That reader omits records that are missing, unparseable or filed
+/// under another database, and the gate denies those with [`PromotionError::NoFreshnessRecord`]. Any other
+/// read failure is returned by the reader as `SyncError::Ledger`, not omitted: the caller must handle it
+/// (by not campaigning) before invoking the gate, never pass a partial map. Records for databases outside
+/// the set are ignored.
 ///
 /// Every record must come from that lease's last activated writer, and lag is measured against that
 /// writer's last renewal; both timestamps are stamped by the writer's clock, so the result does not depend

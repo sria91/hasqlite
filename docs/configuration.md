@@ -87,9 +87,11 @@ allow_replica_reads = false # unsupported until Track N applies snapshots atomic
 http_bind = "0.0.0.0:8088"
 ```
 
-CLI: `hasqlite run --config cluster.toml` plus env overrides. `hasqlite check --config cluster.toml` validates a
-configuration and exits (0 if valid, 78 if not), so it can gate deployments; both commands log every problem
-found, each with the setting it concerns.
+CLI: `hasqlite check --config cluster.toml` validates a configuration and exits (0 if valid, 78 if not), so it
+can gate deployments; it logs every problem found, each with the setting it concerns. Starting a node with
+`hasqlite run --config cluster.toml`, and environment-variable overrides of configuration settings, are planned
+(Phase 1b): today `run` validates the configuration the same way and then exits with status 69 without starting
+a node, and no environment overrides are applied.
 
 The configuration does not list databases. In clustered mode the set of replicated databases lives in the lease's
 writer epoch ([safety contract rule 9](safety-contract.md#replication), ADR-0020), so every node always agrees on it.

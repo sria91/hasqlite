@@ -548,8 +548,11 @@ impl ClusterConfig {
         // Lag is measured from the snapshot start to the writer's last renewal. Between two snapshot
         // starts the writer renews every retry period, so steady-state lag reaches about
         // `interval + retry_period` plus the sync duration; a smaller bound would deny routine promotions.
+        // Invalid (zero) inputs are already reported on their own fields, so the comparison is skipped.
         if let (Some(freshness), Some(sync)) = (&self.freshness, &self.sync)
             && freshness.max_lag_secs != 0
+            && sync.interval_secs != 0
+            && self.lease.retry_period_secs != 0
         {
             let min_lag_bound = sync
                 .interval_secs
@@ -1632,6 +1635,37 @@ http_bind = "0.0.0.0:8088"
         let mut config = valid_test_config();
         config.freshness.as_mut().unwrap().max_lag_secs = 5;
         assert!(config.validate().is_ok());
+        // Smallest valid timing inputs: interval 1 + retry 1 = 2, so a bound of 2 is still rejected.
+        assert_validation_err(
+            |c| {
+                c.sync.as_mut().unwrap().interval_secs = 1;
+                c.lease.retry_period_secs = 1;
+                c.freshness.as_mut().unwrap().max_lag_secs = 2;
+            },
+            "freshness.max_lag_secs (2) must exceed sync.interval_secs (1) + lease.retry_period_secs (1)",
+        );
+    }
+
+    #[test]
+    fn lag_bound_is_not_compared_against_invalid_timing_inputs() {
+        for mutate in [
+            (|c: &mut ClusterConfig| c.sync.as_mut().unwrap().interval_secs = 0) as fn(&mut _),
+            |c: &mut ClusterConfig| c.lease.retry_period_secs = 0,
+        ] {
+            let mut config = valid_test_config();
+            mutate(&mut config);
+            config.freshness.as_mut().unwrap().max_lag_secs = 1;
+            let HasqliteError::Validation(errors) = config.validate().unwrap_err() else {
+                panic!("expected validation error");
+            };
+            assert!(
+                !errors
+                    .issues()
+                    .iter()
+                    .any(|issue| issue.field == "freshness.max_lag_secs"),
+                "got '{errors}'"
+            );
+        }
     }
 
     #[test]
