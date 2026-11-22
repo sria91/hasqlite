@@ -667,7 +667,9 @@ checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 name = "hasqlite"
 version = "0.0.0"
 dependencies = [
+ "hasqlite-core",
  "hasqlite-node",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
 ]
@@ -675,9 +677,6 @@ dependencies = [
 [[package]]
 name = "hasqlite-client"
 version = "0.0.0"
-dependencies = [
- "hasqlite-proto",
-]
 
 [[package]]
 name = "hasqlite-controller"
@@ -701,9 +700,6 @@ dependencies = [
 [[package]]
 name = "hasqlite-gateway"
 version = "0.0.0"
-dependencies = [
- "hasqlite-core",
-]
 
 [[package]]
 name = "hasqlite-lease"
@@ -718,21 +714,10 @@ dependencies = [
 [[package]]
 name = "hasqlite-node"
 version = "0.0.0"
-dependencies = [
- "hasqlite-controller",
- "hasqlite-core",
- "hasqlite-probes",
- "hasqlite-sync",
- "tokio",
- "tracing",
-]
 
 [[package]]
 name = "hasqlite-probes"
 version = "0.0.0"
-dependencies = [
- "hasqlite-core",
-]
 
 [[package]]
 name = "hasqlite-proto"
@@ -743,13 +728,17 @@ name = "hasqlite-sync"
 version = "0.0.0"
 dependencies = [
  "hasqlite-core",
+ "hasqlite-lease",
  "libsqlite3-sys",
  "rsqlite-rsync",
  "tempfile",
  "thiserror",
  "tokio",
  "tokio-stream",
+ "toml",
  "tonic",
+ "tracing",
+ "zeroize",
 ]
 
 [[package]]

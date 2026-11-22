@@ -2,16 +2,37 @@
 #![forbid(unsafe_code)]
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Stable identity for a cluster member (hostname, pod name, etc.).
+///
+/// Deserialization validates the identifier (see [`NodeId::parse`]), so IDs read from lease records,
+/// ledgers or configuration can never carry separators or control characters into records and logs.
+/// [`NodeId::new`] does not validate; use it only for trusted, in-process values and call
+/// [`NodeId::is_valid`] (as `ClusterConfig::validate` does) where that matters.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
 pub struct NodeId(String);
 
 impl NodeId {
-    /// Creates a new `NodeId` from the provided string identifier.
+    /// Creates a new `NodeId` from the provided string identifier without validating it.
     pub fn new(id: impl Into<String>) -> Self {
         Self(id.into())
+    }
+
+    /// Creates a `NodeId`, rejecting anything other than 1–253 ASCII letters, digits, `.`, `_` or `-`.
+    pub fn parse(id: impl Into<String>) -> Result<Self, InvalidNodeId> {
+        let id = id.into();
+        if is_valid_identifier(&id) {
+            Ok(Self(id))
+        } else {
+            Err(InvalidNodeId(id))
+        }
+    }
+
+    /// Returns true if this ID satisfies the rules enforced by [`NodeId::parse`].
+    pub fn is_valid(&self) -> bool {
+        is_valid_identifier(&self.0)
     }
 
     /// Returns the string slice of the `NodeId`.
@@ -31,15 +52,25 @@ impl std::fmt::Display for NodeId {
     }
 }
 
-impl From<String> for NodeId {
-    fn from(s: String) -> Self {
-        Self(s)
+impl TryFrom<String> for NodeId {
+    type Error = InvalidNodeId;
+
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        Self::parse(s)
     }
 }
 
-impl From<&str> for NodeId {
-    fn from(s: &str) -> Self {
-        Self(s.to_string())
+impl From<NodeId> for String {
+    fn from(id: NodeId) -> Self {
+        id.0
+    }
+}
+
+impl std::str::FromStr for NodeId {
+    type Err = InvalidNodeId;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s)
     }
 }
 
@@ -47,6 +78,131 @@ impl AsRef<str> for NodeId {
     fn as_ref(&self) -> &str {
         &self.0
     }
+}
+
+/// A string that is not a valid [`NodeId`]; the offending value is escaped when displayed.
+#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
+#[error(
+    "invalid node id \"{}\": must be 1-{MAX_IDENTIFIER_LEN} ASCII letters, digits, '.', '_' or '-'",
+    .0.escape_debug()
+)]
+pub struct InvalidNodeId(String);
+
+/// Maximum length of a database name in bytes, and of each `/`-separated component.
+pub const MAX_DATABASE_NAME_LEN: usize = 255;
+/// Maximum number of databases in a cluster's database set, and of tombstones (ADR-0020).
+pub const MAX_DATABASES: usize = 64;
+/// File extensions a database name must end with.
+const DATABASE_NAME_EXTENSIONS: [&str; 3] = [".db", ".sqlite", ".sqlite3"];
+/// First path components reserved for hasqlite-managed directories inside `data.dir`.
+const RESERVED_DATABASE_ROOTS: [&str; 2] = ["diverged", "ancestors"];
+
+/// Name of a replicated database: a path relative to `data.dir` (ADR-0020, REQ-MDB-002).
+///
+/// Each `/`-separated component is 1–255 ASCII letters, digits, `.`, `_` or `-` and does not start with
+/// `.`; the whole name is at most 255 bytes, ends in `.db`, `.sqlite` or `.sqlite3`, and does not start
+/// with the reserved component `diverged` or `ancestors`. Construction and deserialization both validate.
+/// Ordering is byte-wise, which is the order the database set is sorted and checked in.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct DatabaseName(String);
+
+impl DatabaseName {
+    /// Validates and wraps a database name.
+    pub fn parse(name: impl Into<String>) -> Result<Self, InvalidDatabaseName> {
+        let name = name.into();
+        match database_name_violation(&name) {
+            None => Ok(Self(name)),
+            Some(reason) => Err(InvalidDatabaseName { name, reason }),
+        }
+    }
+
+    /// Returns the name as a relative path string.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Returns the single-component file name used for this database's ledger record and diverged copies:
+    /// `%` is encoded as `%25` and `/` as `%2F`, so distinct names never collide.
+    pub fn encoded_file_name(&self) -> String {
+        self.0.replace('%', "%25").replace('/', "%2F")
+    }
+}
+
+impl std::fmt::Display for DatabaseName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl TryFrom<String> for DatabaseName {
+    type Error = InvalidDatabaseName;
+
+    fn try_from(name: String) -> Result<Self, Self::Error> {
+        Self::parse(name)
+    }
+}
+
+impl From<DatabaseName> for String {
+    fn from(name: DatabaseName) -> Self {
+        name.0
+    }
+}
+
+impl std::str::FromStr for DatabaseName {
+    type Err = InvalidDatabaseName;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s)
+    }
+}
+
+impl AsRef<str> for DatabaseName {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A string that is not a valid [`DatabaseName`]; the offending value is escaped when displayed.
+#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
+#[error("invalid database name \"{}\": {reason}", .name.escape_debug())]
+pub struct InvalidDatabaseName {
+    /// The rejected name.
+    pub name: String,
+    /// Which rule it broke.
+    pub reason: &'static str,
+}
+
+/// Returns the first database naming rule `name` breaks, or `None` if it is valid.
+fn database_name_violation(name: &str) -> Option<&'static str> {
+    if name.len() > MAX_DATABASE_NAME_LEN {
+        return Some("longer than 255 bytes");
+    }
+    if !DATABASE_NAME_EXTENSIONS
+        .iter()
+        .any(|ext| name.ends_with(ext))
+    {
+        return Some("must end in .db, .sqlite or .sqlite3");
+    }
+    for component in name.split('/') {
+        if component.is_empty() {
+            return Some("contains an empty path component");
+        }
+        if component.starts_with('.') {
+            return Some("a path component starts with '.'");
+        }
+        if !component
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        {
+            return Some("path components may contain only ASCII letters, digits, '.', '_' or '-'");
+        }
+    }
+    let root = name.split('/').next().unwrap_or_default();
+    if RESERVED_DATABASE_ROOTS.contains(&root) {
+        return Some("starts with a reserved directory ('diverged' or 'ancestors')");
+    }
+    None
 }
 
 /// Operational mode for the node.
@@ -76,6 +232,12 @@ pub const DEFAULT_LEASE_RETRY_PERIOD_SECS: u64 = 2;
 pub const MIN_LEASE_FENCING_MARGIN_SECS: u64 = 2;
 /// Maximum `lease.ttl_secs`; it also bounds `lease.renew_deadline_secs`, keeping writer deadlines representable.
 pub const MAX_LEASE_TTL_SECS: u64 = 3_600;
+/// Maximum `promotion.max_future_skew_secs`.
+pub const MAX_FUTURE_SKEW_SECS: u64 = 300;
+/// Default `sync.max_concurrent_pulls`.
+pub const DEFAULT_MAX_CONCURRENT_PULLS: u32 = 4;
+/// Maximum `sync.max_concurrent_pulls` (one pull per database, and a cluster holds at most 64 databases).
+pub const MAX_CONCURRENT_PULLS: u32 = MAX_DATABASES as u32;
 /// Maximum length of `node.id` and of Kubernetes resource names (DNS-1123 subdomain limit).
 pub const MAX_IDENTIFIER_LEN: usize = 253;
 
@@ -91,62 +253,31 @@ fn is_valid_identifier(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
-/// Returns true if `name` is a DNS-1123 subdomain as required for Kubernetes resource names and namespaces.
-fn is_dns1123_subdomain(name: &str) -> bool {
+/// Returns true if `label` is a DNS label: 1–63 bytes of characters accepted by `allowed`, with no
+/// leading or trailing `-`.
+fn is_dns_label(label: &str, allowed: impl Fn(u8) -> bool) -> bool {
+    !label.is_empty()
+        && label.len() <= 63
+        && !label.starts_with('-')
+        && !label.ends_with('-')
+        && label.bytes().all(|b| b == b'-' || allowed(b))
+}
+
+/// Returns true if `name` is a dot-separated sequence of DNS labels of at most 253 bytes.
+fn is_dns_name(name: &str, allowed: impl Fn(u8) -> bool + Copy) -> bool {
     !name.is_empty()
         && name.len() <= MAX_IDENTIFIER_LEN
-        && name.split('.').all(|label| {
-            !label.is_empty()
-                && label.len() <= 63
-                && !label.starts_with('-')
-                && !label.ends_with('-')
-                && label
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-        })
+        && name.split('.').all(|label| is_dns_label(label, allowed))
+}
+
+/// Returns true if `name` is a DNS-1123 subdomain as required for Kubernetes resource names and namespaces.
+fn is_dns1123_subdomain(name: &str) -> bool {
+    is_dns_name(name, |b| b.is_ascii_lowercase() || b.is_ascii_digit())
 }
 
 /// Returns true if a path is empty or contains only whitespace characters.
-fn is_empty_or_whitespace(path: &std::path::Path) -> bool {
+fn is_empty_or_whitespace(path: &Path) -> bool {
     path.as_os_str().is_empty() || path.to_str().map(|s| s.trim().is_empty()).unwrap_or(false)
-}
-
-/// Checks a credential source pair: at most one of the env var or token file may be set, and neither may be blank.
-fn validate_credential_source(
-    env_field: &str,
-    env: Option<&str>,
-    file_field: &str,
-    file: Option<&std::path::Path>,
-) -> Result<(), HasqliteError> {
-    if env.is_some() && file.is_some() {
-        return Err(HasqliteError::Validation(format!(
-            "cannot specify both {env_field} and {file_field} (choose one credential source)"
-        )));
-    }
-    if let Some(env) = env
-        && env.trim().is_empty()
-    {
-        return Err(HasqliteError::Validation(format!(
-            "{env_field} must not be empty when specified"
-        )));
-    }
-    if let Some(path) = file
-        && is_empty_or_whitespace(path)
-    {
-        return Err(HasqliteError::Validation(format!(
-            "{file_field} must not be empty when specified"
-        )));
-    }
-    Ok(())
-}
-
-/// Parses `value` as a [`std::net::SocketAddr`] and returns a user-facing validation error on failure.
-fn parse_socket_addr(field: &str, value: &str) -> Result<std::net::SocketAddr, HasqliteError> {
-    value.parse::<std::net::SocketAddr>().map_err(|e| {
-        HasqliteError::Validation(format!(
-            "{field} '{value}' is not a valid socket address (expected IP:PORT): {e}"
-        ))
-    })
 }
 
 /// Returns true if `endpoint` is `https://host:port`, or `grpc://host:port` with a loopback host.
@@ -188,16 +319,7 @@ fn is_valid_sync_origin_endpoint(endpoint: &str) -> bool {
     }
 
     let ip = host.parse::<std::net::IpAddr>().ok();
-    let valid_hostname = host.len() <= 253
-        && host.split('.').all(|label| {
-            !label.is_empty()
-                && label.len() <= 63
-                && !label.starts_with('-')
-                && !label.ends_with('-')
-                && label
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-        });
+    let valid_hostname = is_dns_name(host, |b| b.is_ascii_alphanumeric());
     // Reject addresses that look like IPv4 literals (all dot-separated labels are purely
     // numeric) but failed to parse as a valid IP, e.g. `grpc://999.999.999.999:50051`.
     let looks_like_ip_literal = host
@@ -212,6 +334,75 @@ fn is_valid_sync_origin_endpoint(endpoint: &str) -> bool {
         && port.bytes().all(|byte| byte.is_ascii_digit())
         && port.parse::<u16>().is_ok_and(|port| port != 0)
         && (scheme == "https" || (scheme == "grpc" && loopback))
+}
+
+/// Accumulates every validation problem found, so an operator can fix a configuration in one pass.
+#[derive(Debug, Default)]
+struct Issues(Vec<ValidationIssue>);
+
+impl Issues {
+    /// Records a problem with `field`.
+    fn push(&mut self, field: &'static str, message: impl Into<String>) {
+        self.0.push(ValidationIssue {
+            field,
+            message: message.into(),
+        });
+    }
+
+    /// Converts the collected problems into a result.
+    fn into_result(self) -> Result<(), HasqliteError> {
+        if self.0.is_empty() {
+            Ok(())
+        } else {
+            Err(HasqliteError::Validation(ValidationErrors(self.0)))
+        }
+    }
+
+    /// Checks a credential source pair: at most one of the env var or token file may be set, and neither may be blank.
+    fn credential_source(
+        &mut self,
+        env_field: &'static str,
+        env: Option<&str>,
+        file_field: &'static str,
+        file: Option<&Path>,
+    ) {
+        if env.is_some() && file.is_some() {
+            self.push(
+                env_field,
+                format!(
+                    "cannot specify both {env_field} and {file_field} (choose one credential source)"
+                ),
+            );
+        }
+        if env.is_some_and(|env| env.trim().is_empty()) {
+            self.push(
+                env_field,
+                format!("{env_field} must not be empty when specified"),
+            );
+        }
+        if file.is_some_and(is_empty_or_whitespace) {
+            self.push(
+                file_field,
+                format!("{file_field} must not be empty when specified"),
+            );
+        }
+    }
+
+    /// Parses `value` as a [`std::net::SocketAddr`], recording a problem on failure.
+    fn socket_addr(&mut self, field: &'static str, value: &str) -> Option<std::net::SocketAddr> {
+        match value.parse::<std::net::SocketAddr>() {
+            Ok(addr) => Some(addr),
+            Err(e) => {
+                self.push(
+                    field,
+                    format!(
+                        "{field} '{value}' is not a valid socket address (expected IP:PORT): {e}"
+                    ),
+                );
+                None
+            }
+        }
+    }
 }
 
 /// Supported coordination backend types for writer leases.
@@ -234,7 +425,7 @@ pub struct ClusterConfig {
     pub data: DataSection,
     /// Authoritative writer lease coordination settings.
     pub lease: LeaseSection,
-    /// Freshness ledger metadata path and retention limits (required in clustered mode).
+    /// Freshness ledger directory and lag bound (required in clustered mode).
     #[serde(default)]
     pub freshness: Option<FreshnessSection>,
     /// Promotion eligibility thresholds (required in clustered mode).
@@ -263,255 +454,307 @@ impl ClusterConfig {
         self.data.dir.join(STANDALONE_CANONICAL_LEASE_FILENAME)
     }
 
-    /// Validates semantic correctness, required backend sections, positive intervals, path presence, and socket address formats.
+    /// Validates semantic correctness, required backend sections, positive intervals, path presence, and
+    /// socket address formats.
+    ///
+    /// Every problem found is reported, in the order the sections appear in the configuration. Checks that
+    /// depend on another value (for example the lag bound, which needs a valid sync interval) are skipped
+    /// while that value is itself invalid, so each mistake is reported once.
     pub fn validate(&self) -> Result<(), HasqliteError> {
+        let mut issues = Issues::default();
+
         if self.node.id.as_str().trim().is_empty() {
-            return Err(HasqliteError::Validation(
-                "node.id must not be empty".to_string(),
-            ));
-        }
-        if !is_valid_identifier(self.node.id.as_str()) {
-            return Err(HasqliteError::Validation(format!(
-                "node.id must be 1-{MAX_IDENTIFIER_LEN} ASCII letters, digits, '.', '_' or '-' (it is embedded in lease records, ledgers and logs)"
-            )));
+            issues.push("node.id", "node.id must not be empty");
+        } else if !self.node.id.is_valid() {
+            issues.push(
+                "node.id",
+                format!(
+                    "node.id must be 1-{MAX_IDENTIFIER_LEN} ASCII letters, digits, '.', '_' or '-' (it is embedded in lease records, ledgers and logs)"
+                ),
+            );
         }
         if is_empty_or_whitespace(&self.data.dir) {
-            return Err(HasqliteError::Validation(
-                "data.dir must not be empty".to_string(),
-            ));
+            issues.push("data.dir", "data.dir must not be empty");
         }
 
-        // Checked before `validate_lease` so a standalone node misconfigured with another backend
-        // is told to switch to a file lease rather than to complete the other backend's section.
-        if self.node.mode == NodeMode::Standalone && self.lease.source != LeaseSourceType::File {
-            return Err(HasqliteError::Validation(
-                "node.mode is 'standalone' but lease.source is not 'file' (standalone mode requires file-backed lease for flock mutual exclusion)".to_string(),
-            ));
+        // A standalone node misconfigured with another backend is told to switch to a file lease rather
+        // than to complete the other backend's section.
+        let wrong_standalone_source =
+            self.node.mode == NodeMode::Standalone && self.lease.source != LeaseSourceType::File;
+        if wrong_standalone_source {
+            issues.push(
+                "lease.source",
+                "node.mode is 'standalone' but lease.source is not 'file' (standalone mode requires file-backed lease for flock mutual exclusion)",
+            );
         }
-        Self::validate_lease(&self.lease, self.node.mode, &self.data.dir)?;
+        Self::validate_lease(
+            &mut issues,
+            &self.lease,
+            self.node.mode,
+            &self.data.dir,
+            !wrong_standalone_source,
+        );
 
         match self.node.mode {
-            NodeMode::Clustered => {
-                let freshness = self.freshness.as_ref().ok_or_else(|| {
-                    HasqliteError::Validation(
-                        "freshness section is required in clustered mode".to_string(),
-                    )
-                })?;
-                Self::validate_freshness(freshness)?;
-
-                let sync = self.sync.as_ref().ok_or_else(|| {
-                    HasqliteError::Validation(
-                        "sync section is required in clustered mode".to_string(),
-                    )
-                })?;
-                sync.validate()?;
-                // Any clustered node can be demoted to replica and must then resync from the writer alias.
-                if sync.origin_endpoint.is_none() {
-                    return Err(HasqliteError::Validation(
-                        "sync.origin_endpoint is required in clustered mode".to_string(),
-                    ));
-                }
-                // Lag is measured from the snapshot start to the writer's last renewal. Between two snapshot
-                // starts the writer renews every retry period, so steady-state lag reaches about
-                // `interval + retry_period` plus the sync duration; a smaller bound would deny routine promotions.
-                let min_lag_bound = sync
-                    .interval_secs
-                    .saturating_add(self.lease.retry_period_secs);
-                if freshness.max_lag_secs <= min_lag_bound {
-                    return Err(HasqliteError::Validation(format!(
-                        "freshness.max_lag_secs ({}) must exceed sync.interval_secs ({}) + lease.retry_period_secs ({}); allow for the sync duration as well",
-                        freshness.max_lag_secs, sync.interval_secs, self.lease.retry_period_secs
-                    )));
-                }
-
-                let promotion = self.promotion.as_ref().ok_or_else(|| {
-                    HasqliteError::Validation(
-                        "promotion section is required in clustered mode".to_string(),
-                    )
-                })?;
-                Self::validate_promotion_section(promotion)?;
-            }
+            NodeMode::Clustered => self.validate_clustered_sections(&mut issues),
             NodeMode::Standalone => {
                 if let Some(ref freshness) = self.freshness {
-                    Self::validate_freshness(freshness)?;
+                    Self::validate_freshness(&mut issues, freshness);
                 }
                 if let Some(ref sync) = self.sync {
-                    sync.validate()?;
+                    sync.collect_issues(&mut issues);
                     // Standalone mode never runs peer replication, so a configured origin is a misconfiguration
                     // (most likely a clustered profile reused with the wrong mode).
                     if sync.origin_endpoint.is_some() {
-                        return Err(HasqliteError::Validation(
-                            "sync.origin_endpoint must not be set in standalone mode (standalone nodes never pull from a peer)".to_string(),
-                        ));
+                        issues.push(
+                            "sync.origin_endpoint",
+                            "sync.origin_endpoint must not be set in standalone mode (standalone nodes never pull from a peer)",
+                        );
                     }
                 }
                 if let Some(ref promotion) = self.promotion {
-                    Self::validate_promotion_section(promotion)?;
+                    Self::validate_promotion_section(&mut issues, promotion);
                 }
             }
         }
 
-        validate_credential_source(
-            "gateway.auth_token_env",
-            self.gateway.auth_token_env.as_deref(),
-            "gateway.auth_token_file",
-            self.gateway.auth_token_file.as_deref(),
-        )?;
-        if (self.gateway.auth_token_env.is_some() || self.gateway.auth_token_file.is_some())
-            && self.gateway.allow_unauthenticated
+        self.validate_gateway(&mut issues);
+        issues.socket_addr("probes.http_bind", &self.probes.http_bind);
+        issues.into_result()
+    }
+
+    /// Validates the sections clustered mode requires: freshness, sync (with an origin) and promotion.
+    fn validate_clustered_sections(&self, issues: &mut Issues) {
+        match self.freshness {
+            Some(ref freshness) => Self::validate_freshness(issues, freshness),
+            None => issues.push(
+                "freshness",
+                "freshness section is required in clustered mode",
+            ),
+        }
+        match self.sync {
+            Some(ref sync) => {
+                sync.collect_issues(issues);
+                // Any clustered node can be demoted to replica and must then resync from the writer alias.
+                if sync.origin_endpoint.is_none() {
+                    issues.push(
+                        "sync.origin_endpoint",
+                        "sync.origin_endpoint is required in clustered mode",
+                    );
+                }
+            }
+            None => issues.push("sync", "sync section is required in clustered mode"),
+        }
+        // Lag is measured from the snapshot start to the writer's last renewal. Between two snapshot
+        // starts the writer renews every retry period, so steady-state lag reaches about
+        // `interval + retry_period` plus the sync duration; a smaller bound would deny routine promotions.
+        // Invalid (zero) inputs are already reported on their own fields, so the comparison is skipped.
+        if let (Some(freshness), Some(sync)) = (&self.freshness, &self.sync)
+            && freshness.max_lag_secs != 0
+            && sync.interval_secs != 0
+            && self.lease.retry_period_secs != 0
         {
-            return Err(HasqliteError::Validation(
-                "cannot specify gateway credentials together with gateway.allow_unauthenticated = true".to_string(),
-            ));
+            let min_lag_bound = sync
+                .interval_secs
+                .saturating_add(self.lease.retry_period_secs);
+            if freshness.max_lag_secs <= min_lag_bound {
+                issues.push(
+                    "freshness.max_lag_secs",
+                    format!(
+                        "freshness.max_lag_secs ({}) must exceed sync.interval_secs ({}) + lease.retry_period_secs ({}); allow for the sync duration as well",
+                        freshness.max_lag_secs, sync.interval_secs, self.lease.retry_period_secs
+                    ),
+                );
+            }
+        }
+        match self.promotion {
+            Some(ref promotion) => Self::validate_promotion_section(issues, promotion),
+            None => issues.push(
+                "promotion",
+                "promotion section is required in clustered mode",
+            ),
+        }
+    }
+
+    /// Validates gateway credentials, the unauthenticated escape hatch and the bind address.
+    fn validate_gateway(&self, issues: &mut Issues) {
+        let gateway = &self.gateway;
+        issues.credential_source(
+            "gateway.auth_token_env",
+            gateway.auth_token_env.as_deref(),
+            "gateway.auth_token_file",
+            gateway.auth_token_file.as_deref(),
+        );
+        let has_credentials = gateway.auth_token_env.is_some() || gateway.auth_token_file.is_some();
+        if has_credentials && gateway.allow_unauthenticated {
+            issues.push(
+                "gateway.allow_unauthenticated",
+                "cannot specify gateway credentials together with gateway.allow_unauthenticated = true",
+            );
         }
         // A loopback bind does not imply local-only access: the clustered topology fronts the gateway with
         // a TLS sidecar, which would expose unauthenticated SQL and replication to the network.
-        if self.gateway.allow_unauthenticated && self.node.mode == NodeMode::Clustered {
-            return Err(HasqliteError::Validation(
-                "gateway.allow_unauthenticated is only permitted in standalone mode".to_string(),
-            ));
+        if gateway.allow_unauthenticated && self.node.mode == NodeMode::Clustered {
+            issues.push(
+                "gateway.allow_unauthenticated",
+                "gateway.allow_unauthenticated is only permitted in standalone mode",
+            );
         }
-        if self.gateway.auth_token_env.is_none()
-            && self.gateway.auth_token_file.is_none()
-            && !self.gateway.allow_unauthenticated
+        if !has_credentials && !gateway.allow_unauthenticated {
+            issues.push(
+                "gateway",
+                "gateway requires authentication credentials (set gateway.auth_token_env or gateway.auth_token_file, or explicitly enable gateway.allow_unauthenticated = true)",
+            );
+        }
+        if let Some(bind) = issues.socket_addr("gateway.bind", &gateway.bind)
+            && gateway.allow_unauthenticated
+            && !bind.ip().is_loopback()
         {
-            return Err(HasqliteError::Validation(
-                "gateway requires authentication credentials (set gateway.auth_token_env or gateway.auth_token_file, or explicitly enable gateway.allow_unauthenticated = true)".to_string(),
-            ));
+            issues.push(
+                "gateway.bind",
+                "gateway.allow_unauthenticated requires gateway.bind to use a loopback address",
+            );
         }
-        let gateway_bind = parse_socket_addr("gateway.bind", &self.gateway.bind)?;
-        if self.gateway.allow_unauthenticated && !gateway_bind.ip().is_loopback() {
-            return Err(HasqliteError::Validation(
-                "gateway.allow_unauthenticated requires gateway.bind to use a loopback address"
-                    .to_string(),
-            ));
-        }
-        parse_socket_addr("probes.http_bind", &self.probes.http_bind)?;
-        Ok(())
     }
 
-    /// Validates lease timing bounds, the section required by the selected lease backend, and in
-    /// standalone mode the canonical lock path inside `data_dir`.
+    /// Validates lease timing bounds and, when `check_backend` is set, the section required by the selected
+    /// lease backend (in standalone mode also the canonical lock path inside `data_dir`).
     fn validate_lease(
+        issues: &mut Issues,
         lease: &LeaseSection,
         mode: NodeMode,
-        data_dir: &std::path::Path,
-    ) -> Result<(), HasqliteError> {
+        data_dir: &Path,
+        check_backend: bool,
+    ) {
         if lease.retry_period_secs == 0 {
-            return Err(HasqliteError::Validation(
-                "lease.retry_period_secs must be greater than 0".to_string(),
-            ));
+            issues.push(
+                "lease.retry_period_secs",
+                "lease.retry_period_secs must be greater than 0",
+            );
         }
         if lease.renew_deadline_secs == 0 {
-            return Err(HasqliteError::Validation(
-                "lease.renew_deadline_secs must be greater than 0".to_string(),
-            ));
+            issues.push(
+                "lease.renew_deadline_secs",
+                "lease.renew_deadline_secs must be greater than 0",
+            );
         }
         // At least two renewal attempts must fit before the deadline so one failed attempt does not demote.
-        if lease.retry_period_secs.saturating_mul(2) > lease.renew_deadline_secs {
-            return Err(HasqliteError::Validation(format!(
-                "lease.retry_period_secs ({}) must be at most half of lease.renew_deadline_secs ({}) so one failed renewal attempt does not demote the writer",
-                lease.retry_period_secs, lease.renew_deadline_secs
-            )));
+        if lease.retry_period_secs != 0
+            && lease.renew_deadline_secs != 0
+            && lease.retry_period_secs.saturating_mul(2) > lease.renew_deadline_secs
+        {
+            issues.push(
+                "lease.retry_period_secs",
+                format!(
+                    "lease.retry_period_secs ({}) must be at most half of lease.renew_deadline_secs ({}) so one failed renewal attempt does not demote the writer",
+                    lease.retry_period_secs, lease.renew_deadline_secs
+                ),
+            );
         }
         if lease.ttl_secs > MAX_LEASE_TTL_SECS {
-            return Err(HasqliteError::Validation(format!(
-                "lease.ttl_secs must not exceed {MAX_LEASE_TTL_SECS} seconds"
-            )));
+            issues.push(
+                "lease.ttl_secs",
+                format!("lease.ttl_secs must not exceed {MAX_LEASE_TTL_SECS} seconds"),
+            );
         }
-        let min_ttl_secs = lease
+        match lease
             .renew_deadline_secs
             .checked_add(MIN_LEASE_FENCING_MARGIN_SECS)
-            .ok_or_else(|| {
-                HasqliteError::Validation(format!(
+        {
+            None => issues.push(
+                "lease.renew_deadline_secs",
+                format!(
                     "lease.renew_deadline_secs ({}) is too large",
                     lease.renew_deadline_secs
-                ))
-            })?;
-        if lease.ttl_secs < min_ttl_secs {
-            return Err(HasqliteError::Validation(format!(
-                "lease.ttl_secs ({}) must exceed lease.renew_deadline_secs ({}) by at least {MIN_LEASE_FENCING_MARGIN_SECS} seconds",
-                lease.ttl_secs, lease.renew_deadline_secs
-            )));
+                ),
+            ),
+            Some(min_ttl_secs) if lease.ttl_secs < min_ttl_secs => issues.push(
+                "lease.ttl_secs",
+                format!(
+                    "lease.ttl_secs ({}) must exceed lease.renew_deadline_secs ({}) by at least {MIN_LEASE_FENCING_MARGIN_SECS} seconds",
+                    lease.ttl_secs, lease.renew_deadline_secs
+                ),
+            ),
+            Some(_) => {}
+        }
+        if !check_backend {
+            return;
         }
         match lease.source {
             LeaseSourceType::Kubernetes => {
-                let k8s = lease.kubernetes.as_ref().ok_or_else(|| {
-                    HasqliteError::Validation(
-                        "lease.source is 'kubernetes' but lease.kubernetes section is missing"
-                            .to_string(),
-                    )
-                })?;
-                if k8s.lease_name.trim().is_empty() {
-                    return Err(HasqliteError::Validation(
-                        "lease.kubernetes.lease_name must not be empty".to_string(),
-                    ));
-                }
-                if !is_dns1123_subdomain(&k8s.lease_name) {
-                    return Err(HasqliteError::Validation(
-                        "lease.kubernetes.lease_name must be a DNS-1123 subdomain (lowercase letters, digits, '-' and '.')".to_string(),
-                    ));
-                }
-                if k8s.namespace.trim().is_empty() {
-                    return Err(HasqliteError::Validation(
-                        "lease.kubernetes.namespace must not be empty".to_string(),
-                    ));
-                }
-                if !is_dns1123_subdomain(&k8s.namespace) {
-                    return Err(HasqliteError::Validation(
-                        "lease.kubernetes.namespace must be a DNS-1123 subdomain (lowercase letters, digits, '-' and '.')".to_string(),
-                    ));
+                let Some(k8s) = lease.kubernetes.as_ref() else {
+                    issues.push(
+                        "lease.kubernetes",
+                        "lease.source is 'kubernetes' but lease.kubernetes section is missing",
+                    );
+                    return;
+                };
+                for (field, value) in [
+                    ("lease.kubernetes.lease_name", &k8s.lease_name),
+                    ("lease.kubernetes.namespace", &k8s.namespace),
+                ] {
+                    if value.trim().is_empty() {
+                        issues.push(field, format!("{field} must not be empty"));
+                    } else if !is_dns1123_subdomain(value) {
+                        issues.push(
+                            field,
+                            format!(
+                                "{field} must be a DNS-1123 subdomain (lowercase letters, digits, '-' and '.')"
+                            ),
+                        );
+                    }
                 }
             }
             LeaseSourceType::File => {
-                let file = lease.file.as_ref().ok_or_else(|| {
-                    HasqliteError::Validation(
-                        "lease.source is 'file' but lease.file section is missing".to_string(),
-                    )
-                })?;
+                let Some(file) = lease.file.as_ref() else {
+                    issues.push(
+                        "lease.file",
+                        "lease.source is 'file' but lease.file section is missing",
+                    );
+                    return;
+                };
                 if is_empty_or_whitespace(&file.path) {
-                    return Err(HasqliteError::Validation(
-                        "lease.file.path must not be empty".to_string(),
-                    ));
-                }
-                if mode == NodeMode::Standalone {
+                    issues.push("lease.file.path", "lease.file.path must not be empty");
+                } else if mode == NodeMode::Standalone {
                     let canonical_lock = data_dir.join(STANDALONE_CANONICAL_LEASE_FILENAME);
                     if file.path != canonical_lock {
-                        return Err(HasqliteError::Validation(format!(
-                            "standalone mode requires canonical lease lock path '{}', found '{}'",
-                            canonical_lock.display(),
-                            file.path.display()
-                        )));
+                        issues.push(
+                            "lease.file.path",
+                            format!(
+                                "standalone mode requires canonical lease lock path '{}', found '{}'",
+                                canonical_lock.display(),
+                                file.path.display()
+                            ),
+                        );
                     }
                 }
             }
         }
-        Ok(())
     }
 
-    /// Validates the freshness ledger path and lag bound.
-    fn validate_freshness(freshness: &FreshnessSection) -> Result<(), HasqliteError> {
-        if is_empty_or_whitespace(&freshness.path) {
-            return Err(HasqliteError::Validation(
-                "freshness.path must not be empty".to_string(),
-            ));
+    /// Validates the freshness ledger directory and lag bound.
+    fn validate_freshness(issues: &mut Issues, freshness: &FreshnessSection) {
+        if is_empty_or_whitespace(&freshness.dir) {
+            issues.push("freshness.dir", "freshness.dir must not be empty");
         }
         if freshness.max_lag_secs == 0 {
-            return Err(HasqliteError::Validation(
-                "freshness.max_lag_secs must be greater than 0".to_string(),
-            ));
+            issues.push(
+                "freshness.max_lag_secs",
+                "freshness.max_lag_secs must be greater than 0",
+            );
         }
-        Ok(())
     }
 
     /// Validates promotion thresholds.
-    fn validate_promotion_section(promotion: &PromotionSection) -> Result<(), HasqliteError> {
-        if promotion.max_future_skew_secs > 300 {
-            return Err(HasqliteError::Validation(
-                "promotion.max_future_skew_secs must not exceed 300 seconds".to_string(),
-            ));
+    fn validate_promotion_section(issues: &mut Issues, promotion: &PromotionSection) {
+        if promotion.max_future_skew_secs > MAX_FUTURE_SKEW_SECS {
+            issues.push(
+                "promotion.max_future_skew_secs",
+                format!(
+                    "promotion.max_future_skew_secs must not exceed {MAX_FUTURE_SKEW_SECS} seconds"
+                ),
+            );
         }
-        Ok(())
     }
 }
 
@@ -572,6 +815,11 @@ fn default_lease_retry_period_secs() -> u64 {
     DEFAULT_LEASE_RETRY_PERIOD_SECS
 }
 
+/// Serde default for `sync.max_concurrent_pulls`.
+fn default_max_concurrent_pulls() -> u32 {
+    DEFAULT_MAX_CONCURRENT_PULLS
+}
+
 /// File-backed lease configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -591,12 +839,15 @@ pub struct KubernetesLeaseSection {
 }
 
 /// Replica freshness tracking configuration.
+///
+/// The single-file `path` key of earlier versions is rejected as an unknown field (REQ-CFG-010).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FreshnessSection {
-    /// Path to the freshness ledger state file; keep it on the same filesystem as the database.
-    pub path: PathBuf,
-    /// Maximum allowed lag, in seconds, of the last snapshot behind the writer's last lease renewal.
+    /// Directory holding one ledger record per replicated database; keep it on the same filesystem as the
+    /// databases, owned by the node UID with mode `0700` (checked at pre-flight).
+    pub dir: PathBuf,
+    /// Maximum allowed lag, in seconds, of each database's last snapshot behind the writer's last lease renewal.
     pub max_lag_secs: u64,
 }
 
@@ -614,6 +865,9 @@ pub struct PromotionSection {
 pub struct SyncSection {
     /// Interval in seconds between periodic background sync passes.
     pub interval_secs: u64,
+    /// Maximum number of pulls of different databases run at the same time (1–64, default 4).
+    #[serde(default = "default_max_concurrent_pulls")]
+    pub max_concurrent_pulls: u32,
     /// Origin endpoint to pull replication pages from (`https://host:port`, or `grpc://host:port` for loopback only).
     /// Required in clustered mode, where it should name a stable alias that always routes to the current writer.
     #[serde(default)]
@@ -627,34 +881,53 @@ pub struct SyncSection {
 }
 
 impl SyncSection {
-    /// Validates sync intervals, origin security, and credential source settings.
+    /// Validates sync intervals, pull concurrency, origin security, and credential source settings.
     pub fn validate(&self) -> Result<(), HasqliteError> {
+        let mut issues = Issues::default();
+        self.collect_issues(&mut issues);
+        issues.into_result()
+    }
+
+    /// Records every problem with this section.
+    fn collect_issues(&self, issues: &mut Issues) {
         if self.interval_secs == 0 {
-            return Err(HasqliteError::Validation(
-                "sync.interval_secs must be greater than 0".to_string(),
-            ));
+            issues.push(
+                "sync.interval_secs",
+                "sync.interval_secs must be greater than 0",
+            );
+        }
+        if !(1..=MAX_CONCURRENT_PULLS).contains(&self.max_concurrent_pulls) {
+            issues.push(
+                "sync.max_concurrent_pulls",
+                format!(
+                    "sync.max_concurrent_pulls ({}) must be between 1 and {MAX_CONCURRENT_PULLS}",
+                    self.max_concurrent_pulls
+                ),
+            );
         }
         if let Some(ref endpoint) = self.origin_endpoint
             && !is_valid_sync_origin_endpoint(endpoint)
         {
-            return Err(HasqliteError::Validation(
-                "sync.origin_endpoint must use HTTPS for remote origins; grpc:// is limited to loopback addresses, with a valid host and non-zero port".to_string(),
-            ));
+            issues.push(
+                "sync.origin_endpoint",
+                "sync.origin_endpoint must use HTTPS for remote origins; grpc:// is limited to loopback addresses, with a valid host and non-zero port",
+            );
         }
         if self.origin_endpoint.is_some()
             && self.transport_auth_token_env.is_none()
             && self.transport_auth_token_file.is_none()
         {
-            return Err(HasqliteError::Validation(
-                "sync.origin_endpoint requires a credential (set sync.transport_auth_token_env or sync.transport_auth_token_file)".to_string(),
-            ));
+            issues.push(
+                "sync.origin_endpoint",
+                "sync.origin_endpoint requires a credential (set sync.transport_auth_token_env or sync.transport_auth_token_file)",
+            );
         }
-        validate_credential_source(
+        issues.credential_source(
             "sync.transport_auth_token_env",
             self.transport_auth_token_env.as_deref(),
             "sync.transport_auth_token_file",
             self.transport_auth_token_file.as_deref(),
-        )
+        );
     }
 }
 
@@ -686,15 +959,64 @@ pub struct ProbesSection {
     pub http_bind: String,
 }
 
+/// One semantic problem with a configuration value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidationIssue {
+    /// Dotted path of the offending setting or section, e.g. `lease.ttl_secs`.
+    pub field: &'static str,
+    /// Human-readable explanation, naming the setting and the rule it breaks.
+    pub message: String,
+}
+
+impl std::fmt::Display for ValidationIssue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+/// Every problem `ClusterConfig::validate` found, in configuration order; never empty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidationErrors(Vec<ValidationIssue>);
+
+impl ValidationErrors {
+    /// Returns the individual problems.
+    pub fn issues(&self) -> &[ValidationIssue] {
+        &self.0
+    }
+
+    /// Returns true if any problem concerns `field`.
+    pub fn has_field(&self, field: &str) -> bool {
+        self.0.iter().any(|issue| issue.field == field)
+    }
+}
+
+impl std::fmt::Display for ValidationErrors {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0.as_slice() {
+            [single] => write!(f, "{single}"),
+            issues => {
+                write!(f, "{} problems: ", issues.len())?;
+                for (index, issue) in issues.iter().enumerate() {
+                    if index > 0 {
+                        f.write_str("; ")?;
+                    }
+                    write!(f, "{issue}")?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 /// Root error type for configuration parsing and semantic validation.
 #[derive(thiserror::Error, Debug, PartialEq, Eq)]
 pub enum HasqliteError {
     /// Deserialization or syntax error in configuration.
     #[error("configuration error: {0}")]
     Config(String),
-    /// Semantic validation error in configuration constraints.
+    /// Semantic validation errors in configuration constraints.
     #[error("validation error: {0}")]
-    Validation(String),
+    Validation(ValidationErrors),
 }
 
 #[cfg(test)]
@@ -715,7 +1037,7 @@ source = "file"
 path = "/tmp/hasqlite.lease"
 
 [freshness]
-path = "/tmp/freshness.txt"
+dir = "/tmp/freshness"
 max_lag_secs = 5
 
 [promotion]
@@ -738,7 +1060,7 @@ http_bind = "127.0.0.1:8088"
     fn valid_test_config() -> ClusterConfig {
         ClusterConfig {
             node: NodeSection {
-                id: NodeId::from("pod-0"),
+                id: NodeId::new("pod-0"),
                 mode: NodeMode::Clustered,
             },
             data: DataSection {
@@ -756,7 +1078,7 @@ http_bind = "127.0.0.1:8088"
                 retry_period_secs: DEFAULT_LEASE_RETRY_PERIOD_SECS,
             },
             freshness: Some(FreshnessSection {
-                path: PathBuf::from("/var/lib/hasqlite/.hasqlite.freshness"),
+                dir: PathBuf::from("/var/lib/hasqlite/.hasqlite.freshness"),
                 max_lag_secs: 10,
             }),
             promotion: Some(PromotionSection {
@@ -764,6 +1086,7 @@ http_bind = "127.0.0.1:8088"
             }),
             sync: Some(SyncSection {
                 interval_secs: 2,
+                max_concurrent_pulls: DEFAULT_MAX_CONCURRENT_PULLS,
                 origin_endpoint: Some("https://writer:50443".to_string()),
                 transport_auth_token_env: Some("HASQLITE_GRPC_AUTH_TOKEN".to_string()),
                 transport_auth_token_file: None,
@@ -797,7 +1120,7 @@ http_bind = "127.0.0.1:8088"
     #[test]
     fn cluster_config_models_all_documented_sections() {
         let config = valid_test_config();
-        assert_eq!(config.node.id, NodeId::from("pod-0"));
+        assert_eq!(config.node.id, NodeId::new("pod-0"));
         assert_eq!(config.node.id.as_str(), "pod-0");
         assert_eq!(config.node.mode, NodeMode::Clustered);
         assert_eq!(config.data.dir, PathBuf::from("/var/lib/hasqlite"));
@@ -815,7 +1138,7 @@ http_bind = "127.0.0.1:8088"
         let toml_str = FILE_LEASE_CLUSTER_TOML;
 
         let parsed: ClusterConfig = toml::from_str(toml_str).expect("should parse valid toml");
-        assert_eq!(parsed.node.id, NodeId::from("node-alpha"));
+        assert_eq!(parsed.node.id, NodeId::new("node-alpha"));
         assert_eq!(parsed.node.mode, NodeMode::Clustered);
         assert_eq!(parsed.lease.source, LeaseSourceType::File);
         assert!(!parsed.gateway.allow_replica_reads);
@@ -880,7 +1203,7 @@ http_bind = "0.0.0.0:8088"
 "#;
 
         let parsed: ClusterConfig = toml::from_str(toml_str).expect("should parse valid toml");
-        assert_eq!(parsed.node.id, NodeId::from("standalone-0"));
+        assert_eq!(parsed.node.id, NodeId::new("standalone-0"));
         assert_eq!(parsed.node.mode, NodeMode::Standalone);
         assert_eq!(parsed.lease.source, LeaseSourceType::File);
         assert!(parsed.freshness.is_none());
@@ -903,10 +1226,13 @@ http_bind = "0.0.0.0:8088"
         mutate(&mut config);
         let err = config.validate().unwrap_err();
         match err {
-            HasqliteError::Validation(msg) => {
+            HasqliteError::Validation(errors) => {
                 assert!(
-                    msg.contains(expected_substr),
-                    "expected error containing '{expected_substr}', got '{msg}'"
+                    errors
+                        .issues()
+                        .iter()
+                        .any(|issue| issue.message.contains(expected_substr)),
+                    "expected an error containing '{expected_substr}', got '{errors}'"
                 );
             }
             other => panic!("expected Validation error, got '{other:?}'"),
@@ -941,14 +1267,191 @@ http_bind = "0.0.0.0:8088"
     }
 
     #[test]
-    fn standalone_mode_reports_lease_source_before_backend_section() {
-        assert_validation_err(
-            |c| {
-                c.node.mode = NodeMode::Standalone;
-                c.lease.source = LeaseSourceType::Kubernetes;
-                c.lease.kubernetes = None;
-            },
-            "node.mode is 'standalone' but lease.source is not 'file'",
+    fn standalone_mode_reports_lease_source_instead_of_backend_section() {
+        let mut config = valid_standalone_config();
+        config.lease.source = LeaseSourceType::Kubernetes;
+        config.lease.file = None;
+        let HasqliteError::Validation(errors) = config.validate().unwrap_err() else {
+            panic!("expected validation errors");
+        };
+        assert_eq!(errors.issues().len(), 1, "got {errors}");
+        assert_eq!(errors.issues()[0].field, "lease.source");
+    }
+
+    #[test]
+    fn validation_reports_every_independent_problem_in_config_order() {
+        let mut config = valid_test_config();
+        config.node.id = NodeId::new("bad id");
+        config.lease.ttl_secs = MAX_LEASE_TTL_SECS + 1;
+        config.sync.as_mut().unwrap().interval_secs = 0;
+        config.probes.http_bind = "nowhere".to_string();
+        let HasqliteError::Validation(errors) = config.validate().unwrap_err() else {
+            panic!("expected validation errors");
+        };
+        let fields: Vec<_> = errors.issues().iter().map(|issue| issue.field).collect();
+        assert_eq!(
+            fields,
+            [
+                "node.id",
+                "lease.ttl_secs",
+                "sync.interval_secs",
+                "probes.http_bind"
+            ]
+        );
+        assert!(
+            errors
+                .to_string()
+                .starts_with("4 problems: node.id must be")
+        );
+    }
+
+    #[test]
+    fn dependent_checks_are_skipped_while_their_inputs_are_invalid() {
+        // A zero lag bound is reported once, not also as "must exceed interval + retry".
+        let mut config = valid_test_config();
+        config.freshness.as_mut().unwrap().max_lag_secs = 0;
+        let HasqliteError::Validation(errors) = config.validate().unwrap_err() else {
+            panic!("expected validation errors");
+        };
+        assert_eq!(errors.issues().len(), 1, "got {errors}");
+        // A zero retry period is not also reported as violating the half-deadline rule.
+        let mut config = valid_test_config();
+        config.lease.renew_deadline_secs = 0;
+        let HasqliteError::Validation(errors) = config.validate().unwrap_err() else {
+            panic!("expected validation errors");
+        };
+        assert!(
+            !errors
+                .issues()
+                .iter()
+                .any(|i| i.message.contains("at most half"))
+        );
+    }
+
+    #[test]
+    fn freshness_path_is_rejected_in_favour_of_dir() {
+        let toml_str = FILE_LEASE_CLUSTER_TOML
+            .replace("dir = \"/tmp/freshness\"", "path = \"/tmp/freshness.txt\"");
+        let err = ClusterConfig::from_toml(&toml_str).unwrap_err();
+        assert!(
+            matches!(&err, HasqliteError::Config(message) if message.contains("unknown field `path`")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn sync_max_concurrent_pulls_defaults_and_bounds() {
+        let config = ClusterConfig::from_toml(FILE_LEASE_CLUSTER_TOML).expect("valid config");
+        assert_eq!(
+            config.sync.unwrap().max_concurrent_pulls,
+            DEFAULT_MAX_CONCURRENT_PULLS
+        );
+        for invalid in [0, MAX_CONCURRENT_PULLS + 1] {
+            assert_validation_err(
+                |c| c.sync.as_mut().unwrap().max_concurrent_pulls = invalid,
+                "sync.max_concurrent_pulls",
+            );
+        }
+        for valid in [1, MAX_CONCURRENT_PULLS] {
+            let mut config = valid_test_config();
+            config.sync.as_mut().unwrap().max_concurrent_pulls = valid;
+            assert!(config.validate().is_ok());
+        }
+    }
+
+    #[test]
+    fn node_id_parse_and_deserialize_reject_unsafe_ids() {
+        assert!(NodeId::parse("pod-0").is_ok());
+        let err = NodeId::parse("node\n1").unwrap_err();
+        assert!(
+            err.to_string().contains("\"node\\n1\""),
+            "control characters are escaped: {err}"
+        );
+        assert!("node 1".parse::<NodeId>().is_err());
+        assert!(!NodeId::new("node 1").is_valid());
+
+        #[derive(Deserialize)]
+        struct Holder {
+            #[allow(dead_code)]
+            id: NodeId,
+        }
+        let err = toml::from_str::<Holder>("id = \"evil\\nline\"")
+            .err()
+            .expect("rejected");
+        assert!(err.to_string().contains("invalid node id"), "got {err}");
+
+        let toml_str =
+            FILE_LEASE_CLUSTER_TOML.replace("id = \"node-alpha\"", "id = \"node alpha\"");
+        assert!(matches!(
+            ClusterConfig::from_toml(&toml_str).unwrap_err(),
+            HasqliteError::Config(message) if message.contains("invalid node id")
+        ));
+    }
+
+    #[test]
+    fn database_names_follow_adr_0020_rules() {
+        for valid in [
+            "app.db",
+            "tenants/acme.db",
+            "a/b/c.sqlite",
+            "x.sqlite3",
+            "diverged.db",
+            "my_db-1.v2.db",
+        ] {
+            assert!(
+                DatabaseName::parse(valid).is_ok(),
+                "expected '{valid}' to be valid"
+            );
+        }
+        let long_component = format!("{}.db", "a".repeat(253));
+        for (invalid, reason) in [
+            ("app", "must end in"),
+            ("app.txt", "must end in"),
+            ("", "must end in"),
+            (".db", "starts with '.'"),
+            ("tenants/.hidden.db", "starts with '.'"),
+            ("tenants//acme.db", "empty path component"),
+            ("/abs.db", "empty path component"),
+            ("../escape.db", "starts with '.'"),
+            ("tenants/ac me.db", "may contain only"),
+            ("tenants\\acme.db", "may contain only"),
+            ("ten%ants.db", "may contain only"),
+            ("diverged/app.db", "reserved"),
+            ("ancestors/app.db", "reserved"),
+            (long_component.as_str(), "longer than 255"),
+        ] {
+            let err = DatabaseName::parse(invalid).unwrap_err();
+            assert!(
+                err.reason.contains(reason),
+                "'{invalid}': expected reason containing '{reason}', got '{}'",
+                err.reason
+            );
+        }
+        assert!(DatabaseName::parse(format!("{}.db", "a".repeat(252))).is_ok());
+    }
+
+    #[test]
+    fn database_name_deserialization_validates_and_orders_bytewise() {
+        #[derive(Deserialize)]
+        struct Holder {
+            name: DatabaseName,
+        }
+        let holder: Holder = toml::from_str("name = \"tenants/acme.db\"").expect("valid");
+        assert_eq!(holder.name.as_str(), "tenants/acme.db");
+        assert!(toml::from_str::<Holder>("name = \"../etc/passwd.db\"").is_err());
+
+        let mut names = ["b.db", "a/z.db", "a.db"].map(|n| DatabaseName::parse(n).unwrap());
+        names.sort();
+        assert_eq!(names.map(|n| n.to_string()), ["a.db", "a/z.db", "b.db"]);
+    }
+
+    #[test]
+    fn database_name_encodes_to_a_single_file_name() {
+        let name = DatabaseName::parse("tenants/acme.db").unwrap();
+        assert_eq!(name.encoded_file_name(), "tenants%2Facme.db");
+        assert_eq!(
+            DatabaseName::parse("app.db").unwrap().encoded_file_name(),
+            "app.db"
         );
     }
 
@@ -1030,8 +1533,8 @@ http_bind = "0.0.0.0:8088"
         config.gateway.bind = "0.0.0.0:50051".to_string();
         assert!(matches!(
             config.validate().unwrap_err(),
-            HasqliteError::Validation(message)
-                if message.contains("gateway.allow_unauthenticated requires gateway.bind to use a loopback address")
+            HasqliteError::Validation(errors)
+                if errors.to_string().contains("gateway.allow_unauthenticated requires gateway.bind to use a loopback address")
         ));
     }
 
@@ -1132,6 +1635,37 @@ http_bind = "0.0.0.0:8088"
         let mut config = valid_test_config();
         config.freshness.as_mut().unwrap().max_lag_secs = 5;
         assert!(config.validate().is_ok());
+        // Smallest valid timing inputs: interval 1 + retry 1 = 2, so a bound of 2 is still rejected.
+        assert_validation_err(
+            |c| {
+                c.sync.as_mut().unwrap().interval_secs = 1;
+                c.lease.retry_period_secs = 1;
+                c.freshness.as_mut().unwrap().max_lag_secs = 2;
+            },
+            "freshness.max_lag_secs (2) must exceed sync.interval_secs (1) + lease.retry_period_secs (1)",
+        );
+    }
+
+    #[test]
+    fn lag_bound_is_not_compared_against_invalid_timing_inputs() {
+        for mutate in [
+            (|c: &mut ClusterConfig| c.sync.as_mut().unwrap().interval_secs = 0) as fn(&mut _),
+            |c: &mut ClusterConfig| c.lease.retry_period_secs = 0,
+        ] {
+            let mut config = valid_test_config();
+            mutate(&mut config);
+            config.freshness.as_mut().unwrap().max_lag_secs = 1;
+            let HasqliteError::Validation(errors) = config.validate().unwrap_err() else {
+                panic!("expected validation error");
+            };
+            assert!(
+                !errors
+                    .issues()
+                    .iter()
+                    .any(|issue| issue.field == "freshness.max_lag_secs"),
+                "got '{errors}'"
+            );
+        }
     }
 
     #[test]
@@ -1149,7 +1683,7 @@ http_bind = "0.0.0.0:8088"
     #[test]
     fn validation_rejects_empty_node_id() {
         assert_validation_err(
-            |c| c.node.id = NodeId::from("   "),
+            |c| c.node.id = NodeId::new("   "),
             "node.id must not be empty",
         );
     }
@@ -1166,13 +1700,13 @@ http_bind = "0.0.0.0:8088"
             &"n".repeat(MAX_IDENTIFIER_LEN + 1),
         ] {
             assert_validation_err(
-                |c| c.node.id = NodeId::from(id),
+                |c| c.node.id = NodeId::new(id),
                 "node.id must be 1-253 ASCII letters, digits, '.', '_' or '-'",
             );
         }
         for id in ["pod-0", "hasqlite-0.hasqlite.default", "edge_node-7", "a"] {
             let mut config = valid_test_config();
-            config.node.id = NodeId::from(id);
+            config.node.id = NodeId::new(id);
             assert!(
                 config.validate().is_ok(),
                 "expected node id '{id}' to be valid"
@@ -1210,8 +1744,8 @@ http_bind = "0.0.0.0:8088"
         config.sync = valid_test_config().sync;
         assert!(matches!(
             config.validate().unwrap_err(),
-            HasqliteError::Validation(message)
-                if message.contains("sync.origin_endpoint must not be set in standalone mode")
+            HasqliteError::Validation(errors)
+                if errors.to_string().contains("sync.origin_endpoint must not be set in standalone mode")
         ));
         config.sync.as_mut().unwrap().origin_endpoint = None;
         config.sync.as_mut().unwrap().transport_auth_token_env = None;
@@ -1228,8 +1762,8 @@ http_bind = "0.0.0.0:8088"
         config.gateway.bind = "[::]:50051".to_string();
         assert!(matches!(
             config.validate().unwrap_err(),
-            HasqliteError::Validation(message)
-                if message.contains("requires gateway.bind to use a loopback address")
+            HasqliteError::Validation(errors)
+                if errors.to_string().contains("requires gateway.bind to use a loopback address")
         ));
     }
 
@@ -1291,8 +1825,8 @@ http_bind = "0.0.0.0:8088"
                 "data.dir must not be empty",
             );
             assert_validation_err(
-                |c| c.freshness.as_mut().unwrap().path = PathBuf::from(invalid_path),
-                "freshness.path must not be empty",
+                |c| c.freshness.as_mut().unwrap().dir = PathBuf::from(invalid_path),
+                "freshness.dir must not be empty",
             );
             assert_validation_err(
                 |c| {
@@ -1444,6 +1978,7 @@ http_bind = "0.0.0.0:8088"
         let mut config = valid_standalone_config();
         config.sync = Some(SyncSection {
             interval_secs: 2,
+            max_concurrent_pulls: DEFAULT_MAX_CONCURRENT_PULLS,
             origin_endpoint: None,
             transport_auth_token_env: None,
             transport_auth_token_file: None,
@@ -1487,8 +2022,8 @@ http_bind = "0.0.0.0:8088"
         let err = ClusterConfig::from_toml(&semantically_invalid_toml).unwrap_err();
         assert!(matches!(
             err,
-            HasqliteError::Validation(message)
-                if message == "sync.interval_secs must be greater than 0"
+            HasqliteError::Validation(errors)
+                if errors.issues().len() == 1 && errors.has_field("sync.interval_secs")
         ));
     }
 
@@ -1506,7 +2041,8 @@ http_bind = "0.0.0.0:8088"
         let id = NodeId::new("node-alpha");
         assert_eq!(id.as_str(), "node-alpha");
         assert_eq!(id.as_ref(), "node-alpha");
-        assert_eq!(NodeId::from(String::from("node-alpha")), id);
+        assert_eq!(NodeId::parse(String::from("node-alpha")).unwrap(), id);
+        assert_eq!(String::from(id.clone()), "node-alpha");
         assert_eq!(format!("{id}"), "node-alpha");
         assert_eq!(id.into_inner(), "node-alpha");
     }
