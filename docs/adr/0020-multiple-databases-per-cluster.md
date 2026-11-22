@@ -3,7 +3,7 @@
 - Status: Accepted
 - Date: 2026-11-18
 - Supersedes: ADR-0018
-- Related: REQ-MDB-001 to REQ-MDB-023, REQ-CFG-011; safety contract rules 2, 6, 8–10, 15
+- Related: REQ-MDB-001 to REQ-MDB-024, REQ-CFG-011; safety contract rules 2, 6, 8–10, 15
   and 16; operations §10.2, §10.4; ADR-0005, ADR-0007, ADR-0010, ADR-0011
 
 ## Context
@@ -48,16 +48,22 @@ writer's databases, or holds a stale copy of one, must not be promotable.
   is idempotent and finished after a crash, because the tombstone stays in
   the lease. A node deletes nothing while a divergence preservation is
   pending, so a former writer's unreplicated commits to a removed database
-  are preserved first. A node never deletes files that are in neither the
-  set nor the tombstones; it reports them as unmanaged.
+  are preserved first. A node that holds a ledger record for a name in
+  neither the set nor the tombstones deletes that name's files too: it
+  replicated the name, so the files belong to a removal whose tombstone was
+  dropped while the node was away. A node never deletes files that are in
+  neither list and have no ledger record; it reports them as unmanaged.
 - **Incarnations guard against reused names.** A ledger record carries its
   database's incarnation. Promotion requires it to match the set entry, and a
   replica deletes local files of an older incarnation before its first pull
   of a new one. An old copy of a removed database therefore can neither pass
   the gate nor be patched into a re-added one.
-- **Names.** Each `/`-separated component is 1–255 ASCII letters, digits, `.`,
-  `_` or `-` and does not start with `.`. The whole name is at most 255 bytes
-  and ends in `.db`, `.sqlite` or `.sqlite3`. The first component is not
+- **Names.** Each `/`-separated component is non-empty, uses only ASCII
+  letters, digits, `.`, `_` or `-`, and does not start with `.`. The whole
+  name ends in `.db`, `.sqlite` or `.sqlite3` and is at most 200 bytes with
+  each `/` counted as three bytes (its `%2F` encoding), so every generated
+  ledger-record and diverged-copy name, including its `.tmp` file, stays
+  within the 255-byte file-name limit. The first component is not
   `diverged` or `ancestors`. With the cap of 64, the set fits in the Kubernetes
   Lease annotations (well under 256 KiB).
 - **One ledger record per database.** The freshness ledger becomes a directory
@@ -119,9 +125,11 @@ writer's databases, or holds a stale copy of one, must not be promotable.
   `--confirm-data-loss`. The only surviving copy is a diverged copy on a former
   writer that had not yet resynced. Take a backup first if the data may be
   needed.
-- Files from a tombstone that was dropped from the full list, on a node that
-  was offline for 64 removals, are not deleted automatically; they are
-  reported as unmanaged.
+- A node that was offline for more than 64 removals still deletes the files
+  of a dropped tombstone if it holds a ledger record for the name, which it
+  does for any database it replicated. Only files with no ledger record (for
+  example, a `db add` that crashed before its CAS on a node that never
+  replicated the name) are left in place and reported as unmanaged.
 - The `freshness.path` configuration key is replaced by `freshness.dir`.
 - A standalone volume with more than 64 databases, or with names that break
   the naming rules, cannot be seeded into a cluster until it is reorganised.

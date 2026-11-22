@@ -312,7 +312,7 @@ Events per tick (informed by the upstream `ReconcileDecision` model):
      lag over its databases, before its acquisition attempt
      and aborts if the lease version changes meanwhile, so the least-lagged
      replica normally wins the race. Because lag uses saturating subtraction
-     (`writer.renewed_at_secs.saturating_sub(synced_at_secs)`), multiple snapshots
+     (`(writer.renewed_at_secs + writer.clock_deficit_secs).saturating_sub(synced_at_secs)`), multiple snapshots
      taken at or after the writer's last renewal evaluate to zero lag and zero delay;
      among such candidates, an older snapshot may win the race without a freshness
      preference.
@@ -539,7 +539,7 @@ docstring, test and coverage gates apply to their first line of real code.
 
 ### Dependency-removal plan
 
-`hasqlite-sync` currently uses the `rsqlite-rsync` v0.5.0 Git dependency, pinned
+`hasqlite-sync` currently uses the `rsqlite-rsync` v0.5.1 Git dependency, pinned
 by commit `rev` rather than the movable tag, for replication pulls (CI builds with
 `--locked`); its integration test also uses the upstream server and
 protocol types. Keep this dependency only as a bridge while hasqlite builds its

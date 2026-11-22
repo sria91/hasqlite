@@ -14,7 +14,15 @@ The default deployment posture is intentionally conservative:
   only when the deployment model specifically requires them; they are never the
   preferred credential source in Kubernetes or Docker-based production use.
 - The SQL token and replication token are separate credentials with separate
-  scopes; they are never interchangeable.
+  scopes; they are never interchangeable. Distinctness is enforced at startup
+  and on every rotation. The node holds the two credentials as one pair and
+  replaces the pair only as a whole: whenever either credential's source
+  changes, it reads both under one lock, compares the resolved values in
+  constant time, and installs the new pair only if they differ. On a match it
+  keeps the previous pair active, rejects the change and raises an alert.
+  Because reloads are serialized and always read both sources, two rotations
+  that land together are compared with each other, never each with the other's
+  old value. Rotation to a distinct value needs no restart.
 
 This section is normative for v1 and is intentionally stricter than a permissive
 local-dev default.
@@ -23,7 +31,7 @@ local-dev default.
 
 ## 8. Configuration contract (v1)
 
-Unified config file (TOML/YAML) replacing long flag lists:
+Unified TOML config file replacing long flag lists:
 
 ```toml
 [node]
@@ -51,8 +59,8 @@ namespace = "default"
 # annotation writes to the Lease object cannot postpone failover.
 
 [freshness]
-# One ledger record per replicated database (ADR-0020). Directory on the PVC, same filesystem as data.dir,
-# owned by the node UID with mode 0700. Replaces the single-file `path` key, which is now rejected.
+# One ledger record per replicated database (ADR-0020), on the same filesystem as data.dir, owned by the node UID
+# with mode 0700. The single-file `path` key of earlier versions is rejected.
 dir = "/var/lib/hasqlite/.hasqlite.freshness"
 max_lag_secs = 8 # max lag of each database's last snapshot behind the writer's last lease renewal (both on the writer's clock); > interval_secs + retry_period_secs
 
@@ -61,7 +69,7 @@ max_future_skew_secs = 2
 
 [sync]
 interval_secs = 2
-max_concurrent_pulls = 4 # pulls of different databases run in parallel (1–64); one pull per database at a time
+max_concurrent_pulls = 4 # pulls of different databases in parallel (1–64, default 4); validated today, used once the multi-database sync round lands (Phase 2)
 # Required in clustered mode on every node, including the current writer: any node can be demoted and
 # must then resync. Use a stable alias that always routes to the current writer, never a pod hostname.
 origin_endpoint = "https://hasqlite-writer:50443" # remote origins require TLS; grpc:// is limited to loopback IPs and `localhost`
@@ -121,12 +129,13 @@ Validation (`ClusterConfig::from_toml`) fails closed and reports every problem i
   bounds the writer's renewal deadline. At runtime a candidate waits the *effective* TTL,
   `max(its ttl_secs, the holder's recorded ttl_secs)`, so lease timing can be changed in a rolling fashion.
 - `freshness.max_lag_secs > sync.interval_secs + lease.retry_period_secs`: between two snapshot starts the
-  writer renews every retry period, so steady-state lag reaches about that sum plus the sync duration. Pulls of
-  different databases run concurrently up to `sync.max_concurrent_pulls`, so allow for the slowest pull, or a full
-  round when there are more databases than pull slots, on top of the validated minimum.
-- `sync.max_concurrent_pulls` is 1–64 (default 4).
-- `freshness.path` is rejected (replaced by `freshness.dir`). At pre-flight, `freshness.dir` must be a directory
-  owned by the node UID with mode `0700`, must not be a symlink and must be on the same filesystem as `data.dir`.
+  writer renews every retry period, so steady-state lag reaches about that sum plus the sync duration. The
+  multi-database sync round is not implemented yet (ADR-0020, Phase 2). Once it is, pulls of different databases
+  run concurrently up to `sync.max_concurrent_pulls`, so allow for the slowest pull, or a full round when there are
+  more databases than pull slots, on top of the validated minimum.
+- `freshness.dir` is required and `freshness.path` is rejected as an unknown key (ADR-0020).
+  `sync.max_concurrent_pulls` is 1–64 (default 4). At pre-flight, `freshness.dir` must be a directory owned by the node UID with mode `0700`, must not be a
+  symlink and must be on the same filesystem as `data.dir`.
 - Standalone mode rejects `sync.origin_endpoint` (a standalone node never pulls from a peer); `[sync]`,
   `[freshness]` and `[promotion]` are otherwise optional there.
 - Plaintext `grpc://` origins are accepted only for literal loopback IPs and `localhost`; `*.localhost`

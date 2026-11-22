@@ -25,7 +25,11 @@ and completely on disk, nor attribute it to the wrong writer.
   1. Observe the lease before the pull; abort if `holder_node_id !=
      writer.node_id`.
   2. After the database fsync, observe the lease again; publish only if
-     `version` is unchanged and the holder still equals the writer epoch.
+     `holder_node_id` and `generation` are unchanged since step 1, the holder
+     still equals the writer epoch, and the database's set entry (name and
+     incarnation) is unchanged. `version` is not compared: the writer renews
+     every retry period, so it changes during most pulls without changing who
+     served the snapshot.
   3. Stamp `source_node_id`, `source_generation` and `synced_at_secs :=
      writer.renewed_at_secs` from the *pre-pull* observation, a lower bound on
      the snapshot start, so lag is overstated, never understated.
@@ -53,11 +57,14 @@ and completely on disk, nor attribute it to the wrong writer.
   stamping; size `freshness.max_lag_secs` accordingly.
 - Replica reads stay unsupported while application is in place, because
   concurrent readers can see torn pages.
-- A lease change during a pull wastes that pull; it is retried next tick.
+- A change of writer (holder or generation) during a pull wastes that pull;
+  it is retried next tick. Renewals by the same writer do not.
 
 ## Alternatives considered
 
 - **Use sync completion time as `synced_at_secs`**: rejected; it overstates
   freshness relative to the writer's clock.
+- **Require an unchanged `version` after the pull**: rejected; renewals
+  every retry period would block publication of any pull longer than that.
 - **Trust the adapter's serving node without a role gate**: rejected; a
   demoted origin could serve a stale snapshot attributed to the new writer.

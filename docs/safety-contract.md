@@ -11,10 +11,21 @@ protocol.
 2. **Lease is authoritative** for writer identity: `holder_node_id`, `generation`,
    `renewed_at_secs`, `ttl_secs` (the holder's configured TTL), a hasqlite-owned
    `version` token that changes on every lease write *made by hasqlite* (acquire,
-   activate, renew, release), and the last **activated writer epoch** (`writer`:
-   node ID, generation, last renewal, the *database set* `databases`,
-   `promoted_from` and, after a planned switchover, `stopped_at_secs`; rules 9,
-   10 and 16). The backend's native
+   activate, renew, release), the lease `format` (below), and the last
+   **activated writer epoch** (`writer`: node ID, generation, last renewal,
+   the clock fields `clock_deficit_secs` and `clock_rebased_at_secs`, the
+   *database set* `databases`, `promoted_from` and, after a planned
+   switchover, `stopped_at_secs`; rules 4, 9, 10 and 16).
+   **Lease format.** `format` is an integer that is raised whenever a lease
+   field is added that changes how candidates must evaluate promotion. A node
+   that reads a lease whose `format` is newer than it supports neither
+   acquires nor promotes against it (rule 10), so a candidate can never
+   ignore a field it does not understand and promote on an incomplete check.
+   Rollouts update replicas before the writer, so a newer format is written
+   only once no older candidate remains. A rollback across a format change
+   leaves the older nodes unpromotable until they are upgraded again. Format
+   1, the first format any campaigning release reads, already includes the
+   clock fields of rule 4. The backend's native
    revision (Kubernetes `resourceVersion`, file record counter) is the
    compare-and-swap precondition and
    is bumped atomically with `version`, but it is never used as the liveness
@@ -44,10 +55,52 @@ protocol.
    clock cannot cause saturating subtraction to make stale snapshots appear fresh
    or bypass the lag limit; the writer issues every stamp through `WriterClock`,
    which returns `max(wall clock, last stamp)` and is seeded from the writer
-   epoch's last renewal on activation); and (b) the future-skew check compares the
+   epoch's last renewal on activation, and candidates add the recorded clock
+   deficit, below); and (b) the future-skew check compares the
    writer-stamped snapshot timestamp with the candidate's local wall time, which
    can deny promotion but never authorizes it. Candidates do not compare the
    lease's `renewed_at_secs` with their own wall clock.
+   **Clock deficit.** Non-decreasing stamps alone do not bound lag. While
+   `WriterClock` holds at its floor, or while the wall clock runs slow, real
+   time passes that the stamps do not show, so the difference between two
+   stamps can understate how stale a snapshot is. `WriterClock` therefore
+   also keeps a *reference*. On activation the reference is set to the first
+   stamp. It then advances with the writer's local monotonic clock and moves
+   forward to the wall clock whenever the wall clock reads later. It is never
+   behind any stamp. The *deficit* is the reference minus the current stamp.
+   Because the deficit is cumulative, it catches one large backward step, a
+   run of small ones and a slow-running clock alike.
+   - *Recording*: every lease write the writer makes records
+     `writer.clock_deficit_secs`. The value is the deficit rounded up to
+     whole seconds, or 0 when the deficit is 1 second or less. Candidates
+     measure lag as `writer.renewed_at_secs + writer.clock_deficit_secs −
+     synced_at_secs` (rule 10). The deficit is written in the same CAS as
+     the renewal stamp it corrects, so a held renewal stamp is never visible
+     without its correction. A snapshot stamp issued during a deficit only
+     makes that snapshot look older. A writer that crashes during a deficit
+     therefore leaves a lease that candidates evaluate conservatively, with
+     no marker left for anyone to clear. A replica whose corrected lag is
+     within `freshness.max_lag_secs` stays promotable. Otherwise the cluster
+     needs the operator recovery of ADR-0019, as for any writer that dies
+     ahead of its replicas.
+   - *Rebase*: after a backward step the wall clock runs at its normal rate
+     again, so the deficit never shrinks by itself. Once the wall clock reads
+     later than the last stamp, so that stamps advance with it again, the
+     writer's next lease write *rebases*. It records that write's stamp as
+     `writer.clock_rebased_at_secs` and a deficit of 0. After the CAS
+     succeeds, the writer resets the reference to that stamp, as of the
+     instant the stamp was taken. Candidates deny promotion from a snapshot
+     stamped at or before `writer.clock_rebased_at_secs`, because its gap to
+     later renewals is no longer corrected. A rebase is the only way the
+     writer clears a deficit of more than 1 second. Until the rebase, the
+     correction keeps snapshots taken before the step promotable for as long
+     as their corrected lag allows.
+   - *Bound*: between rebases, the corrected lag is never less than the
+     writer's monotonic time from a snapshot to a later renewal, minus 1
+     second. A deficit of 1 second or less is not recorded and can understate
+     lag by at most that much. Forward jumps only overstate lag. A wall clock
+     that keeps running slow causes a rebase each time its deficit passes 1
+     second. Each rebase makes replicas unpromotable until they next sync.
 5. **Writers fence themselves.** A writer accepts a commit only before
    `send time of its last successful renewal + lease.renew_deadline_secs`, on its
    local monotonic clock. `enforce_write_fence` runs inside the write transaction
@@ -93,11 +146,17 @@ protocol.
    - **Database set**: the cluster replicates exactly the databases in the
      lease's `writer.databases`, a list of 1–64 entries `(name, incarnation)`,
      sorted by name with no duplicate names, and no name is a directory
-     ancestor of another (`a.db` and `a.db/b.db`). Names are relative to `data.dir`.
-     Each `/`-separated component is 1–255 ASCII letters, digits, `.`, `_` or
-     `-` and does not start with `.`; the whole name is at most 255 bytes,
-     ends in `.db`, `.sqlite` or `.sqlite3`, and its first component is not
-     `diverged` or `ancestors`. The *incarnation* is a number the writer takes
+     ancestor of another (`a.db` and `a.db/b.db`). Names are relative to
+     `data.dir`. Each `/`-separated component is non-empty, uses only ASCII
+     letters, digits, `.`, `_` or `-`, and does not start with `.`. The whole
+     name ends in `.db`, `.sqlite` or `.sqlite3`, its first component is not
+     `diverged` or `ancestors`, and it is at most 200 bytes when each `/` is
+     counted as three bytes (its `%2F` encoding; `%` cannot occur in a name).
+     That bound keeps every generated name within the 255-byte file-name
+     limit: the encoded ledger record name and its `.tmp` file, and the
+     diverged copy `<db>.diverged-<id>` and its `.tmp` file, where
+     `.diverged-`, the longest id (`standalone-g<u64>`, 32 bytes) and `.tmp`
+     add at most 46 bytes. The *incarnation* is a number the writer takes
      from the lease counter `writer.next_incarnation` each time a name is
      added, so a name that is removed and added again never reuses an
      incarnation. Node configuration never defines the set. Genesis or the
@@ -128,11 +187,18 @@ protocol.
        15's diverged copy on a former writer that had not yet resynced.
      - *Tombstones*: `writer.removed` holds up to 64 `(name, incarnation)`
        entries. When it is full, the oldest is dropped. A node deletes local
-       files only for a database named in the tombstones, or for a database
+       files only for a database named in the tombstones, for a database
        whose files belong to an older incarnation of a name in the set
-       (*incarnation check*, below). It never deletes a database that is in
-       neither list; such files are not served or replicated, are reported
-       with `hasqlite_unmanaged_database_files`, and must be removed by hand.
+       (*incarnation check*, below), or for a *dropped removal*: a name in
+       neither list for which the node holds a ledger record. A record shows
+       that the node replicated that name, and a name leaves the set only by
+       removal, so its files belong to a removed incarnation whose tombstone
+       was dropped while the node was away (more than 64 removals). The node
+       deletes them when it observes such a lease, so the stale files cannot
+       later block *Add* of that name. It never deletes files in neither list
+       for which it holds no ledger record. Such files are not served or
+       replicated, are reported with `hasqlite_unmanaged_database_files`, and
+       must be removed by hand.
      - *File deletion*: with no open handle on the database and no pull in
        progress for it, the node unlinks the `-wal` file, then the `-shm`
        file, then the database file, treating a missing file as already
@@ -143,7 +209,22 @@ protocol.
        refuses a name while any of its three files exists. While a
        divergence preservation is pending (rule 15) the node deletes nothing,
        so a former writer's commits to a database removed by its successor
-       are preserved first.
+       are preserved first. Deletion of a name is serialized with pulls of
+       that name and, on the writer, with *Add* of that name, under one
+       per-name lock. Holding the lock, the node re-reads the lease
+       immediately before deleting anything, and proceeds only if the
+       current lease still tombstones the name and does not list it in the
+       set; or the lease lists the name in neither the set nor the
+       tombstones and the node holds a ledger record for it (a dropped
+       removal); or, on a replica, the set entry's incarnation differs from
+       that of the local files (taken from the local ledger record; files
+       without a record count as an older incarnation). If the set lists the
+       local files' incarnation, it skips the deletion. *Add* holds the lock
+       from its file check until its CAS completes, so a dropped-removal
+       deletion never removes a file that *Add* has just created. The ledger
+       record is deleted last, so a crash during a dropped-removal deletion
+       leaves the record in place and the node finishes the deletion when it
+       next observes the lease.
      - *Incarnation check*: before the first pull of a database whose local
        record is missing or carries a different incarnation than the set
        entry, the replica deletes any local files of that name as above. A
@@ -193,10 +274,15 @@ protocol.
      writer.renewed_at_secs` observed before the pull, a lower bound on the
      snapshot start on the writer's clock, so lag is overstated, never
      understated); (2) read the lease again after the database fsync and publish
-     the ledger only if `version` is unchanged and `holder_node_id ==
-     writer.node_id`; and (3) serve pulls only while it is itself the activated
-     writer (a role-gating interceptor in front of the adapter's replication
-     server). A lease change observed in (2) leaves the ledger invalidated.
+     the ledger only if `holder_node_id` and `generation` are unchanged since
+     the pre-pull observation, `holder_node_id == writer.node_id`, the
+     `writer` epoch (node and generation) is unchanged, and the database's set
+     entry (name and incarnation) is unchanged; and (3) serve pulls only while
+     it is itself the activated writer (a role-gating interceptor in front of
+     the adapter's replication server). `version` is not compared in (2): the
+     writer renews every retry period, so it changes during most pulls, and a
+     renewal by the same writer does not change who served the snapshot. A
+     change of writer observed in (2) leaves the ledger invalidated.
      For a planned switchover (rule 16), the pre-pull renewal may predate the
      stop stamp, so it cannot show a pull to be post-stop. Instead, right after
      issuing the stop stamp, the stopping writer performs a renew CAS stamped
@@ -217,18 +303,24 @@ protocol.
       ledger record whose incarnation equals the set entry's and that is
       bound to this replica. Its source node and generation
       equal the lease's `writer` epoch. Its lag behind that writer's last
-      renewal (`writer.renewed_at_secs − synced_at_secs`) is at most
-      `freshness.max_lag_secs`; both timestamps come from the writer's clock.
-      Its `synced_at_secs` is at most `max_future_skew_secs` ahead of local
-      time. A missing record, or one from another incarnation, for any
-      database in the set denies promotion.
-      A lease without an activated writer is denied first, since its epoch
-      supplies the set. The remaining checks are evaluated in a fixed order of
-      classes (ledger shape, writer epoch, time bounds); within a class, databases are checked in name
-      order. The first failure is reported, naming its database. The class
-      order is part of the `hasqlite_promotion_denied_total` metric contract.
-      The freshest-first delay ([architecture §3](architecture.md#3-architecture))
-      uses the largest lag over the set. The post-v1 emergency
+      renewal, corrected for the clock deficit (`writer.renewed_at_secs +
+      writer.clock_deficit_secs − synced_at_secs`, saturating, rule 4), is at
+      most `freshness.max_lag_secs`. All three values come from the writer's
+      clock. Its `synced_at_secs` is at most `max_future_skew_secs` ahead of
+      local time. Its `synced_at_secs` is later than
+      `writer.clock_rebased_at_secs` when that is set (rule 4). The observed
+      lease's `format` is one this node supports (rule 2). A
+      missing record, or one from another incarnation, for any database in
+      the set denies promotion.
+      The lease format is checked first, then a lease without an activated
+      writer is denied, since its epoch supplies the set. The remaining
+      checks are evaluated in a fixed order of classes (ledger shape, writer
+      epoch, time bounds);
+      within a class, databases are checked in name order. The first failure
+      is reported, naming its database. The class order is part of the
+      `hasqlite_promotion_denied_total` metric contract. The freshest-first
+      delay ([architecture §3](architecture.md#3-architecture)) uses the
+      largest corrected lag over the set. The post-v1 emergency
       promotion and dead-epoch roll-forward exceptions are specified in
       [automated-recovery.md](automated-recovery.md#3-tier-2-cluster-consensus--degraded-failover)
       and are not part of v1.

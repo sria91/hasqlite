@@ -18,7 +18,10 @@ Implement native equivalents of the required pure HA logic in
 
 - `parse_lease_record`, `parse_freshness_ledger` (mandatory destination binding, non-empty source attribution)
 - `LeaseObservation` (candidate-side expiry on the local monotonic clock against the effective TTL `max(local, holder's recorded ttl_secs)`; done) and `RenewalDeadline` (writer-side commit cutoff; done)
-- `WriterClock` (non-decreasing time basis for every writer stamp, seeded from the writer epoch's last renewal on activation; done) wired into renew, activate, release and snapshot stamping
+- `WriterClock` (non-decreasing time basis for every writer stamp, seeded from the writer epoch's last renewal on activation; done). Still to do: the monotonic reference and
+  cumulative deficit, the lease fields `writer.clock_deficit_secs` / `writer.clock_rebased_at_secs` and the lease
+  `format` number (safety contract rules 2 and 4) wired into renew, activate, release and snapshot stamping, and
+  `validate_promotion` using the corrected lag and rejecting snapshots stamped at or before the rebase
 - `validate_promotion` against the observed lease's activated writer epoch (done), and `enforce_write_fence` checked before `COMMIT`
 - Lease store trait with conditional operations only; the store, not the caller, derives the new generation. Every write bumps the hasqlite-owned `LeaseVersion` token and uses the backend's native revision only as the CAS precondition (contract rule 2):
   - `acquire(observed: &VersionedLease) -> Result<VersionedLease, LeaseError>` (generation + 1, writer epoch unchanged)
@@ -99,8 +102,10 @@ depend on it:
      (an acquired-but-not-activated holder, or no activated writer).
   2. Invalidate the ledger and fsync it before the first page is written.
   3. Pull; `pull_replica` fsyncs the replica file and its directory on success.
-  4. Observe the lease again. Publish only if `version` is unchanged since step 1; otherwise leave the ledger
-     invalidated and retry on the next tick.
+  4. Observe the lease again. Publish only if `holder_node_id` and `generation` are unchanged since step 1, the
+     holder is still the writer epoch, and the database's set entry is unchanged; `version` is not compared, because
+     renewals by the same writer change it during most pulls. Otherwise leave the ledger invalidated and retry on the
+     next tick.
   5. Publish the new ledger stamped from the step-1 observation: `source_node_id = writer.node_id`,
      `source_generation = writer.generation`, `synced_at_secs = writer.renewed_at_secs` (a lower bound on the snapshot
      start on the writer's clock; lag is overstated by at most one retry period, never understated), and the local
@@ -146,7 +151,7 @@ Deliverables:
 - HTTP probes (`hasqlite-probes`) with Kubernetes readiness vs liveness semantics documented; `/live` never touches SQLite or the lease store
 - Writer routing: pod self-labeling (`hasqlite.io/role=writer`) for Kubernetes; for the local and Compose harnesses, an HAProxy front end that health-checks `/ready` provides the stable `sync.origin_endpoint` alias
 - Graceful shutdown: replica preStop catch-up sync; writer planned switchover (stop writes on every database, bounded wait for replicas' post-fence snapshots of every database, release the lease), then drain and checkpoint
-- Database-set administration on the writer (ADR-0020): `hasqlite db add`, `hasqlite db remove --confirm-data-loss` and `hasqlite db list`, each audited, applied through the writer's renew CAS; removal tombstones the database and every node deletes its files (crash-safe, after any pending divergence preservation); the gateway resolves only names in the set and never creates databases
+- Database-set administration on the writer (ADR-0020): `hasqlite db add` and `hasqlite db remove --confirm-data-loss`, each audited and applied through the writer's renew CAS, and `hasqlite db list`, which only reads the lease and never renews it; removal tombstones the database and every node deletes its files (crash-safe, after any pending divergence preservation); the gateway resolves only names in the set and never creates databases
 - Concurrent serving: per-database connection pools and write locks on the writer, concurrent origin sessions with per-session snapshot deadlines
 
 Deliverables:
